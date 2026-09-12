@@ -1,0 +1,22 @@
+[package]
+name = "convmat"
+version = "0.1.0"
+edition = "2021"
+description = "A MATLAB/Octave-to-MLIR compiler aiming to be a better MATLAB Coder"
+license = "MIT OR Apache-2.0"
+
+# `runmat-*` provide the MATLAB/Octave frontend (parse -> HIR -> MIR); `melior`
+# provides the MLIR bindings. Both are mandatory: code generation is the whole
+# point of this crate. `melior` requires a local MLIR 22 install (libMLIR +
+# libMLIR-C).
+#
+# NOTE: runmat-static-analysis is deliberately excluded: it pulls runmat-vm ->
+# runmat-runtime -> native HDF5/OpenBLAS, which we don't need for the MVP.
+# Type/shape inference is deferred; scalars default to double.
+[dependencies]
+thiserror = "2"
+anyhow = "1"
+runmat-parser = "0.6.2"
+runmat-hir = "0.6.2"
+runmat-mir = "0.6.2"
+melior = "0.27.8"
