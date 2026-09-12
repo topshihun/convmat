@@ -293,3 +293,97 @@ fn codegen_unary_mix() {
     assert!(c.contains("double unary_mix("), "got:\n{c}");
     assert!(c.contains('-'), "got:\n{c}");
 }
+
+// --- Built-in function codegen -------------------------------------------------
+
+#[test]
+fn codegen_scalar_trig_builtins() {
+    let c = compile_fixture("trig");
+    assert!(c.contains("double trig("), "got:\n{c}");
+    assert!(c.contains("sin("), "got:\n{c}");
+    assert!(c.contains("cos("), "got:\n{c}");
+    assert!(c.contains("tan("), "got:\n{c}");
+}
+
+#[test]
+fn codegen_scalar_math_builtins() {
+    let c = compile_fixture("mathfns");
+    assert!(c.contains("double mathfns("), "got:\n{c}");
+    assert!(c.contains("sqrt("), "got:\n{c}");
+    assert!(c.contains("exp("), "got:\n{c}");
+    assert!(c.contains("fabs("), "got:\n{c}");
+    assert!(c.contains("floor("), "got:\n{c}");
+}
+
+#[test]
+fn codegen_sign_builtin() {
+    // `sign` lowers inline (no libm call), via ordered comparisons + select.
+    let c = compile_fixture("sign_builtin");
+    assert!(c.contains("double sign_builtin("), "got:\n{c}");
+    assert!(c.contains("bool"), "got:\n{c}");
+}
+
+#[test]
+fn codegen_binary_math_builtins() {
+    let c = compile_fixture("binary_math");
+    assert!(c.contains("double binary_math("), "got:\n{c}");
+    assert!(c.contains("pow("), "got:\n{c}");
+    assert!(c.contains("atan2("), "got:\n{c}");
+    assert!(c.contains("fmod("), "got:\n{c}");
+    assert!(c.contains("fmax("), "got:\n{c}");
+}
+
+#[test]
+fn codegen_elementwise_array_builtin() {
+    // An array output becomes an out-pointer parameter (`void f(double out[N])`).
+    let c = compile_fixture("sin_array");
+    assert!(c.contains("void sin_array(double"), "got:\n{c}");
+    assert!(c.contains("sin("), "got:\n{c}");
+    assert!(c.contains("for ("), "got:\n{c}");
+}
+
+#[test]
+fn codegen_abs_array_builtin() {
+    let c = compile_fixture("abs_array");
+    assert!(c.contains("void abs_array(double"), "got:\n{c}");
+    assert!(c.contains("fabs("), "got:\n{c}");
+    assert!(c.contains("for ("), "got:\n{c}");
+}
+
+#[test]
+fn codegen_reduce_sum() {
+    let c = compile_fixture("reduce_sum");
+    assert!(c.contains("double reduce_sum("), "got:\n{c}");
+    assert!(c.contains("for ("), "got:\n{c}");
+}
+
+#[test]
+fn codegen_reduce_prod() {
+    let c = compile_fixture("reduce_prod");
+    assert!(c.contains("double reduce_prod("), "got:\n{c}");
+    assert!(c.contains("for ("), "got:\n{c}");
+}
+
+#[test]
+fn codegen_reduce_minmax() {
+    let c = compile_fixture("reduce_minmax");
+    assert!(c.contains("double reduce_minmax("), "got:\n{c}");
+    assert!(c.contains("INFINITY"), "got:\n{c}");
+}
+
+#[test]
+fn codegen_nested_elementwise() {
+    // Nested array elementwise calls compose through intermediate temporaries.
+    let c = compile_fixture("nested_elementwise");
+    assert!(c.contains("void nested_elementwise(double"), "got:\n{c}");
+    assert!(c.contains("sin("), "got:\n{c}");
+    assert!(c.contains("cos("), "got:\n{c}");
+}
+
+#[test]
+fn lower_builtin_to_func_call() {
+    // The core-dialect MLIR lowers `sin` to a `func.call` into libm.
+    let mlir = lower_fixture("sin_array");
+    assert!(mlir.contains("func.call @sin"), "got:\n{mlir}");
+    assert!(mlir.contains("func.func private @sin"), "got:\n{mlir}");
+}

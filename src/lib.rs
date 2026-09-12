@@ -14,6 +14,7 @@
 //! ```
 
 pub mod backend;
+pub mod builtins;
 pub mod error;
 pub mod frontend;
 pub mod mir_to_mlir;

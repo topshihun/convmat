@@ -10,26 +10,31 @@
 //! CFG and emitted as `scf.if`/`scf.while`, which sidesteps explicit SSA phi
 //! construction while remaining faithful to the source semantics.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use melior::{
     dialect::{arith, func, memref, scf, DialectRegistry},
     ir::{
-        attribute::{FloatAttribute, IntegerAttribute, StringAttribute, TypeAttribute},
+        attribute::{
+            FlatSymbolRefAttribute, FloatAttribute, IntegerAttribute, StringAttribute,
+            TypeAttribute,
+        },
         block::BlockLike,
         r#type::{FunctionType, MemRefType},
-        Block, Location, Module, Region, RegionLike, Type, Value,
+        Block, Identifier, Location, Module, Region, RegionLike, Type, Value,
     },
     utility::register_all_dialects,
     Context,
 };
 
+use crate::builtins::{self, Builtin, MinMax, ReduceOp};
 use crate::error::{Error, Result};
+use crate::triage::{call_name, infer_locals, LocalTy};
 
 use runmat_hir::OperatorKind;
 use runmat_mir::{
-    BasicBlockId, MirAssembly, MirBody, MirConstant, MirLocalId, MirOperand, MirPlace, MirRvalue,
-    MirShortCircuitOp, MirStmt, MirStmtKind, MirTerminatorKind,
+    BasicBlockId, MirAssembly, MirBody, MirCall, MirCallArg, MirConstant, MirLocalId, MirOperand,
+    MirPlace, MirRvalue, MirShortCircuitOp, MirStmt, MirStmtKind, MirTerminatorKind,
 };
 
 /// Create an MLIR context with all registered dialects loaded.
@@ -63,6 +68,28 @@ pub fn lower_to_module<'c>(context: &'c Context, mir: &MirAssembly) -> Result<Mo
         scalar_memref: MemRefType::contiguous(Type::float64(context), &[1], None),
     };
 
+    // Declare every `libm` function the bodies call before lowering, so the
+    // emitted `func.call`s resolve and `mlir-translate` prints the C externs.
+    for (symbol, arity) in collect_libm_symbols(mir) {
+        let input_types = match arity {
+            1 => vec![cx.float],
+            _ => vec![cx.float, cx.float],
+        };
+        let fn_type = FunctionType::new(context, &input_types, &[cx.float]);
+        let region = Region::new();
+        module.body().append_operation(func::func(
+            context,
+            StringAttribute::new(context, symbol.as_str()),
+            TypeAttribute::new(fn_type.into()),
+            region,
+            &[(
+                Identifier::new(context, "sym_visibility"),
+                StringAttribute::new(context, "private").into(),
+            )],
+            location,
+        ));
+    }
+
     for (function_id, body) in &mir.bodies {
         lower_function(&cx, mir, *function_id, body, &module)?;
     }
@@ -77,6 +104,71 @@ struct Cx<'c> {
     float: Type<'c>,
     index: Type<'c>,
     scalar_memref: MemRefType<'c>,
+}
+
+impl<'c> Cx<'c> {
+    /// A contiguous `memref<nxf64>` type for a statically-shaped array.
+    fn array_memref(&self, n: usize) -> MemRefType<'c> {
+        MemRefType::contiguous(self.float, &[n as i64], None)
+    }
+}
+
+/// Collect the `(symbol, arity)` pairs for every `libm` function referenced by
+/// a supported built-in call anywhere in the assembly.
+fn collect_libm_symbols(mir: &MirAssembly) -> BTreeSet<(String, usize)> {
+    let mut symbols = BTreeSet::new();
+    for body in mir.bodies.values() {
+        for block in &body.blocks {
+            for stmt in &block.statements {
+                collect_stmt_symbols(stmt, &mut symbols);
+            }
+        }
+    }
+    symbols
+}
+
+fn collect_stmt_symbols(stmt: &MirStmt, symbols: &mut BTreeSet<(String, usize)>) {
+    match &stmt.kind {
+        MirStmtKind::Assign { value, .. } | MirStmtKind::Expr(value) => {
+            collect_rvalue_symbols(value, symbols)
+        }
+        _ => {}
+    }
+}
+
+fn collect_rvalue_symbols(rvalue: &MirRvalue, symbols: &mut BTreeSet<(String, usize)>) {
+    match rvalue {
+        MirRvalue::Call(call) => {
+            if let Some((symbol, arity)) = libm_symbol_and_arity(call) {
+                symbols.insert((symbol.to_string(), arity));
+            }
+        }
+        MirRvalue::ShortCircuit { right_temps, .. } => {
+            for stmt in right_temps {
+                collect_stmt_symbols(stmt, symbols);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The `libm` symbol and arity for a built-in call, when it lowers to a direct
+/// C call (reductions and `sign` are lowered inline and return `None`).
+fn libm_symbol_and_arity(call: &MirCall) -> Option<(&'static str, usize)> {
+    let name = call_name(&call.callee)?;
+    let builtin = builtins::lookup(&name)?;
+    match builtin {
+        Builtin::Unary(symbol) => Some((symbol, 1)),
+        Builtin::Binary(symbol) => Some((symbol, 2)),
+        Builtin::MinMax(minmax) if call.args.len() == 2 => {
+            let symbol = match minmax {
+                MinMax::Min => "fmin",
+                MinMax::Max => "fmax",
+            };
+            Some((symbol, 2))
+        }
+        _ => None,
+    }
 }
 
 /// Lower a single MIR body into a `func.func` appended to `module`.
@@ -101,6 +193,8 @@ fn lower_function<'c>(
         }
     }
 
+    let tys = infer_locals(body);
+
     let params: Vec<MirLocalId> = body
         .abi
         .fixed_inputs
@@ -113,20 +207,61 @@ fn lower_function<'c>(
         })
         .collect::<Result<_>>()?;
 
-    // Entry block with one `f64` argument per parameter.
-    let entry = Block::new(
-        &params
-            .iter()
-            .map(|_| (cx.float, cx.location))
-            .collect::<Vec<_>>(),
-    );
+    // Split outputs by ABI: scalars are returned; arrays become out-pointer
+    // parameters supplied (and allocated) by the caller.
+    let outputs: Vec<MirLocalId> = body
+        .abi
+        .fixed_outputs
+        .iter()
+        .map(|binding| {
+            binding_to_local
+                .get(binding)
+                .copied()
+                .ok_or_else(|| Error::Backend(format!("no local for output {binding:?}")))
+        })
+        .collect::<Result<_>>()?;
 
-    // Allocate one stack cell per local and store incoming parameters into it.
+    let mut scalar_outputs = Vec::new();
+    let mut array_outputs = Vec::new();
+    for output in &outputs {
+        match tys.get(&output.0).copied().unwrap_or(LocalTy::Scalar) {
+            LocalTy::Scalar => scalar_outputs.push(*output),
+            LocalTy::Array { .. } => array_outputs.push(*output),
+            LocalTy::Dynamic => {
+                return Err(Error::NotLowerable("dynamic output shape".to_string()))
+            }
+        }
+    }
+
+    // Entry block arguments: scalar parameters first, then array out-params.
+    let mut entry_arg_types = Vec::new();
+    for _ in &params {
+        entry_arg_types.push((cx.float, cx.location));
+    }
+    for output in &array_outputs {
+        let LocalTy::Array { n } = tys[&output.0] else {
+            unreachable!("array output must have an array type");
+        };
+        entry_arg_types.push((cx.array_memref(n).into(), cx.location));
+    }
+    let entry = Block::new(&entry_arg_types);
+
+    // Allocate a stack cell per local. Array outputs are caller-provided and
+    // are wired to their incoming buffers below instead of being allocated.
+    let out_param_ids: HashSet<usize> = array_outputs.iter().map(|output| output.0).collect();
     let mut locals: HashMap<usize, Value> = HashMap::new();
     for local in &body.locals {
+        if out_param_ids.contains(&local.id.0) {
+            continue;
+        }
+        let memref_ty = match tys.get(&local.id.0).copied().unwrap_or(LocalTy::Scalar) {
+            LocalTy::Scalar => cx.scalar_memref,
+            LocalTy::Array { n } => cx.array_memref(n),
+            LocalTy::Dynamic => return Err(Error::NotLowerable("dynamic local shape".to_string())),
+        };
         let alloca = entry.append_operation(memref::alloca(
             cx.context,
-            cx.scalar_memref,
+            memref_ty,
             &[],
             &[],
             None,
@@ -139,6 +274,7 @@ fn lower_function<'c>(
         locals.insert(local.id.0, value);
     }
 
+    // Store incoming scalar parameters into their cells.
     for (index, param) in params.iter().enumerate() {
         let argument: Value = entry
             .argument(index)
@@ -152,19 +288,35 @@ fn lower_function<'c>(
         entry.append_operation(memref::store(argument, target, &[zero], cx.location));
     }
 
+    // Wire array outputs to their incoming caller-provided buffers.
+    for (offset, output) in array_outputs.iter().enumerate() {
+        let argument: Value = entry
+            .argument(params.len() + offset)
+            .map_err(|e| Error::Backend(format!("block argument: {e}")))?
+            .into();
+        locals.insert(output.0, argument);
+    }
+
+    let mut input_types: Vec<Type> = vec![cx.float; params.len()];
+    for output in &array_outputs {
+        let LocalTy::Array { n } = tys[&output.0] else {
+            unreachable!("array output must have an array type");
+        };
+        input_types.push(cx.array_memref(n).into());
+    }
+    let output_types: Vec<Type> = vec![cx.float; scalar_outputs.len()];
+
     let cfg = compute_cfg(body);
     let lowerer = FuncLowerer {
         cx,
         body,
         locals,
+        tys,
         preds: cfg.preds,
         dominators: cfg.dominators,
     };
     lowerer.lower_region(&entry, 0, None)?;
     drop(lowerer);
-
-    let input_types = vec![cx.float; params.len()];
-    let output_types = vec![cx.float; body.abi.fixed_outputs.len()];
 
     let region = Region::new();
     region.append_block(entry);
@@ -190,8 +342,34 @@ struct FuncLowerer<'c, 'e, 'x, 'y> {
     cx: &'x Cx<'c>,
     body: &'y MirBody,
     locals: HashMap<usize, Value<'c, 'e>>,
+    tys: HashMap<usize, LocalTy>,
     preds: Vec<Vec<usize>>,
     dominators: Vec<HashSet<usize>>,
+}
+
+/// A reduction to apply across an array.
+#[derive(Clone, Copy)]
+enum Reducer {
+    Add,
+    Mul,
+    Min,
+    Max,
+}
+
+impl Reducer {
+    fn from_reduce(op: ReduceOp) -> Self {
+        match op {
+            ReduceOp::Sum => Reducer::Add,
+            ReduceOp::Prod => Reducer::Mul,
+        }
+    }
+
+    fn from_minmax(minmax: MinMax) -> Self {
+        match minmax {
+            MinMax::Min => Reducer::Min,
+            MinMax::Max => Reducer::Max,
+        }
+    }
 }
 
 impl<'c, 'e, 'x, 'y> FuncLowerer<'c, 'e, 'x, 'y> {
@@ -260,7 +438,19 @@ impl<'c, 'e, 'x, 'y> FuncLowerer<'c, 'e, 'x, 'y> {
                     }
                     let mut values = Vec::new();
                     for operand in operands {
-                        values.push(self.lower_operand(block, operand)?);
+                        match self.operand_ty(operand) {
+                            LocalTy::Scalar => {
+                                values.push(self.lower_operand(block, operand)?);
+                            }
+                            // Array outputs are already written into their
+                            // caller-provided out-parameter buffers.
+                            LocalTy::Array { .. } => {}
+                            LocalTy::Dynamic => {
+                                return Err(Error::NotLowerable(
+                                    "dynamic return value".to_string(),
+                                ));
+                            }
+                        }
                     }
                     block.append_operation(func::r#return(&values, self.cx.location));
                     return Ok(None);
@@ -321,14 +511,29 @@ impl<'c, 'e, 'x, 'y> FuncLowerer<'c, 'e, 'x, 'y> {
                         "non-local assignment target {place:?}"
                     )));
                 };
-                let value = self.lower_rvalue(block, value)?;
                 let cell = self
                     .locals
                     .get(&target.0)
                     .copied()
                     .ok_or_else(|| Error::Backend(format!("no cell for local {:?}", target)))?;
-                let zero = index_zero(self.cx, block)?;
-                block.append_operation(memref::store(value, cell, &[zero], self.cx.location));
+                match self.tys.get(&target.0).copied().unwrap_or(LocalTy::Scalar) {
+                    LocalTy::Scalar => {
+                        let value = self.lower_rvalue(block, value)?;
+                        let zero = index_zero(self.cx, block)?;
+                        block.append_operation(memref::store(
+                            value,
+                            cell,
+                            &[zero],
+                            self.cx.location,
+                        ));
+                    }
+                    LocalTy::Array { .. } => {
+                        self.lower_array_rvalue_into(block, value, cell)?;
+                    }
+                    LocalTy::Dynamic => {
+                        return Err(Error::NotLowerable("dynamic assignment target".to_string()));
+                    }
+                }
                 Ok(())
             }
             MirStmtKind::Expr(value) => {
@@ -368,6 +573,7 @@ impl<'c, 'e, 'x, 'y> FuncLowerer<'c, 'e, 'x, 'y> {
                 let r = self.lower_operand(block, right)?;
                 self.apply_short_circuit(block, op, l, r)
             }
+            MirRvalue::Call(call) => self.lower_scalar_call(block, call),
             other => Err(Error::NotLowerable(format!("rvalue {other:?}"))),
         }
     }
@@ -404,6 +610,299 @@ impl<'c, 'e, 'x, 'y> FuncLowerer<'c, 'e, 'x, 'y> {
             },
             other => Err(Error::NotLowerable(format!("operand {other:?}"))),
         }
+    }
+
+    /// The static type of an operand, as determined by triage's shape analysis.
+    fn operand_ty(&self, operand: &MirOperand) -> LocalTy {
+        match operand {
+            MirOperand::Local(id) => self.tys.get(&id.0).copied().unwrap_or(LocalTy::Scalar),
+            MirOperand::Constant(_) => LocalTy::Scalar,
+            _ => LocalTy::Dynamic,
+        }
+    }
+
+    /// Lower a built-in call that yields a scalar `f64`.
+    fn lower_scalar_call<'b>(&self, block: &'b Block<'c>, call: &MirCall) -> Result<Value<'c, 'b>> {
+        let name = call_name(&call.callee)
+            .ok_or_else(|| Error::NotLowerable("dynamic function call".to_string()))?;
+        let builtin = builtins::lookup(&name)
+            .ok_or_else(|| Error::NotLowerable(format!("unsupported builtin `{name}`")))?;
+
+        let args: Vec<&MirOperand> = call
+            .args
+            .iter()
+            .map(|arg| match arg {
+                MirCallArg::Single(operand) => Ok(operand),
+                MirCallArg::Expansion { .. } => {
+                    Err(Error::NotLowerable("argument expansion".to_string()))
+                }
+            })
+            .collect::<Result<_>>()?;
+
+        match builtin {
+            Builtin::Unary(symbol) => {
+                let value = self.lower_operand(block, args[0])?;
+                self.emit_libm_call(block, symbol, &[value], self.cx.float)
+            }
+            Builtin::Binary(symbol) => {
+                let l = self.lower_operand(block, args[0])?;
+                let r = self.lower_operand(block, args[1])?;
+                self.emit_libm_call(block, symbol, &[l, r], self.cx.float)
+            }
+            Builtin::Sign => {
+                let value = self.lower_operand(block, args[0])?;
+                self.sign(block, value)
+            }
+            Builtin::MinMax(minmax) => match args.len() {
+                2 => {
+                    let l = self.lower_operand(block, args[0])?;
+                    let r = self.lower_operand(block, args[1])?;
+                    let symbol = match minmax {
+                        MinMax::Min => "fmin",
+                        MinMax::Max => "fmax",
+                    };
+                    self.emit_libm_call(block, symbol, &[l, r], self.cx.float)
+                }
+                1 => self.reduce_arg(block, args[0], Reducer::from_minmax(minmax)),
+                _ => unreachable!("arity checked by triage"),
+            },
+            Builtin::Reduce(op) => self.reduce_arg(block, args[0], Reducer::from_reduce(op)),
+        }
+    }
+
+    /// Lower a reduction over a scalar (identity) or an array (loop).
+    fn reduce_arg<'b>(
+        &self,
+        block: &'b Block<'c>,
+        operand: &MirOperand,
+        reducer: Reducer,
+    ) -> Result<Value<'c, 'b>> {
+        match self.operand_ty(operand) {
+            LocalTy::Scalar => self.lower_operand(block, operand),
+            LocalTy::Array { n } => {
+                let src = self.array_source(operand)?;
+                self.reduce(block, reducer, src, n)
+            }
+            LocalTy::Dynamic => Err(Error::NotLowerable("dynamic reduction".to_string())),
+        }
+    }
+
+    /// Lower an array-producing rvalue directly into `dest` (a `memref<nxf64>`).
+    fn lower_array_rvalue_into<'b>(
+        &self,
+        block: &'b Block<'c>,
+        rvalue: &MirRvalue,
+        dest: Value<'c, '_>,
+    ) -> Result<()> {
+        match rvalue {
+            MirRvalue::Aggregate { kind, elements, .. } => {
+                if !matches!(kind, runmat_mir::MirAggregateKind::Tensor) {
+                    return Err(Error::NotLowerable("cell array literal".to_string()));
+                }
+                for (offset, element) in elements.iter().enumerate() {
+                    let value = self.lower_operand(block, element)?;
+                    let index = index_constant(self.cx, block, offset as i64)?;
+                    block.append_operation(memref::store(value, dest, &[index], self.cx.location));
+                }
+                Ok(())
+            }
+            MirRvalue::Call(call) => {
+                let name = call_name(&call.callee)
+                    .ok_or_else(|| Error::NotLowerable("dynamic function call".to_string()))?;
+                let builtin = builtins::lookup(&name)
+                    .ok_or_else(|| Error::NotLowerable(format!("unsupported builtin `{name}`")))?;
+                match builtin {
+                    Builtin::Unary(symbol) => {
+                        let [MirCallArg::Single(arg)] = call.args.as_slice() else {
+                            return Err(Error::NotLowerable(
+                                "expected a single array argument".to_string(),
+                            ));
+                        };
+                        let src = self.array_source(arg)?;
+                        let n = self.array_len(arg)?;
+                        self.map_unary(block, symbol, src, dest, n)
+                    }
+                    _ => Err(Error::NotLowerable(format!(
+                        "array result from `{name}` is not supported"
+                    ))),
+                }
+            }
+            other => Err(Error::NotLowerable(format!("array rvalue {other:?}"))),
+        }
+    }
+
+    /// The cell `memref` backing an array-typed operand.
+    fn array_source(&self, operand: &MirOperand) -> Result<Value<'c, 'e>> {
+        match operand {
+            MirOperand::Local(id) => self
+                .locals
+                .get(&id.0)
+                .copied()
+                .ok_or_else(|| Error::Backend(format!("array operand {id:?} has no cell"))),
+            _ => Err(Error::NotLowerable(
+                "array source must be a local".to_string(),
+            )),
+        }
+    }
+
+    /// The flattened element count of an array-typed operand.
+    fn array_len(&self, operand: &MirOperand) -> Result<usize> {
+        match self.operand_ty(operand) {
+            LocalTy::Array { n } => Ok(n),
+            _ => Err(Error::NotLowerable("expected an array operand".to_string())),
+        }
+    }
+
+    /// Apply a unary `libm` function elementwise from `src` into `dest`.
+    fn map_unary<'b>(
+        &self,
+        block: &'b Block<'c>,
+        symbol: &str,
+        src: Value<'c, '_>,
+        dest: Value<'c, '_>,
+        n: usize,
+    ) -> Result<()> {
+        let start = index_constant(self.cx, block, 0)?;
+        let end = index_constant(self.cx, block, n as i64)?;
+        let step = index_constant(self.cx, block, 1)?;
+        let body = Block::new(&[(self.cx.index, self.cx.location)]);
+        let i: Value = body
+            .argument(0)
+            .map_err(|e| Error::Backend(format!("induction variable: {e}")))?
+            .into();
+        let load = body.append_operation(memref::load(src, &[i], self.cx.location));
+        let x: Value = load
+            .result(0)
+            .map_err(|e| Error::Backend(format!("memref.load result: {e}")))?
+            .into();
+        let y = self.emit_libm_call(&body, symbol, &[x], self.cx.float)?;
+        body.append_operation(memref::store(y, dest, &[i], self.cx.location));
+        body.append_operation(scf::r#yield(&[], self.cx.location));
+        let region = Region::new();
+        region.append_block(body);
+        block.append_operation(scf::r#for(start, end, step, region, self.cx.location));
+        Ok(())
+    }
+
+    /// Reduce an array to a scalar using a scalar accumulator cell.
+    fn reduce<'b>(
+        &self,
+        block: &'b Block<'c>,
+        reducer: Reducer,
+        src: Value<'c, '_>,
+        n: usize,
+    ) -> Result<Value<'c, 'b>> {
+        let alloca = block.append_operation(memref::alloca(
+            self.cx.context,
+            self.cx.scalar_memref,
+            &[],
+            &[],
+            None,
+            self.cx.location,
+        ));
+        let acc: Value = alloca
+            .result(0)
+            .map_err(|e| Error::Backend(format!("memref.alloca result: {e}")))?
+            .into();
+
+        let init = self.float_constant(
+            block,
+            match reducer {
+                Reducer::Add => 0.0,
+                Reducer::Mul => 1.0,
+                Reducer::Min => f64::INFINITY,
+                Reducer::Max => f64::NEG_INFINITY,
+            },
+        )?;
+        let zero = index_zero(self.cx, block)?;
+        block.append_operation(memref::store(init, acc, &[zero], self.cx.location));
+
+        let start = index_constant(self.cx, block, 0)?;
+        let end = index_constant(self.cx, block, n as i64)?;
+        let step = index_constant(self.cx, block, 1)?;
+        let body = Block::new(&[(self.cx.index, self.cx.location)]);
+        let i: Value = body
+            .argument(0)
+            .map_err(|e| Error::Backend(format!("induction variable: {e}")))?
+            .into();
+        let load = body.append_operation(memref::load(src, &[i], self.cx.location));
+        let x: Value = load
+            .result(0)
+            .map_err(|e| Error::Backend(format!("memref.load result: {e}")))?
+            .into();
+        let cur = load_local(self.cx, &body, acc)?;
+        let next = self.reduce_step(&body, reducer, cur, x)?;
+        let zero = index_zero(self.cx, &body)?;
+        body.append_operation(memref::store(next, acc, &[zero], self.cx.location));
+        body.append_operation(scf::r#yield(&[], self.cx.location));
+        let region = Region::new();
+        region.append_block(body);
+        block.append_operation(scf::r#for(start, end, step, region, self.cx.location));
+
+        let zero = index_zero(self.cx, block)?;
+        let result = block.append_operation(memref::load(acc, &[zero], self.cx.location));
+        result
+            .result(0)
+            .map_err(|e| Error::Backend(format!("memref.load result: {e}")))
+            .map(Into::into)
+    }
+
+    /// One accumulation step of a reduction.
+    fn reduce_step<'b>(
+        &self,
+        block: &'b Block<'c>,
+        reducer: Reducer,
+        acc: Value<'c, 'b>,
+        x: Value<'c, 'b>,
+    ) -> Result<Value<'c, 'b>> {
+        use melior::dialect::arith::CmpfPredicate;
+
+        match reducer {
+            Reducer::Add => self.append_arith(block, arith::addf(acc, x, self.cx.location)),
+            Reducer::Mul => self.append_arith(block, arith::mulf(acc, x, self.cx.location)),
+            Reducer::Min => {
+                let cond = self.cmpf(block, CmpfPredicate::Olt, x, acc)?;
+                self.select(block, cond, x, acc)
+            }
+            Reducer::Max => {
+                let cond = self.cmpf(block, CmpfPredicate::Ogt, x, acc)?;
+                self.select(block, cond, x, acc)
+            }
+        }
+    }
+
+    /// Emit a `func.call` to a declared external `libm` function.
+    fn emit_libm_call<'b>(
+        &self,
+        block: &'b Block<'c>,
+        symbol: &str,
+        args: &[Value<'c, '_>],
+        result: Type<'c>,
+    ) -> Result<Value<'c, 'b>> {
+        let flat = FlatSymbolRefAttribute::new(self.cx.context, symbol);
+        let op = block.append_operation(func::call(
+            self.cx.context,
+            flat,
+            args,
+            &[result],
+            self.cx.location,
+        ));
+        op.result(0)
+            .map_err(|e| Error::Backend(format!("func.call result: {e}")))
+            .map(Into::into)
+    }
+
+    /// Lower `sign(x)` inline: `1` for `x > 0`, `-1` for `x < 0`, else `0`.
+    fn sign<'b>(&self, block: &'b Block<'c>, x: Value<'c, '_>) -> Result<Value<'c, 'b>> {
+        use melior::dialect::arith::CmpfPredicate;
+
+        let zero = self.float_constant(block, 0.0)?;
+        let one = self.float_constant(block, 1.0)?;
+        let neg_one = self.float_constant(block, -1.0)?;
+        let gt = self.cmpf(block, CmpfPredicate::Ogt, x, zero)?;
+        let lt = self.cmpf(block, CmpfPredicate::Olt, x, zero)?;
+        let inner = self.select(block, lt, neg_one, zero)?;
+        self.select(block, gt, one, inner)
     }
 
     fn apply_unary<'b>(
@@ -880,6 +1379,16 @@ impl<'c, 'e, 'x, 'y> FuncLowerer<'c, 'e, 'x, 'y> {
 /// Emit an `arith.constant 0 : index` into `block`.
 fn index_zero<'c, 'b>(cx: &Cx<'c>, block: &'b Block<'c>) -> Result<Value<'c, 'b>> {
     let attribute = IntegerAttribute::new(cx.index, 0);
+    let op = block.append_operation(arith::constant(cx.context, attribute.into(), cx.location));
+    Ok(op
+        .result(0)
+        .map_err(|e| Error::Backend(format!("index constant result: {e}")))?
+        .into())
+}
+
+/// Emit an `arith.constant value : index` into `block`.
+fn index_constant<'c, 'b>(cx: &Cx<'c>, block: &'b Block<'c>, value: i64) -> Result<Value<'c, 'b>> {
+    let attribute = IntegerAttribute::new(cx.index, value);
     let op = block.append_operation(arith::constant(cx.context, attribute.into(), cx.location));
     Ok(op
         .result(0)

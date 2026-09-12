@@ -5,15 +5,20 @@
 //! decision, so a program can mix compiled and runtime code.
 //!
 //! The current implementation is a hand-written whitelist of the scalar-double
-//! subset. It is exposed behind [`Classifier`] so a
-//! `runmat-static-analysis`-driven classifier (type/shape inference, definite
-//! assignment) can replace it without changing callers.
+//! subset (plus statically-shaped array literals and pure numeric built-ins).
+//! It is exposed behind [`Classifier`] so a `runmat-static-analysis`-driven
+//! classifier (type/shape inference, definite assignment) can replace it
+//! without changing callers.
+
+use std::collections::HashMap;
 
 use runmat_hir::OperatorKind;
 use runmat_mir::{
-    MirBody, MirConstant, MirOperand, MirPlace, MirRvalue, MirStmt, MirStmtKind, MirTerminator,
-    MirTerminatorKind,
+    MirBody, MirCall, MirCallArg, MirCallee, MirConstant, MirOperand, MirPlace, MirRvalue, MirStmt,
+    MirStmtKind, MirTerminator, MirTerminatorKind,
 };
+
+use crate::builtins::{self, Builtin};
 
 /// A per-function classification result.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +27,18 @@ pub enum Verdict {
     Static,
     /// Deferred to the runtime with a human-readable reason.
     Deferred { reason: String },
+}
+
+/// The static type of a MIR local, as inferred by the boundary's lightweight
+/// shape analysis (a stand-in for `runmat-static-analysis` in the MVP).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalTy {
+    /// A scalar `f64` value.
+    Scalar,
+    /// A statically-shaped numeric array with `n` elements (flattened).
+    Array { n: usize },
+    /// Not statically resolvable; the value must be deferred to the runtime.
+    Dynamic,
 }
 
 /// Operators supported by the current scalar lowering.
@@ -57,6 +74,14 @@ fn supported_binary(op: &OperatorKind) -> bool {
             | OperatorKind::ElementwiseAnd
             | OperatorKind::ElementwiseOr
     )
+}
+
+/// Resolve a callable to its source-level name, when one exists.
+pub fn call_name(callee: &MirCallee) -> Option<String> {
+    match callee {
+        MirCallee::Static(identity) => identity.display_name(),
+        _ => None,
+    }
 }
 
 fn operand_reason(operand: &MirOperand) -> Option<String> {
@@ -97,8 +122,38 @@ fn rvalue_reason(value: &MirRvalue) -> Option<String> {
         } => operand_reason(left)
             .or_else(|| operand_reason(right))
             .or_else(|| right_temps.iter().find_map(stmt_reason)),
+        MirRvalue::Aggregate { kind, .. } => match kind {
+            runmat_mir::MirAggregateKind::Tensor => None,
+            runmat_mir::MirAggregateKind::Cell => {
+                Some("cell array literals are not supported yet".to_string())
+            }
+        },
+        MirRvalue::Call(call) => call_reason(call),
         other => Some(format!("unsupported rvalue {other:?}")),
     }
+}
+
+fn call_reason(call: &MirCall) -> Option<String> {
+    let Some(name) = call_name(&call.callee) else {
+        return Some("dynamic or non-static function call is not supported".to_string());
+    };
+    let Some(builtin) = builtins::lookup(&name) else {
+        return Some(format!(
+            "unsupported builtin `{name}` (deferred to runtime)"
+        ));
+    };
+    if !builtin.valid_arity(call.args.len()) {
+        return Some(format!(
+            "builtin `{name}` called with {} argument(s)",
+            call.args.len()
+        ));
+    }
+    call.args.iter().find_map(|arg| match arg {
+        MirCallArg::Single(operand) => operand_reason(operand),
+        MirCallArg::Expansion { .. } => {
+            Some("argument expansion (`{:}`/`varargin`) is not supported".to_string())
+        }
+    })
 }
 
 fn stmt_reason(stmt: &MirStmt) -> Option<String> {
@@ -142,7 +197,8 @@ pub trait Classifier {
 }
 
 /// The current classifier: a hand-written whitelist of the scalar-double
-/// subset with structured control flow (`if`/`while`/`for`/`switch`).
+/// subset with structured control flow (`if`/`while`/`for`/`switch`), statically
+/// shaped array literals, and the pure numeric built-ins in [`builtins`].
 pub struct WhitelistClassifier;
 
 impl Classifier for WhitelistClassifier {
@@ -158,6 +214,16 @@ impl Classifier for WhitelistClassifier {
             }
         }
 
+        // Shape analysis must fully resolve every local; anything `Dynamic`
+        // crosses the static boundary and is deferred to the runtime.
+        for (local, ty) in infer_locals(body) {
+            if ty == LocalTy::Dynamic {
+                return Verdict::Deferred {
+                    reason: format!("unresolved shape for local {local}"),
+                };
+            }
+        }
+
         Verdict::Static
     }
 }
@@ -165,4 +231,101 @@ impl Classifier for WhitelistClassifier {
 /// Classify a MIR body with the default ([`WhitelistClassifier`]) classifier.
 pub fn classify(body: &MirBody) -> Verdict {
     WhitelistClassifier.classify(body)
+}
+
+// --- Lightweight local type / shape inference ---------------------------------
+
+/// Infer the static type of every local in `body`.
+///
+/// Parameters default to [`LocalTy::Scalar`] (the MVP has no
+/// `runmat-static-analysis`, so array-typed parameters are out of scope and are
+/// treated as scalars). Array shapes are only known for tensor `Aggregate`
+/// literals; elementwise built-ins preserve their argument's shape; reductions
+/// produce a scalar. Anything else resolves to [`LocalTy::Dynamic`].
+pub fn infer_locals(body: &MirBody) -> HashMap<usize, LocalTy> {
+    let mut tys = HashMap::new();
+
+    for local in &body.locals {
+        if let Some(binding) = local.binding {
+            if body.abi.fixed_inputs.contains(&binding) {
+                tys.insert(local.id.0, LocalTy::Scalar);
+            }
+        }
+    }
+
+    for block in &body.blocks {
+        for stmt in &block.statements {
+            if let MirStmtKind::Assign { place, value } = &stmt.kind {
+                let MirPlace::Local(target) = place else {
+                    continue;
+                };
+                let ty = rvalue_ty(value, &tys);
+                tys.insert(target.0, ty);
+            }
+        }
+    }
+
+    tys
+}
+
+fn operand_ty(operand: &MirOperand, tys: &HashMap<usize, LocalTy>) -> LocalTy {
+    match operand {
+        MirOperand::Local(id) => tys.get(&id.0).copied().unwrap_or(LocalTy::Scalar),
+        MirOperand::Constant(_) => LocalTy::Scalar,
+        _ => LocalTy::Dynamic,
+    }
+}
+
+fn rvalue_ty(value: &MirRvalue, tys: &HashMap<usize, LocalTy>) -> LocalTy {
+    match value {
+        MirRvalue::Use(operand) => operand_ty(operand, tys),
+        MirRvalue::Unary(_, operand) => match operand_ty(operand, tys) {
+            LocalTy::Scalar => LocalTy::Scalar,
+            _ => LocalTy::Dynamic,
+        },
+        MirRvalue::Binary(lhs, _, rhs) => {
+            if operand_ty(lhs, tys) == LocalTy::Scalar && operand_ty(rhs, tys) == LocalTy::Scalar {
+                LocalTy::Scalar
+            } else {
+                LocalTy::Dynamic
+            }
+        }
+        MirRvalue::ShortCircuit { .. } => LocalTy::Scalar,
+        MirRvalue::Aggregate {
+            kind, rows, cols, ..
+        } => match kind {
+            runmat_mir::MirAggregateKind::Tensor => LocalTy::Array { n: rows * cols },
+            runmat_mir::MirAggregateKind::Cell => LocalTy::Dynamic,
+        },
+        MirRvalue::Call(call) => call_ty(call, tys),
+        _ => LocalTy::Dynamic,
+    }
+}
+
+fn call_ty(call: &MirCall, tys: &HashMap<usize, LocalTy>) -> LocalTy {
+    let Some(name) = call_name(&call.callee) else {
+        return LocalTy::Dynamic;
+    };
+    let Some(builtin) = builtins::lookup(&name) else {
+        return LocalTy::Dynamic;
+    };
+
+    let args: Vec<LocalTy> = call
+        .args
+        .iter()
+        .map(|arg| match arg {
+            MirCallArg::Single(operand) => operand_ty(operand, tys),
+            MirCallArg::Expansion { .. } => LocalTy::Dynamic,
+        })
+        .collect();
+
+    match builtin {
+        // Elementwise unary: preserves the argument's shape.
+        Builtin::Unary(_) => args.first().copied().unwrap_or(LocalTy::Dynamic),
+        // `min`/`max`: reduction over one array, or elementwise over two
+        // scalars — both produce a scalar in the supported subset.
+        Builtin::MinMax(_) => LocalTy::Scalar,
+        // Everything else in the supported set is scalar-valued.
+        Builtin::Binary(_) | Builtin::Sign | Builtin::Reduce(_) => LocalTy::Scalar,
+    }
 }
