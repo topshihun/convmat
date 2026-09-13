@@ -15,14 +15,17 @@ to MLIR and aims to be a better MATLAB Coder.
   toolchain recent (Rust 1.85+).
 - Frontend dependencies (all 0.6.2, mandatory): `runmat-parser`,
   `runmat-hir`, `runmat-mir`.
-- Authoritative architecture and conventions live in `AGENTS.md` (project root);
-  follow it and keep this skill in sync.
+- Authoritative architecture lives in `docs/architecture.md`; agent working
+  conventions live in `AGENTS.md` (project root). Follow both and keep this
+  skill in sync.
 - Backend dependency: `melior` 0.27.8 (safe MLIR bindings). Requires a local
   MLIR/LLVM 22 install (`libMLIR` + `libMLIR-C`) and `mlir-translate` on
   `PATH` for the C backend.
 - `runmat-static-analysis` is intentionally excluded: it pulls
   runmat-vm -> runmat-runtime -> native HDF5/OpenBLAS, which the MVP does not
-  need. Type/shape inference is deferred; scalars default to `double`.
+  need. Shape inference is lightweight and local (`src/triage::infer_locals`);
+  array shapes are static-only (from literals) and array parameters default to
+  scalars.
 - `runmat`/`melior` are mandatory (not feature-gated): code generation is the
   whole point of the crate.
 

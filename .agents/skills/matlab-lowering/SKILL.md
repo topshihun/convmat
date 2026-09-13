@@ -10,14 +10,18 @@ semantics into MLIR.
 
 ## Target dialects
 
-Start with the core MLIR dialects available through `melior`:
+melior 0.27.8 exposes **typed builders** for these dialects:
 
-- `arith` — scalar arithmetic and type casts for elementwise math.
-- `linalg` — named structured ops (matmul, reductions, generic) for array code.
+- `arith` — scalar arithmetic / comparisons / casts / select.
 - `func` — function definitions and calls.
-- `cf` / `scf` — control flow and loops (`for`/`while` lowering).
-- `memref` / `tensor` — dense arrays and their lowering path.
+- `scf` / `cf` — structured control flow (`if`/`while`/`for`).
+- `memref` — dense arrays (`alloca` / `alloc` / `load` / `store`).
 - `index` — loop induction and indexing.
+
+`linalg` / `tensor` / `math` / `emitc` have **no typed builders**, but their
+**pass factories are available** (`melior::pass::{linalg,tensor,math,conversion}`).
+Emit those ops via the generic `OperationBuilder` (by op name) when needed, and
+drive them with the corresponding passes.
 
 Introduce a `convmat` dialect only after the core dialects prove insufficient
 for MATLAB-specific semantics (e.g. colon indexing, `end`, dynamic typing).
@@ -28,15 +32,20 @@ for MATLAB-specific semantics (e.g. colon indexing, `end`, dynamic typing).
    runtime type descriptor or boxed value until static analysis (via
    `runmat-static-analysis`) proves a concrete element type/shape, then lower
    to `memref`/`tensor`.
-2. **Arrays**: map matrix ops to `linalg` on `memref<...x...>` after shape
-   inference; fall back to a runtime-library call for shape-dependent code.
+2. **Arrays**: static shapes are tracked in `Shape`/`LocalTy` and stored as a
+   flattened column-major `memref<nxf64>` with shape metadata; elementwise,
+   transpose, matmul, and reductions lower to `scf`/`arith` directly (matmul and
+   reductions are compile-time unrolled for static shapes). Reserve `linalg` for
+   later fusion/vectorization, and defer dynamic shapes to the runtime.
 3. **Control flow**: `for` loops lower to `scf.for`; `while` to `scf.while`;
-   `if`/`switch` to `scf.if`/`cf.cond_br`.
-4. **Functions**: `function` files become `func.func`; respect MATLAB
-   pass-by-value semantics when lowering arguments.
-5. **Built-ins**: call into the runmat builtin/runtime layer first, and only
-   inline or pattern-match a builtin once it is on a hot path and its
-   semantics are verified.
+   `if`/`switch` to `scf.if` (a nested if/else chain).
+4. **Functions**: `function` files become `func.func`; scalar outputs return,
+   array outputs become caller-allocated out-pointer parameters (the ABI in
+   `docs/architecture.md` §5).
+5. **Built-ins**: pure numeric built-ins lower to `func.call @libm` via the
+   `src/builtins.rs` table (with a private `func.func` declaration emitted once);
+   `sign` and `min`/`max` over scalars lower inline. Impure or dynamic built-ins
+   defer to the runtime.
 
 ## Verification
 

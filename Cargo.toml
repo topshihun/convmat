@@ -12,7 +12,8 @@ license = "MIT OR Apache-2.0"
 #
 # NOTE: runmat-static-analysis is deliberately excluded: it pulls runmat-vm ->
 # runmat-runtime -> native HDF5/OpenBLAS, which we don't need for the MVP.
-# Type/shape inference is deferred; scalars default to double.
+# Shape inference is lightweight and local (src/triage); array shapes are
+# static-only (from literals) and array parameters default to scalars.
 [dependencies]
 thiserror = "2"
 anyhow = "1"

@@ -38,7 +38,7 @@ pub const MAX_RANK: usize = 4;
 /// [`Shape::Static`] is resolved at compile time and lowered to a static
 /// `memref<nxf64>` (stack or caller buffer). [`Shape::Dynamic`] is only known at
 /// runtime and is deferred to a `memref<?×…×f64>` plus a shape descriptor — that
-/// tier is not implemented yet (P7, see `AGENTS.md` §13.2).
+/// tier is not implemented yet (P7, see `docs/architecture.md` §11.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shape {
     /// Compile-time known dimensions.
