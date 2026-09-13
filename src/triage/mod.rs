@@ -14,8 +14,8 @@ use std::collections::HashMap;
 
 use runmat_hir::OperatorKind;
 use runmat_mir::{
-    MirBody, MirCall, MirCallArg, MirCallee, MirConstant, MirOperand, MirPlace, MirRvalue, MirStmt,
-    MirStmtKind, MirTerminator, MirTerminatorKind,
+    MirBody, MirCall, MirCallArg, MirCallee, MirConstant, MirIndexComponent, MirIndexing,
+    MirOperand, MirPlace, MirRvalue, MirStmt, MirStmtKind, MirTerminator, MirTerminatorKind,
 };
 
 use crate::builtins::{self, Builtin};
@@ -29,14 +29,58 @@ pub enum Verdict {
     Deferred { reason: String },
 }
 
+/// Maximum tensor rank tracked by the lightweight shape analysis.
+pub const MAX_RANK: usize = 4;
+
+/// The static shape of a numeric array, in MATLAB column-major logical order
+/// (`dims[0]` is rows, `dims[1]` is columns, and so on).
+///
+/// Arrays are stored in a flattened `memref<nxf64>` whose linear layout follows
+/// column-major order; [`Shape`] records the logical dimensions so that
+/// dimension-aware operations (transpose, `*`, reductions along an axis) can
+/// compute the correct column-major strides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shape {
+    /// Number of meaningful dimensions (at least 2 for a MATLAB matrix).
+    pub rank: usize,
+    /// Dimension sizes; only the first `rank` entries are meaningful.
+    pub dims: [usize; MAX_RANK],
+}
+
+impl Shape {
+    /// A 2-D `rows x cols` shape.
+    pub fn matrix(rows: usize, cols: usize) -> Self {
+        let mut dims = [1; MAX_RANK];
+        dims[0] = rows;
+        dims[1] = cols;
+        Shape { rank: 2, dims }
+    }
+
+    /// Total element count (`numel`).
+    pub fn numel(&self) -> usize {
+        self.dims[..self.rank].iter().product()
+    }
+
+    /// Column-major linear offset of the given logical index.
+    pub fn linear(&self, index: &[usize]) -> usize {
+        let mut offset = 0;
+        let mut stride = 1;
+        for (k, &coord) in index.iter().take(self.rank).enumerate() {
+            offset += coord * stride;
+            stride *= self.dims[k];
+        }
+        offset
+    }
+}
+
 /// The static type of a MIR local, as inferred by the boundary's lightweight
 /// shape analysis (a stand-in for `runmat-static-analysis` in the MVP).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalTy {
     /// A scalar `f64` value.
     Scalar,
-    /// A statically-shaped numeric array with `n` elements (flattened).
-    Array { n: usize },
+    /// A statically-shaped `f64` array.
+    Array { shape: Shape },
     /// Not statically resolvable; the value must be deferred to the runtime.
     Dynamic,
 }
@@ -129,6 +173,15 @@ fn rvalue_reason(value: &MirRvalue) -> Option<String> {
             }
         },
         MirRvalue::Call(call) => call_reason(call),
+        MirRvalue::Index { base, indexing } => operand_reason(base).or_else(|| {
+            indexing
+                .components
+                .iter()
+                .find_map(|component| match component {
+                    MirIndexComponent::Expr(operand) => operand_reason(operand),
+                    MirIndexComponent::Colon | MirIndexComponent::End { .. } => None,
+                })
+        }),
         other => Some(format!("unsupported rvalue {other:?}")),
     }
 }
@@ -279,26 +332,95 @@ fn operand_ty(operand: &MirOperand, tys: &HashMap<usize, LocalTy>) -> LocalTy {
 fn rvalue_ty(value: &MirRvalue, tys: &HashMap<usize, LocalTy>) -> LocalTy {
     match value {
         MirRvalue::Use(operand) => operand_ty(operand, tys),
-        MirRvalue::Unary(_, operand) => match operand_ty(operand, tys) {
-            LocalTy::Scalar => LocalTy::Scalar,
-            _ => LocalTy::Dynamic,
-        },
-        MirRvalue::Binary(lhs, _, rhs) => {
-            if operand_ty(lhs, tys) == LocalTy::Scalar && operand_ty(rhs, tys) == LocalTy::Scalar {
-                LocalTy::Scalar
-            } else {
-                LocalTy::Dynamic
-            }
+        MirRvalue::Unary(op, operand) => unary_ty(*op, operand_ty(operand, tys)),
+        MirRvalue::Binary(lhs, op, rhs) => {
+            binary_ty(operand_ty(lhs, tys), *op, operand_ty(rhs, tys))
         }
         MirRvalue::ShortCircuit { .. } => LocalTy::Scalar,
         MirRvalue::Aggregate {
             kind, rows, cols, ..
         } => match kind {
-            runmat_mir::MirAggregateKind::Tensor => LocalTy::Array { n: rows * cols },
+            runmat_mir::MirAggregateKind::Tensor => LocalTy::Array {
+                shape: Shape::matrix(*rows, *cols),
+            },
             runmat_mir::MirAggregateKind::Cell => LocalTy::Dynamic,
         },
         MirRvalue::Call(call) => call_ty(call, tys),
+        MirRvalue::Index { base, indexing } => index_ty(operand_ty(base, tys), indexing),
         _ => LocalTy::Dynamic,
+    }
+}
+
+/// Elementwise operators that accept array operands (with scalar broadcast).
+fn is_elementwise(op: OperatorKind) -> bool {
+    matches!(
+        op,
+        OperatorKind::Add
+            | OperatorKind::Subtract
+            | OperatorKind::ElementwiseMultiply
+            | OperatorKind::ElementwiseDivide
+            | OperatorKind::ElementwiseLeftDivide
+            | OperatorKind::Equal
+            | OperatorKind::NotEqual
+            | OperatorKind::Less
+            | OperatorKind::LessEqual
+            | OperatorKind::Greater
+            | OperatorKind::GreaterEqual
+            | OperatorKind::ElementwiseAnd
+            | OperatorKind::ElementwiseOr
+    )
+}
+
+fn unary_ty(op: OperatorKind, ty: LocalTy) -> LocalTy {
+    match (op, ty) {
+        // 2-D transpose swaps the first two dimensions.
+        (OperatorKind::Transpose | OperatorKind::ConjugateTranspose, LocalTy::Array { shape }) => {
+            if shape.rank == 2 {
+                LocalTy::Array {
+                    shape: Shape::matrix(shape.dims[1], shape.dims[0]),
+                }
+            } else {
+                LocalTy::Dynamic
+            }
+        }
+        // Unary minus/plus/not preserve the shape elementwise.
+        (_, LocalTy::Array { shape }) => LocalTy::Array { shape },
+        (_, LocalTy::Scalar) => LocalTy::Scalar,
+        (_, LocalTy::Dynamic) => LocalTy::Dynamic,
+    }
+}
+
+fn binary_ty(lhs: LocalTy, op: OperatorKind, rhs: LocalTy) -> LocalTy {
+    use LocalTy::*;
+
+    match (lhs, rhs) {
+        (Scalar, Scalar) => Scalar,
+        (Dynamic, _) | (_, Dynamic) => Dynamic,
+        // Scalar broadcast against an array (`*` behaves like `.*` here).
+        (Scalar, Array { shape }) | (Array { shape }, Scalar) => {
+            if is_elementwise(op) || op == OperatorKind::MatrixMultiply {
+                Array { shape }
+            } else {
+                Dynamic
+            }
+        }
+        // Two arrays: elementwise when the shapes agree; `*` is a matmul.
+        (Array { shape: lhs_shape }, Array { shape: rhs_shape }) => match op {
+            OperatorKind::MatrixMultiply => matmul_ty(lhs_shape, rhs_shape),
+            _ if lhs_shape == rhs_shape && is_elementwise(op) => Array { shape: lhs_shape },
+            _ => Dynamic,
+        },
+    }
+}
+
+/// The shape of `A * B` for two 2-D operands (`m x k` times `k x n`).
+fn matmul_ty(lhs: Shape, rhs: Shape) -> LocalTy {
+    if lhs.rank == 2 && rhs.rank == 2 && lhs.dims[1] == rhs.dims[0] {
+        LocalTy::Array {
+            shape: Shape::matrix(lhs.dims[0], rhs.dims[1]),
+        }
+    } else {
+        LocalTy::Dynamic
     }
 }
 
@@ -322,10 +444,139 @@ fn call_ty(call: &MirCall, tys: &HashMap<usize, LocalTy>) -> LocalTy {
     match builtin {
         // Elementwise unary: preserves the argument's shape.
         Builtin::Unary(_) => args.first().copied().unwrap_or(LocalTy::Dynamic),
-        // `min`/`max`: reduction over one array, or elementwise over two
-        // scalars — both produce a scalar in the supported subset.
-        Builtin::MinMax(_) => LocalTy::Scalar,
+        // Reductions: one array argument reduces to a scalar; a second numeric
+        // argument selects the dimension to reduce along (array result).
+        Builtin::MinMax(_) | Builtin::Reduce(_) => match args.as_slice() {
+            [LocalTy::Scalar] | [LocalTy::Array { .. }] | [LocalTy::Scalar, LocalTy::Scalar] => {
+                LocalTy::Scalar
+            }
+            [LocalTy::Array { shape }, _] => match reduction_dim(call) {
+                Some(dim) => reduce_axis_ty(*shape, dim),
+                None => LocalTy::Dynamic,
+            },
+            _ => LocalTy::Dynamic,
+        },
+        // Shape introspection: scalar results, except `size(A)` (a 1x2 vector).
+        Builtin::Numel | Builtin::Length => LocalTy::Scalar,
+        Builtin::Size => {
+            if call.args.len() == 1 {
+                LocalTy::Array {
+                    shape: Shape::matrix(1, 2),
+                }
+            } else {
+                LocalTy::Scalar
+            }
+        }
         // Everything else in the supported set is scalar-valued.
-        Builtin::Binary(_) | Builtin::Sign | Builtin::Reduce(_) => LocalTy::Scalar,
+        Builtin::Binary(_) | Builtin::Sign => LocalTy::Scalar,
+        // Constructors and reshape: array shapes from constant dim arguments.
+        Builtin::Fill(_) | Builtin::Eye => match (constant_arg(call, 0), constant_arg(call, 1)) {
+            (Some(n), None) => LocalTy::Array {
+                shape: Shape::matrix(n, n),
+            },
+            (Some(rows), Some(cols)) => LocalTy::Array {
+                shape: Shape::matrix(rows, cols),
+            },
+            _ => LocalTy::Dynamic,
+        },
+        Builtin::Reshape => match (constant_arg(call, 1), constant_arg(call, 2)) {
+            (Some(rows), Some(cols)) => LocalTy::Array {
+                shape: Shape::matrix(rows, cols),
+            },
+            _ => LocalTy::Dynamic,
+        },
+    }
+}
+
+/// The constant `usize` value of the `index`-th argument of a call, if present.
+fn constant_arg(call: &MirCall, index: usize) -> Option<usize> {
+    match call.args.get(index) {
+        Some(MirCallArg::Single(MirOperand::Constant(MirConstant::Number(text)))) => {
+            text.trim().parse::<usize>().ok()
+        }
+        _ => None,
+    }
+}
+
+/// The 1-based dimension argument of a reduction call, if present and constant.
+fn reduction_dim(call: &MirCall) -> Option<usize> {
+    if call.args.len() < 2 {
+        return None;
+    }
+    match &call.args[1] {
+        MirCallArg::Single(MirOperand::Constant(MirConstant::Number(text))) => {
+            text.trim().parse::<usize>().ok()
+        }
+        _ => None,
+    }
+}
+
+/// The shape of reducing a 2-D array along dimension `dim` (1 or 2).
+fn reduce_axis_ty(shape: Shape, dim: usize) -> LocalTy {
+    if shape.rank != 2 {
+        return LocalTy::Dynamic;
+    }
+    let mut reduced = shape;
+    match dim {
+        1 => reduced.dims[0] = 1,
+        2 => reduced.dims[1] = 1,
+        _ => return LocalTy::Dynamic,
+    }
+    LocalTy::Array { shape: reduced }
+}
+
+/// The type of an indexing expression `base(...)`.
+fn index_ty(base: LocalTy, indexing: &MirIndexing) -> LocalTy {
+    let LocalTy::Array { shape } = base else {
+        return LocalTy::Dynamic;
+    };
+    let has_colon = indexing
+        .components
+        .iter()
+        .any(|component| matches!(component, MirIndexComponent::Colon));
+    if has_colon {
+        // `A(:)` flattens to a column vector; other slices are deferred.
+        if indexing.components.len() == 1
+            && matches!(indexing.components[0], MirIndexComponent::Colon)
+        {
+            LocalTy::Array {
+                shape: Shape::matrix(shape.numel(), 1),
+            }
+        } else {
+            LocalTy::Dynamic
+        }
+    } else {
+        // Constant or `end` subscript reads produce a scalar.
+        LocalTy::Scalar
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shape_numel() {
+        assert_eq!(Shape::matrix(1, 3).numel(), 3);
+        assert_eq!(Shape::matrix(3, 1).numel(), 3);
+        assert_eq!(Shape::matrix(2, 3).numel(), 6);
+    }
+
+    #[test]
+    fn shape_linear_is_column_major() {
+        // A 2x3 matrix stores element (row, col) at offset col*rows + row.
+        let shape = Shape::matrix(2, 3);
+        assert_eq!(shape.linear(&[0, 0]), 0);
+        assert_eq!(shape.linear(&[1, 0]), 1);
+        assert_eq!(shape.linear(&[0, 1]), 2);
+        assert_eq!(shape.linear(&[1, 1]), 3);
+        assert_eq!(shape.linear(&[0, 2]), 4);
+        assert_eq!(shape.linear(&[1, 2]), 5);
+    }
+
+    #[test]
+    fn row_and_column_vectors_have_distinct_shapes() {
+        assert_eq!(Shape::matrix(1, 3), Shape::matrix(1, 3));
+        assert_ne!(Shape::matrix(1, 3), Shape::matrix(3, 1));
     }
 }

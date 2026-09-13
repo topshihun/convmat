@@ -134,10 +134,11 @@ fn codegen_for_loop_with_step() {
 
 #[test]
 fn codegen_one_sided_if() {
-    // `if` without an `else` lowers to an `scf.if` with an empty else region.
+    // `if` without an `else` lowers to an `scf.if` with an empty else region,
+    // which canonicalize folds away into a plain `if (...)` in the C output.
     let c = compile_fixture("ifonly");
     assert!(c.contains("double clamp_hi("), "got:\n{c}");
-    assert!(c.contains("else"), "got:\n{c}");
+    assert!(c.contains("if ("), "got:\n{c}");
 }
 
 #[test]
@@ -386,4 +387,150 @@ fn lower_builtin_to_func_call() {
     let mlir = lower_fixture("sin_array");
     assert!(mlir.contains("func.call @sin"), "got:\n{mlir}");
     assert!(mlir.contains("func.func private @sin"), "got:\n{mlir}");
+}
+
+// --- Matrix / vector shape support (P1) --------------------------------------
+
+#[test]
+fn codegen_matrix_literal() {
+    // A 2x2 matrix flattens to four elements (column-major) and returns via an
+    // out-parameter of that size.
+    let c = compile_fixture("matrix2d");
+    assert!(c.contains("void matrix2d(double v1[4])"), "got:\n{c}");
+}
+
+#[test]
+fn codegen_column_vector_literal() {
+    let c = compile_fixture("colvec");
+    assert!(c.contains("void colvec(double v1[3])"), "got:\n{c}");
+}
+
+#[test]
+fn codegen_row_vector_literal() {
+    let c = compile_fixture("rowvec");
+    assert!(c.contains("void rowvec(double v1[3])"), "got:\n{c}");
+}
+
+// --- Matrix elementwise operators / broadcast / transpose (P2) ----------------
+
+#[test]
+fn codegen_matrix_add() {
+    let c = compile_fixture("mat_add");
+    assert!(c.contains("void mat_add(double v1[4])"), "got:\n{c}");
+    assert!(c.contains("for ("), "got:\n{c}");
+}
+
+#[test]
+fn codegen_matrix_scalar_broadcast() {
+    let c = compile_fixture("mat_broadcast");
+    assert!(c.contains("void mat_broadcast(double v1[4])"), "got:\n{c}");
+    assert!(c.contains("for ("), "got:\n{c}");
+}
+
+#[test]
+fn codegen_matrix_transpose() {
+    let c = compile_fixture("mat_transpose");
+    assert!(c.contains("void mat_transpose(double v1[4])"), "got:\n{c}");
+}
+
+#[test]
+fn codegen_matrix_elementwise_scale() {
+    let c = compile_fixture("mat_scale");
+    assert!(c.contains("void mat_scale(double v1[4])"), "got:\n{c}");
+    assert!(c.contains('*'), "got:\n{c}");
+}
+
+#[test]
+fn codegen_matrix_comparison() {
+    let c = compile_fixture("mat_cmp");
+    assert!(c.contains("void mat_cmp(double v1[4])"), "got:\n{c}");
+    assert!(c.contains("bool"), "got:\n{c}");
+}
+
+// --- Matrix multiplication (P3) ----------------------------------------------
+
+#[test]
+fn codegen_matrix_multiply() {
+    let c = compile_fixture("matmul");
+    assert!(c.contains("void matmul(double v1[4])"), "got:\n{c}");
+    assert!(c.contains('*'), "got:\n{c}");
+}
+
+#[test]
+fn codegen_matrix_vector_multiply() {
+    let c = compile_fixture("matvec");
+    assert!(c.contains("void matvec(double v1[2])"), "got:\n{c}");
+    assert!(c.contains('*'), "got:\n{c}");
+}
+
+// --- Dimension reductions & shape introspection (P4) ---------------------------
+
+#[test]
+fn codegen_reduce_along_dim1() {
+    let c = compile_fixture("sum_dim1");
+    assert!(c.contains("void sum_dim1(double v1[2])"), "got:\n{c}");
+}
+
+#[test]
+fn codegen_reduce_along_dim2() {
+    let c = compile_fixture("sum_dim2");
+    assert!(c.contains("void sum_dim2(double v1[2])"), "got:\n{c}");
+}
+
+#[test]
+fn codegen_shape_introspection() {
+    let c = compile_fixture("shape_intro");
+    assert!(c.contains("double shape_intro("), "got:\n{c}");
+}
+
+#[test]
+fn codegen_size_vector() {
+    let c = compile_fixture("size_vec");
+    assert!(c.contains("void size_vec(double v1[2])"), "got:\n{c}");
+}
+
+// --- Constructors & reshape (P4) ---------------------------------------------
+
+#[test]
+fn codegen_zeros_constructor() {
+    let c = compile_fixture("zeros2x3");
+    assert!(c.contains("void zeros2x3(double v1[6])"), "got:\n{c}");
+}
+
+#[test]
+fn codegen_ones_constructor() {
+    let c = compile_fixture("ones2x2");
+    assert!(c.contains("void ones2x2(double v1[4])"), "got:\n{c}");
+}
+
+#[test]
+fn codegen_eye_constructor() {
+    let c = compile_fixture("eye2");
+    assert!(c.contains("void eye2(double v1[4])"), "got:\n{c}");
+}
+
+#[test]
+fn codegen_reshape() {
+    let c = compile_fixture("reshape2x2");
+    assert!(c.contains("void reshape2x2(double v1[4])"), "got:\n{c}");
+}
+
+// --- Indexing (P5) -----------------------------------------------------------
+
+#[test]
+fn codegen_scalar_indexing() {
+    let c = compile_fixture("index_scalar");
+    assert!(c.contains("double index_scalar("), "got:\n{c}");
+}
+
+#[test]
+fn codegen_end_indexing() {
+    let c = compile_fixture("index_end");
+    assert!(c.contains("double index_end("), "got:\n{c}");
+}
+
+#[test]
+fn codegen_colon_indexing() {
+    let c = compile_fixture("index_colon");
+    assert!(c.contains("void index_colon(double v1[4])"), "got:\n{c}");
 }

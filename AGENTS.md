@@ -22,6 +22,8 @@
 | 可/不可生成代码的边界 | 静态分析后按「类型/形状是否确定 + 是否封闭世界」做函数级/表达式级分类 |
 | 代码生成后端 | 今天 `emitc` 方言 → C；后端做成可插拔策略，预留 LLVM/GPU 等 |
 | 函数 ABI（跨函数传值） | 能由 C 直接表示的值走返回值；数组/可变长等走**输出指针入参**，空间由调用方分配 |
+| 数组/矩阵值模型 | 静态形状 `Shape`（列主序）+ 扁平 `memref<nxf64>` 存储，维度元数据驱动转置/乘法/按维归约 |
+| 内建函数降级 | 纯数值内建 → C `libm` 的 `func.call` 或内联 pattern；有副作用/形状未知的 → 运行时兔底 |
 | 是否自定义方言 | **暂不自定义**；先只用核心方言，动态语义走运行时库调用 |
 | 复用原则 | 能用 MLIR 的（passes、验证、后端）就不自研 |
 
@@ -165,8 +167,9 @@ flowchart TD
 |----|------------------|------|-----------|
 | 0 前端 | `runmat-parser/hir/mir/static-analysis` | 解析、HIR、MIR、静态分析 | 复用 runmat |
 | 1 输入 | `src/frontend/` | 读取 `.m`、驱动 runmat 前端、产出 MIR | 薄封装 |
-| 2 边界 | `src/triage/` | 静态 vs 动态分类，产出「可生成代码计划」+ 诊断 | 自研（核心） |
+| 2 边界 | `src/triage/` | 静态 vs 动态分类，产出「可生成代码计划」+ 形状推断（`Shape`/`LocalTy`） | 自研（核心） |
 | 3 降级 | `src/mir_to_mlir/` | MIR → 核心方言 MLIR；动态部分 → 运行时调用 | 自研（核心） |
+| 3.5 内建表 | `src/builtins.rs` | 内建函数名 → 降级配方（`libm` 符号/归约/内联） | 自研（薄表） |
 | 4 管线 | `src/passes/` | 调 melior 运行上游 passes（canonicalize/CSE/...） | 复用 MLIR |
 | 5 后端 | `src/backend/` | 后端策略：`emitc`（今天）、`llvm`/`gpu`（预留） | 复用 MLIR |
 | 6 运行时 | `runtime/`（或复用 runmat runtime） | 内存管理、动态盒、内置函数、兜底语义 | 复用 + 薄 shim |
@@ -236,3 +239,85 @@ flowchart TD
 
 - 遵循个人 AGENTS.md 的提交信息规范（祈使句、50 字符主题行、72 字符正文）。
 - 一个提交只做一件事；架构或规范类改动同时更新本文件。
+
+## 12. 矩阵/数组支持与内建函数降级（现状与路线）
+
+### 12.1 值模型
+
+- **形状**：`Shape { rank, dims: [usize; 4] }`，记录 MATLAB 逻辑维度（`dims[0]` 行、
+  `dims[1]` 列、…），行向量 `1×N` 与列向量 `M×1` 被区分对待。
+- **存储**：扁平 `memref<nxf64>`，`n = numel`，线性顺序为 **MATLAB 列主序**。
+  `runmat` 的 `Aggregate.elements` 是行主序，降级时在字面量边界做转置。
+- **类型格**：`LocalTy::{Scalar, Array{shape}, Dynamic}`；元素类型暂只 `f64`（`logical`
+  仍以 `f64` 的 0/1 表示，`single/int/complex` 延后）。
+- 形状来源：静态分析只有字面量 + 形状传播（转置/乘/按维归约）；形参默认标量，
+  数组形参需 `runmat-static-analysis`（见 12.5）。
+
+### 12.2 运算符
+
+- 逐元素（同形数组或标量广播）：`+ - .* ./ .\` 及比较 `== < > ~= <= >=`、逻辑 `& |`。
+- 转置：`.'` / `'`（2-D 交换 `dims[0]`/`dims[1]`，列主序下用维度元数据做下标重排）。
+- 矩阵乘：`*`（`m×k · k×n → m×n`），编译期展开三层乘加；矩阵/向量乘由同一条路径覆盖。
+- `mrdivide`/`mldivide`（`/` `\`）、`^`（mpower）、数组×数组广播、N-D 转置 → 延后。
+
+### 12.3 内建函数降级
+
+`src/builtins.rs` 维护「内建名 → 配方」薄表，`MirCall` 按配方降级：
+
+- **一元逐元素**（标量/数组）：`sin cos tan asin acos atan sinh cosh tanh exp log log10
+  log2 sqrt abs floor ceil round` → `func.call @libm`（模块顶部声明 `func.func private`）。
+- **二元逐元素**（标量）：`pow atan2 hypot mod rem` → `func.call @libm`。
+- **内联**：`sign`、`min`/`max`（两标量 → `fmin`/`fmax`）。
+- **归约**：`sum prod min max`（一参 → 全归约到标量；二参 `(A, dim)` → 按维归约到
+  行/列向量）。
+- **形状内省**：`numel length size(A,dim) size(A)`。
+- **构造器/重塑**：`zeros(m,n) ones(m,n) eye(n) reshape(A,m,n)`（维度须为常量）。
+- 未支持/有副作用/形状未知的内建 → 运行时兔底（`Error::NotLowerable`）。
+
+### 12.4 pass 管线
+
+```text
+lower(arith/scf/memref/func + func.call libm)
+  → canonicalize
+  → cse
+  → convert-to-emitc
+  → reconcile-unrealized-casts
+  → mlir-translate --mlir-to-cpp
+```
+
+`linalg`/`tensor`/`math` 的 pass 工厂（融合/分块/向量化/bufferize）melior 已提供，但
+类型化 builder 未暴露；后续若需要 linalg 优化，用通用 `OperationBuilder` 按 op 名发射
+再跑上游 pass（见 §6 渐进式降级）。
+
+### 12.5 路线状态
+
+| 阶段 | 状态 | 说明 |
+|------|------|------|
+| P1 形状模型 | ✅ 完成 | `Shape`/`LocalTy`、列主序、行/列/N-D 元数据 |
+| P2 逐元素/广播/转置/逻辑 | ✅ 完成 | 同形数组 + 标量广播 + 2-D 转置 |
+| P3 矩阵乘 | ✅ 完成 | `*` 编译期展开（尚未接 linalg） |
+| P4 内建 | 🟡 部分 | 归约(含按维)+形状内省+`zeros/ones/eye/reshape` 已做；`permute/repmat/cat/horzcat/vertcat` 未做 |
+| P5 索引/冒号/`end` | 🟡 部分 | 常量下标 `A(i,j)`、线性 `A(i)`、`end`、`A(:)` 已做；`A(i,:)`/`A(:,j)`/冒号区间/变量下标未做 |
+| P6 优化 | 🟡 部分 | 已接 `canonicalize`+`cse`；linalg 融合/向量化未接 |
+| P7 动态形状 | ⛔ 未做 | 需 `runmat-static-analysis`（见下方依赖困难） |
+
+> 数组形参目前被当作标量；`sum(param)` 等会被解释为标量恒等。这是无静态分析下的
+> 已知限制，P7 接入静态分析后解决（动态形状走 `memref<?×…>` + 形状描述 ABI）。
+
+**P7 依赖困难（已实测 `cargo add runmat-static-analysis`）**：
+
+- 依赖链是 `runmat-static-analysis → runmat-vm → runmat-runtime`，`runmat-runtime`
+  带原生依赖：
+  - **HDF5**（`hdf5-metno-sys`）：本机无系统 HDF5，`cargo check` 立即失败：
+    `Unable to locate HDF5 root directory and/or headers`。
+  - **OpenBLAS**（`openblas-src`）：需要 Fortran 编译器从源码编译，本机无 `gfortran`；
+    即使 HDF5 解决，也会在此失败或耗时 10+ 分钟。
+  - 另通过 `runmat-accelerate`（→ `wgpu`）引入 GPU 栈，以及 filesystem/plot/zip/zstd
+    等大量间接依赖（`cargo add` 新增数百个 crate）。
+- 依赖成本与 convmat「薄编译器」目标冲突：为拿「类型/形状推断」却要编译整个 runmat
+  解释器/运行时。
+- `runmat-static-analysis` 是 pre-1.0，驱动入口 API 未文档化，需自行摸索如何对 MIR/HIR
+  产出逐变量类型/形状。
+
+> 建议：优先自写一个聚焦数值子集的轻量类型/形状推断（扩展当前 `infer_locals`），
+> 而非引入整个 VM 栈；或把静态分析做成 feature gate 并接受原生构建成本。

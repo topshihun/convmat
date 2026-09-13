@@ -1,13 +1,12 @@
 //! Layer 4: run MLIR passes.
 //!
 //! `convert_to_emitc` lowers the core-dialect MLIR (`func`/`arith`/`scf`/
-//! `memref`) to the `emitc` dialect using melior's pass manager. This is a
-//! deliberately simple pipeline (no optimization), reserved to grow into
-//! canonicalize/CSE/linalg transforms later.
+//! `memref`) to the `emitc` dialect using melior's pass manager. Before the
+//! emitc conversion, `canonicalize` and `cse` clean up the lowered IR.
 
 use melior::{
     ir::Module,
-    pass::{conversion, PassManager},
+    pass::{conversion, transform, PassManager},
 };
 
 use crate::error::{Error, Result};
@@ -22,6 +21,8 @@ use crate::error::{Error, Result};
 /// `!emitc.size_t`) so the result is printable.
 pub fn convert_to_emitc(context: &melior::Context, module: &mut Module) -> Result<String> {
     let manager = PassManager::new(context);
+    manager.add_pass(transform::create_canonicalizer());
+    manager.add_pass(transform::create_cse());
     manager.add_pass(conversion::create_to_emit_c());
     manager.add_pass(conversion::create_reconcile_unrealized_casts());
     manager
