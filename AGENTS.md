@@ -22,6 +22,7 @@
 | 可/不可生成代码的边界 | 静态分析后按「类型/形状是否确定 + 是否封闭世界」做函数级/表达式级分类 |
 | 代码生成后端 | 今天 `emitc` 方言 → C；后端做成可插拔策略，预留 LLVM/GPU 等 |
 | 函数 ABI（跨函数传值） | 能由 C 直接表示的值走返回值；数组/可变长等走**输出指针入参**，空间由调用方分配 |
+| 可变参数（varargin/varargout） | 封闭世界内按调用点特化（`nargin`/`nargout` 常量折叠）；开放世界降为运行时 cell + `Value` 盒 |
 | 编译期/运行期值分级 | 类型/形状编译期已定的走核心方言（静态 `memref`）；运行期才定的走运行时 + 形状描述符 |
 | 内存管理 | 静态局部走栈（`memref.alloca`）、跨函数走调用方分配的输出指针、动态/增长走运行时堆（`alloc`/`dealloc`） |
 | 数组/矩阵值模型 | `Shape::Static`（列主序 `memref<nxf64>`）与 `Shape::Dynamic`（`memref<?…>` + 形状描述符） |
@@ -66,10 +67,10 @@ MATLAB 是动态语言，无法（也不应）要求所有代码都静态可编�
 2. **形状可控**：需要静态形状的地方（例如进入 `memref`/`tensor` 的数组）形状已推断；
    形状运行期才确定的，降级为运行时库调用。
 3. **封闭世界**：被调用的函数要么同样可生成代码，要么被声明为外部符号（映射到运行时
-   C 函数）。
+   C 函数）。`varargin`/`varargout` 只有在封闭世界内、且所有调用点已知时才能静态化
+   （按调用点特化，见 §14）；开放世界则降为动态。
 4. **不含不支持的构造**：如 `eval`/`evalin`、字符串形式的 `feval`、`assignin`、动态
-   字段/元胞索引、变长 `varargin`/`varargout`、`classdef` 动态分派、类型未知的
-   `global` 等。
+   字段/元胞索引、`classdef` 动态分派、类型未知的 `global` 等。
 
 **边界两侧的处理**：
 
@@ -129,7 +130,9 @@ runtime shim），负责内存管理、动态类型盒、内置函数、以及�
 
 > 原则：先「运行时调用 + 核心方言」，能跑通再谈方言。不要一开始就为了「语法完整」造方言。
 
-## 7. 架构图
+## 7. 架构图与编译管线
+
+### 7.1 高层架构图
 
 ```mermaid
 flowchart TD
@@ -162,6 +165,35 @@ flowchart TD
     C --> RT
     NATIVE --> RT
 ```
+
+### 7.2 端到端编译管线（输入 → 调用 → 产出）
+
+下面是一条命令 `convmat add.m`（`pipeline::compile`）从源码到 C 的完整链路，列明每步
+**输入了什么、调用了什么、产出了什么**：
+
+| 阶段 | 模块 / 函数 | 输入 | 调用（复用/自研） | 产出 / 效果 |
+|------|-------------|------|--------------------|-------------|
+| 0 前端 | `src/frontend::parse_mir` | `.m` 源文本 | `runmat_parser::parse` → `runmat_hir::lower` → `runmat_mir::lowering::lower_assembly` | `MirAssembly`（lexer→parser→HIR→MIR，控制流显式、操作符已脱糖） |
+| 1 边界 | `src/triage::classify` | `MirAssembly` 的每个 `MirBody` | 自研白名单 + `infer_locals`（形状推断，区分 `Static`/`Dynamic`） | `Static`（可生成）或 `Deferred`（降运行时，MVP 报错） |
+| 2 降级 | `src/mir_to_mlir::lower_to_module` | 可生成代码的 `MirBody` | `melior`（`arith/scf/memref/func`）+ `builtins` 表（`func.call @libm`） | 核心方言 MLIR `Module`（含数组/矩阵/内建/控制流） |
+| 3 管线 | `src/passes::convert_to_emitc` | 核心方言 MLIR | `melior` `PassManager`（`canonicalize`→`cse`→`convert-to-emitc`→`reconcile-unrealized-casts`） | `emitc` 方言 MLIR |
+| 4 后端 | `src/backend::emit` | `emitc` 方言 MLIR | `mlir-translate --mlir-to-cpp`（`tool::run_tool`） | C 源码文本（最终产物） |
+| 5 运行时兔底（分支） | `src/runtime::defer_to_runtime` | 被 `Deferred` 的函数（从阶段 1 分支） | 运行时 shim（MVP 尚未实现，当前报错） | 运行时调用（预留） |
+
+```text
+.m 源码
+  └─[0 前端 runmat]─────────────────────────────→ MirAssembly
+  └─[1 边界 triage]── Static ────────────────┐   └─ Deferred → runtime（MVP 报错）
+  └─[2 降级 mir_to_mlir]──────────────────────┤   → 核心方言 MLIR Module
+  └─[3 管线 passes]───────────────────────────┤   → emitc 方言 MLIR
+  └─[4 后端 backend]──────────────────────────┘   → C 源码
+```
+
+> **关键点**：
+> - 边界（阶段 1）是「静态 vs 动态」的分水岭；只有 `Static` 才进入降级，`Deferred` 走
+>   运行时兔底。
+> - 内存分配决策（栈/堆/输出指针，§13.3）在阶段 2 降级时依据 `LocalTy` 做出。
+> - 阶段 2 产出的核心方言 MLIR 与后端无关，换后端只替换阶段 4（§5 可插拔策略）。
 
 ## 8. 分层与模块职责
 
@@ -372,3 +404,49 @@ lower(arith/scf/memref/func + func.call libm)
 
 > 现状：只实现了静态 tier（`Shape::Static` 全部入栈/输出指针）；动态 tier 是 P7，
 > 受 `runmat-static-analysis` 依赖阻碍（见 §12.5）。
+
+## 14. 可变参数 varargin / varargout
+
+### 14.1 本质：可变元数 + 异构类型
+
+- `varargin` 在 MATLAB 里是 cell 数组，元素个数与元素类型都运行期才定；`varargout`
+  同理，输出个数运行期才定。
+- 因此 varargin/varargout **本质属于动态 tier**（§13.1）：类型未知、形状未知、个数未知。
+- 与静态形状（§13.2）不同，这里的「未知」不止是维度，还包括「有多少个参数、每个
+  参数是什么类型」，是更高一层的动态。
+
+### 14.2 封闭世界 → 编译期特化（静态路径）
+
+当程序封闭（所有调用点已知，§4「封闭世界」），编译器可以把可变元数「特化」掉：
+
+- `nargin`/`nargout` 在每个调用点常量折叠为实际传入/接收的个数。
+- `varargin{k}`（`k` 为常量）解析为调用点的第 `k` 个实参，直接引用，而不是 cell 访问。
+- 函数按「不同的实参个数/类型」monomorphize 成若干固定签名版本（类似 C++ 模板实例化）。
+- 结果：生成的 C 里没有 varargin，只有若干固定签名的函数版本。
+
+> 这与 MATLAB Coder 的思路一致：varargin/varargout 需要「封闭世界 + 所有调用点已知」
+> 才能生成代码。
+
+### 14.3 开放世界 → 运行时（动态路径）
+
+当无法封闭（外部调用者、递归、函数句柄传递、`feval`），varargin/varargout 降为动态
+运行时语义：
+
+- **输入 ABI**：`func(int nargin, Value* args, ...)`，每个 `Value` 是动态类型盒（§6 运行时）。
+- **输出 ABI**：`func(..., int* nargout, Value** outputs)`，调用方传入 `nargout` 并接收
+  可变输出。
+- `varargin{i}` 是运行时 cell 索引 + 类型分派；`varargout{i}` 是运行时 cell 写回。
+- 这条路径走运行时库（`runtime/` 第 6 层），是 §4 边界外的语义兔底。
+
+### 14.4 与 ABI（§5）和值分级（§13）的关系
+
+- **特化后的固定签名**：沿用 §5 规则——标量走返回值，数组/可变长走输出指针入参。
+- **动态 varargin 的参数**：无法用静态 `memref<N>` 表达，改用 `Value` 盒 + 形状描述符
+  （§13.2），所有权规则同 §13.3（动态值走运行时堆）。
+- `nargin`/`nargout` 是「编译器能算出（封闭世界）或只能运行时算出（开放世界）」的典型。
+
+### 14.5 当前状态与建议
+
+- **未实现**：`varargin`/`varargout` 目前被 `triage` 判为不支持的构造（defer 到运行时）。
+- 建议先做**封闭世界特化**（`nargin` 常量折叠 + `varargin{k}` 常量下标直接引用），
+  这是可静态化的子集；开放世界的运行时 cell ABI 后续再接。
