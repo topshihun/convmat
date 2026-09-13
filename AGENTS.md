@@ -22,7 +22,9 @@
 | 可/不可生成代码的边界 | 静态分析后按「类型/形状是否确定 + 是否封闭世界」做函数级/表达式级分类 |
 | 代码生成后端 | 今天 `emitc` 方言 → C；后端做成可插拔策略，预留 LLVM/GPU 等 |
 | 函数 ABI（跨函数传值） | 能由 C 直接表示的值走返回值；数组/可变长等走**输出指针入参**，空间由调用方分配 |
-| 数组/矩阵值模型 | 静态形状 `Shape`（列主序）+ 扁平 `memref<nxf64>` 存储，维度元数据驱动转置/乘法/按维归约 |
+| 编译期/运行期值分级 | 类型/形状编译期已定的走核心方言（静态 `memref`）；运行期才定的走运行时 + 形状描述符 |
+| 内存管理 | 静态局部走栈（`memref.alloca`）、跨函数走调用方分配的输出指针、动态/增长走运行时堆（`alloc`/`dealloc`） |
+| 数组/矩阵值模型 | `Shape::Static`（列主序 `memref<nxf64>`）与 `Shape::Dynamic`（`memref<?…>` + 形状描述符） |
 | 内建函数降级 | 纯数值内建 → C `libm` 的 `func.call` 或内联 pattern；有副作用/形状未知的 → 运行时兔底 |
 | 是否自定义方言 | **暂不自定义**；先只用核心方言，动态语义走运行时库调用 |
 | 复用原则 | 能用 MLIR 的（passes、验证、后端）就不自研 |
@@ -167,8 +169,8 @@ flowchart TD
 |----|------------------|------|-----------|
 | 0 前端 | `runmat-parser/hir/mir/static-analysis` | 解析、HIR、MIR、静态分析 | 复用 runmat |
 | 1 输入 | `src/frontend/` | 读取 `.m`、驱动 runmat 前端、产出 MIR | 薄封装 |
-| 2 边界 | `src/triage/` | 静态 vs 动态分类，产出「可生成代码计划」+ 形状推断（`Shape`/`LocalTy`） | 自研（核心） |
-| 3 降级 | `src/mir_to_mlir/` | MIR → 核心方言 MLIR；动态部分 → 运行时调用 | 自研（核心） |
+| 2 边界 | `src/triage/` | 静态 vs 动态分类，产出「可生成代码计划」+ 形状推断（`Shape`/`LocalTy`，区分 `Static`/`Dynamic`） | 自研（核心） |
+| 3 降级 | `src/mir_to_mlir/` | MIR → 核心方言 MLIR；动态部分 → 运行时调用；内存分配策略（栈/堆/输出指针） | 自研（核心） |
 | 3.5 内建表 | `src/builtins.rs` | 内建函数名 → 降级配方（`libm` 符号/归约/内联） | 自研（薄表） |
 | 4 管线 | `src/passes/` | 调 melior 运行上游 passes（canonicalize/CSE/...） | 复用 MLIR |
 | 5 后端 | `src/backend/` | 后端策略：`emitc`（今天）、`llvm`/`gpu`（预留） | 复用 MLIR |
@@ -244,12 +246,14 @@ flowchart TD
 
 ### 12.1 值模型
 
-- **形状**：`Shape { rank, dims: [usize; 4] }`，记录 MATLAB 逻辑维度（`dims[0]` 行、
-  `dims[1]` 列、…），行向量 `1×N` 与列向量 `M×1` 被区分对待。
+- **形状**：`Shape::{Static{rank, dims}, Dynamic}`，记录 MATLAB 逻辑维度（`dims[0]` 行、
+  `dims[1]` 列、…），行向量 `1×N` 与列向量 `M×1` 被区分对待；`Dynamic` 对应动态形状
+  tier（见 §13，P7 未实现）。
 - **存储**：扁平 `memref<nxf64>`，`n = numel`，线性顺序为 **MATLAB 列主序**。
   `runmat` 的 `Aggregate.elements` 是行主序，降级时在字面量边界做转置。
-- **类型格**：`LocalTy::{Scalar, Array{shape}, Dynamic}`；元素类型暂只 `f64`（`logical`
-  仍以 `f64` 的 0/1 表示，`single/int/complex` 延后）。
+- **类型格**：`LocalTy::{Scalar, Array{shape}, Dynamic}`；`Array` 的 `shape` 可为
+  `Static` 或 `Dynamic`，`Dynamic`（非数值/无法静态解析）仍单独保留；元素类型暂只
+  `f64`（`logical` 仍以 `f64` 的 0/1 表示，`single/int/complex` 延后）。
 - 形状来源：静态分析只有字面量 + 形状传播（转置/乘/按维归约）；形参默认标量，
   数组形参需 `runmat-static-analysis`（见 12.5）。
 
@@ -321,3 +325,50 @@ lower(arith/scf/memref/func + func.call libm)
 
 > 建议：优先自写一个聚焦数值子集的轻量类型/形状推断（扩展当前 `infer_locals`），
 > 而非引入整个 VM 栈；或把静态分析做成 feature gate 并接受原生构建成本。
+
+## 13. 值分级、动态形状与内存管理
+
+### 13.1 编译期 vs 运行期值
+
+把每个值分成两个 tier，由静态分析的结果决定（不是全局开关，而是**函数级 + 表达式级**）：
+
+| Tier | 判定 | MLIR 表示 | 内存 |
+|------|------|-----------|------|
+| **静态值** | 类型/形状编译期已定（字面量、常量维度、形状传播） | `f64`、`memref<d0×…×dk×f64>` | 栈（`memref.alloca`）或调用方缓冲 |
+| **动态值** | 类型/形状运行期才定（形参数组、动态形状、动态类型盒） | `memref<?×…×f64>` + 形状描述符 | 堆（运行时分配） |
+
+- **编译器必须算出**的：每个值的类型/形状（或标记为动态）、函数 ABI 布局（哪些走返回值、
+  哪些走输出指针、缓冲大小）、内存分配策略（栈/堆/输出指针）。
+- **运行时才能算出**的：动态形状的实际维度、动态类型的真实类型、越界/重分配、以及
+  §4 边界外语义的兔底。
+
+> 这条是 §4「形状可控」的细化：静态值走核心方言，动态值走运行时 + 形状描述符，
+> 二者在同一个函数里可以共存（函数级/表达式级混合）。
+
+### 13.2 动态形状
+
+- `Shape::Static(dims)` → 静态 `memref<d0×…×dk×f64>`（编译期已知，可入栈/调用方分配）。
+- `Shape::Dynamic` → `memref<?×…×f64>`，维度运行期通过**形状描述符**传递。
+- **动态形状 ABI**：输出走「数据指针 + 形状描述」两个入参（或一个 emxArray 风格的
+  结构体：`data ptr + dims + capacity`），空间由调用方分配/释放；这也延续 §5「输出指针入参」
+  的约定。
+
+### 13.3 内存管理（谁分配、谁释放、放哪层）
+
+三条规则，由值的 tier 决定：
+
+1. **固定形状、不逃逸的局部值** → 栈 `memref.alloca`，无需显式释放。
+2. **固定形状、跨函数传递的数组** → 调用方分配缓冲（栈或堆），输出指针入参（§5 ABI），
+   所有权固定在调用方。
+3. **动态形状/可能增长的值** → 堆 `memref.alloc`/`memref.dealloc`，由运行时 shim 管理。
+
+**归属**：
+
+- **分配决策**（栈 vs 堆 vs 输出指针）在 `mir_to_mlir`（第 3 层）做，依据 `triage` 的
+  `LocalTy`（`Static`/`Dynamic`）。
+- **运行时堆分配器 + 形状描述符 + 越界/重分配** 在 `runtime/`（第 6 层）。
+- **（可选，接入 linalg 后）** 让 `one-shot-bufferize` + `buffer-results-to-out-params` +
+  `promote-buffers-to-stack` 在 `passes`（第 4 层）自动做栈/堆提升，替代手写 memref 发射。
+
+> 现状：只实现了静态 tier（`Shape::Static` 全部入栈/输出指针）；动态 tier 是 P7，
+> 受 `runmat-static-analysis` 依赖阻碍（见 §12.5）。

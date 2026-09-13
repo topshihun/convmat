@@ -32,42 +32,67 @@ pub enum Verdict {
 /// Maximum tensor rank tracked by the lightweight shape analysis.
 pub const MAX_RANK: usize = 4;
 
-/// The static shape of a numeric array, in MATLAB column-major logical order
+/// The shape of a numeric array, in MATLAB column-major logical order
 /// (`dims[0]` is rows, `dims[1]` is columns, and so on).
 ///
-/// Arrays are stored in a flattened `memref<nxf64>` whose linear layout follows
-/// column-major order; [`Shape`] records the logical dimensions so that
-/// dimension-aware operations (transpose, `*`, reductions along an axis) can
-/// compute the correct column-major strides.
+/// [`Shape::Static`] is resolved at compile time and lowered to a static
+/// `memref<nxf64>` (stack or caller buffer). [`Shape::Dynamic`] is only known at
+/// runtime and is deferred to a `memref<?×…×f64>` plus a shape descriptor — that
+/// tier is not implemented yet (P7, see `AGENTS.md` §13.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Shape {
-    /// Number of meaningful dimensions (at least 2 for a MATLAB matrix).
-    pub rank: usize,
-    /// Dimension sizes; only the first `rank` entries are meaningful.
-    pub dims: [usize; MAX_RANK],
+pub enum Shape {
+    /// Compile-time known dimensions.
+    Static {
+        rank: usize,
+        dims: [usize; MAX_RANK],
+    },
+    /// Runtime-determined dimensions.
+    Dynamic,
 }
 
 impl Shape {
-    /// A 2-D `rows x cols` shape.
+    /// A static 2-D `rows x cols` shape.
     pub fn matrix(rows: usize, cols: usize) -> Self {
         let mut dims = [1; MAX_RANK];
         dims[0] = rows;
         dims[1] = cols;
-        Shape { rank: 2, dims }
+        Shape::Static { rank: 2, dims }
     }
 
-    /// Total element count (`numel`).
+    /// Whether this shape is runtime-determined.
+    pub fn is_dynamic(&self) -> bool {
+        matches!(self, Shape::Dynamic)
+    }
+
+    /// Number of meaningful dimensions, for a static shape.
+    pub fn rank(&self) -> usize {
+        match self {
+            Shape::Static { rank, .. } => *rank,
+            Shape::Dynamic => panic!("dynamic shape has no static rank"),
+        }
+    }
+
+    /// The meaningful dimensions, for a static shape.
+    pub fn dims(&self) -> &[usize] {
+        match self {
+            Shape::Static { rank, dims } => &dims[..*rank],
+            Shape::Dynamic => panic!("dynamic shape has no static dims"),
+        }
+    }
+
+    /// Total element count (`numel`), for a static shape.
     pub fn numel(&self) -> usize {
-        self.dims[..self.rank].iter().product()
+        self.dims().iter().product()
     }
 
-    /// Column-major linear offset of the given logical index.
+    /// Column-major linear offset of the given logical index, for a static shape.
     pub fn linear(&self, index: &[usize]) -> usize {
+        let dims = self.dims();
         let mut offset = 0;
         let mut stride = 1;
-        for (k, &coord) in index.iter().take(self.rank).enumerate() {
+        for (k, &coord) in index.iter().enumerate() {
             offset += coord * stride;
-            stride *= self.dims[k];
+            stride *= dims[k];
         }
         offset
     }
@@ -79,9 +104,9 @@ impl Shape {
 pub enum LocalTy {
     /// A scalar `f64` value.
     Scalar,
-    /// A statically-shaped `f64` array.
+    /// A `f64` array, with either a static or dynamic shape.
     Array { shape: Shape },
-    /// Not statically resolvable; the value must be deferred to the runtime.
+    /// Not a numeric value / not statically resolvable; deferred to the runtime.
     Dynamic,
 }
 
@@ -267,10 +292,16 @@ impl Classifier for WhitelistClassifier {
             }
         }
 
-        // Shape analysis must fully resolve every local; anything `Dynamic`
-        // crosses the static boundary and is deferred to the runtime.
+        // Shape analysis must fully resolve every local; anything dynamic
+        // (`LocalTy::Dynamic` or a dynamic-shape array) crosses the static
+        // boundary and is deferred to the runtime.
         for (local, ty) in infer_locals(body) {
-            if ty == LocalTy::Dynamic {
+            let is_dynamic = match ty {
+                LocalTy::Dynamic => true,
+                LocalTy::Array { shape } => shape.is_dynamic(),
+                LocalTy::Scalar => false,
+            };
+            if is_dynamic {
                 return Verdict::Deferred {
                     reason: format!("unresolved shape for local {local}"),
                 };
@@ -375,9 +406,9 @@ fn unary_ty(op: OperatorKind, ty: LocalTy) -> LocalTy {
     match (op, ty) {
         // 2-D transpose swaps the first two dimensions.
         (OperatorKind::Transpose | OperatorKind::ConjugateTranspose, LocalTy::Array { shape }) => {
-            if shape.rank == 2 {
+            if !shape.is_dynamic() && shape.rank() == 2 {
                 LocalTy::Array {
-                    shape: Shape::matrix(shape.dims[1], shape.dims[0]),
+                    shape: Shape::matrix(shape.dims()[1], shape.dims()[0]),
                 }
             } else {
                 LocalTy::Dynamic
@@ -415,9 +446,12 @@ fn binary_ty(lhs: LocalTy, op: OperatorKind, rhs: LocalTy) -> LocalTy {
 
 /// The shape of `A * B` for two 2-D operands (`m x k` times `k x n`).
 fn matmul_ty(lhs: Shape, rhs: Shape) -> LocalTy {
-    if lhs.rank == 2 && rhs.rank == 2 && lhs.dims[1] == rhs.dims[0] {
+    if lhs.is_dynamic() || rhs.is_dynamic() {
+        return LocalTy::Dynamic;
+    }
+    if lhs.rank() == 2 && rhs.rank() == 2 && lhs.dims()[1] == rhs.dims()[0] {
         LocalTy::Array {
-            shape: Shape::matrix(lhs.dims[0], rhs.dims[1]),
+            shape: Shape::matrix(lhs.dims()[0], rhs.dims()[1]),
         }
     } else {
         LocalTy::Dynamic
@@ -513,16 +547,20 @@ fn reduction_dim(call: &MirCall) -> Option<usize> {
 
 /// The shape of reducing a 2-D array along dimension `dim` (1 or 2).
 fn reduce_axis_ty(shape: Shape, dim: usize) -> LocalTy {
-    if shape.rank != 2 {
+    let Shape::Static { rank, mut dims } = shape else {
+        return LocalTy::Dynamic;
+    };
+    if rank != 2 {
         return LocalTy::Dynamic;
     }
-    let mut reduced = shape;
     match dim {
-        1 => reduced.dims[0] = 1,
-        2 => reduced.dims[1] = 1,
+        1 => dims[0] = 1,
+        2 => dims[1] = 1,
         _ => return LocalTy::Dynamic,
     }
-    LocalTy::Array { shape: reduced }
+    LocalTy::Array {
+        shape: Shape::Static { rank, dims },
+    }
 }
 
 /// The type of an indexing expression `base(...)`.
@@ -578,5 +616,27 @@ mod tests {
     fn row_and_column_vectors_have_distinct_shapes() {
         assert_eq!(Shape::matrix(1, 3), Shape::matrix(1, 3));
         assert_ne!(Shape::matrix(1, 3), Shape::matrix(3, 1));
+    }
+
+    #[test]
+    fn shape_static_vs_dynamic() {
+        assert!(!Shape::matrix(2, 2).is_dynamic());
+        assert!(Shape::Dynamic.is_dynamic());
+        assert_ne!(Shape::matrix(2, 2), Shape::Dynamic);
+    }
+
+    #[test]
+    fn shape_static_accessors() {
+        let shape = Shape::matrix(2, 3);
+        assert_eq!(shape.rank(), 2);
+        assert_eq!(shape.dims(), &[2, 3]);
+        assert_eq!(shape.numel(), 6);
+        assert_eq!(shape.linear(&[1, 2]), 5);
+    }
+
+    #[test]
+    #[should_panic]
+    fn shape_dynamic_numel_panics() {
+        let _ = Shape::Dynamic.numel();
     }
 }

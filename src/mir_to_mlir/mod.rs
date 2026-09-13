@@ -243,7 +243,7 @@ fn lower_function<'c>(
         let LocalTy::Array { shape } = tys[&output.0] else {
             unreachable!("array output must have an array type");
         };
-        entry_arg_types.push((cx.array_memref(shape.numel()).into(), cx.location));
+        entry_arg_types.push((cx.array_memref(static_numel(shape)?).into(), cx.location));
     }
     let entry = Block::new(&entry_arg_types);
 
@@ -257,7 +257,7 @@ fn lower_function<'c>(
         }
         let memref_ty = match tys.get(&local.id.0).copied().unwrap_or(LocalTy::Scalar) {
             LocalTy::Scalar => cx.scalar_memref,
-            LocalTy::Array { shape } => cx.array_memref(shape.numel()),
+            LocalTy::Array { shape } => cx.array_memref(static_numel(shape)?),
             LocalTy::Dynamic => return Err(Error::NotLowerable("dynamic local shape".to_string())),
         };
         let alloca = entry.append_operation(memref::alloca(
@@ -303,7 +303,7 @@ fn lower_function<'c>(
         let LocalTy::Array { shape } = tys[&output.0] else {
             unreachable!("array output must have an array type");
         };
-        input_types.push(cx.array_memref(shape.numel()).into());
+        input_types.push(cx.array_memref(static_numel(shape)?).into());
     }
     let output_types: Vec<Type> = vec![cx.float; scalar_outputs.len()];
 
@@ -694,7 +694,7 @@ impl<'c, 'e, 'x, 'y> FuncLowerer<'c, 'e, 'x, 'y> {
                 MirIndexComponent::End { dim, offset } => {
                     let dim = dim.unwrap_or(axis);
                     let size = *shape
-                        .dims
+                        .dims()
                         .get(dim)
                         .ok_or_else(|| Error::NotLowerable("end index out of range".to_string()))?;
                     let position = size as isize + offset;
@@ -783,9 +783,7 @@ impl<'c, 'e, 'x, 'y> FuncLowerer<'c, 'e, 'x, 'y> {
             },
             Builtin::Length => {
                 let max = match self.operand_ty(args[0]) {
-                    LocalTy::Array { shape } => {
-                        shape.dims[..shape.rank].iter().copied().max().unwrap_or(1)
-                    }
+                    LocalTy::Array { shape } => shape.dims().iter().copied().max().unwrap_or(1),
                     LocalTy::Scalar => 1,
                     LocalTy::Dynamic => {
                         return Err(Error::NotLowerable("dynamic length".to_string()))
@@ -796,8 +794,8 @@ impl<'c, 'e, 'x, 'y> FuncLowerer<'c, 'e, 'x, 'y> {
             Builtin::Size => {
                 let dim = self.dim_arg(call)?.unwrap_or(1);
                 let size = match self.operand_ty(args[0]) {
-                    LocalTy::Array { shape } if dim >= 1 && dim <= shape.rank => {
-                        shape.dims[dim - 1]
+                    LocalTy::Array { shape } if dim >= 1 && dim <= shape.rank() => {
+                        shape.dims()[dim - 1]
                     }
                     _ => 1,
                 };
@@ -932,8 +930,8 @@ impl<'c, 'e, 'x, 'y> FuncLowerer<'c, 'e, 'x, 'y> {
                                 return Err(Error::NotLowerable("dynamic size".to_string()))
                             }
                         };
-                        let rows = self.float_constant(block, shape.dims[0] as f64)?;
-                        let cols = self.float_constant(block, shape.dims[1] as f64)?;
+                        let rows = self.float_constant(block, shape.dims()[0] as f64)?;
+                        let cols = self.float_constant(block, shape.dims()[1] as f64)?;
                         let zero = index_constant(self.cx, block, 0)?;
                         let one = index_constant(self.cx, block, 1)?;
                         block.append_operation(memref::store(
@@ -1075,12 +1073,12 @@ impl<'c, 'e, 'x, 'y> FuncLowerer<'c, 'e, 'x, 'y> {
             OperatorKind::Transpose | OperatorKind::ConjugateTranspose => {
                 let src = self.array_source(operand)?;
                 let shape = self.array_shape(operand)?;
-                if shape.rank != 2 {
+                if shape.rank() != 2 {
                     return Err(Error::NotLowerable(
                         "only 2-D transpose is supported".to_string(),
                     ));
                 }
-                self.transpose(block, src, dest, shape.dims[0], shape.dims[1])
+                self.transpose(block, src, dest, shape.dims()[0], shape.dims()[1])
             }
             OperatorKind::UnaryMinus | OperatorKind::UnaryPlus | OperatorKind::Not => {
                 let src = self.array_source(operand)?;
@@ -1274,7 +1272,7 @@ impl<'c, 'e, 'x, 'y> FuncLowerer<'c, 'e, 'x, 'y> {
         lhs: Shape,
         rhs: Shape,
     ) -> Result<()> {
-        let (m, k, n) = (lhs.dims[0], lhs.dims[1], rhs.dims[1]);
+        let (m, k, n) = (lhs.dims()[0], lhs.dims()[1], rhs.dims()[1]);
         let c_shape = Shape::matrix(m, n);
         for i in 0..m {
             for j in 0..n {
@@ -1321,12 +1319,12 @@ impl<'c, 'e, 'x, 'y> FuncLowerer<'c, 'e, 'x, 'y> {
         dim: usize,
         dest: Value<'c, '_>,
     ) -> Result<()> {
-        if src_shape.rank != 2 {
+        if src_shape.rank() != 2 {
             return Err(Error::NotLowerable(
                 "only 2-D reduction is supported".to_string(),
             ));
         }
-        let (rows, cols) = (src_shape.dims[0], src_shape.dims[1]);
+        let (rows, cols) = (src_shape.dims()[0], src_shape.dims()[1]);
         match dim {
             // Reduce over rows (down each column).
             1 => {
@@ -2058,6 +2056,18 @@ fn index_constant<'c, 'b>(cx: &Cx<'c>, block: &'b Block<'c>, value: i64) -> Resu
         .result(0)
         .map_err(|e| Error::Backend(format!("index constant result: {e}")))?
         .into())
+}
+
+/// The static element count of a shape, deferring dynamic shapes (they need
+/// runtime heap allocation, which is P7 and not implemented yet).
+fn static_numel(shape: Shape) -> Result<usize> {
+    if shape.is_dynamic() {
+        Err(Error::NotLowerable(
+            "dynamic shape arrays need runtime heap allocation (P7, not implemented)".to_string(),
+        ))
+    } else {
+        Ok(shape.numel())
+    }
 }
 
 /// Load the scalar stored in `cell` from `block`.
