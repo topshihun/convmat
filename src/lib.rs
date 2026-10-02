@@ -1,4 +1,4 @@
-//! convmat — a MATLAB/Octave-to-MLIR compiler that aims to be a better
+//! convmat — a MATLAB/Octave-to-C compiler that aims to be a better
 //! MATLAB Coder.
 //!
 //! Pipeline:
@@ -7,21 +7,21 @@
 //! MATLAB source
 //!   -> runmat frontend (lexer / parser / HIR / MIR)   [src/frontend]
 //!   -> triage (static vs dynamic classification)       [src/triage]
-//!   -> MIR -> MLIR (melior, core dialects)             [src/mir_to_mlir]
-//!   -> MLIR passes (-> emitc)                          [src/passes]
-//!   -> backend (emitc -> C today; LLVM/GPU reserved)   [src/backend]
-//!   -> runtime fallback (deferred code)                [src/runtime]
+//!   -> MIR -> matlab dialect (pliron)                  [src/mir_to_mlir]
+//!   -> matlab -> emitc dialect (pliron)                [src/lowering]
+//!   -> emitc -> C                                      [src/emit_c]
 //! ```
 
 pub mod backend;
 pub mod builtins;
+pub mod dialects;
+pub mod emit_c;
 pub mod error;
 pub mod frontend;
+pub mod lowering;
 pub mod mir_to_mlir;
-pub mod passes;
 pub mod pipeline;
 pub mod runtime;
-pub(crate) mod tool;
 pub mod triage;
 
 pub use error::{Error, Result};

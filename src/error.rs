@@ -18,7 +18,7 @@ pub enum Error {
     #[error("not lowerable: {0}")]
     NotLowerable(String),
 
-    /// A backend failed to emit code (MLIR/emitc tools or melior).
+    /// A backend failed to emit code.
     #[error("backend error: {0}")]
     Backend(String),
 

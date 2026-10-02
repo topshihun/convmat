@@ -1,9 +1,9 @@
 # convmat
 
-A MATLAB/Octave-to-MLIR compiler written in Rust. The goal is to become a
+A MATLAB/Octave-to-C compiler written in Rust. The goal is to become a
 better MATLAB Coder: parse MATLAB-style source with the
-[RunMat](https://github.com/runmat-org/runmat) frontend, lower it to MLIR with
-the [melior](https://github.com/mlir-rs/melior) bindings, and generate C.
+[RunMat](https://github.com/runmat-org/runmat) frontend, lower it to a
+[pliron](https://github.com/pliron-org/pliron)-based IR, and generate C.
 
 ## Status
 
@@ -17,7 +17,7 @@ End-to-end codegen works for a growing subset of MATLAB:
   transpose, and matrix multiply.
 - **Pure numeric built-ins** (`sin`/`cos`/`sqrt`/`abs`/`floor`/…,
   `sum`/`prod`/`min`/`max` with an optional dimension, `numel`/`length`/`size`,
-  `zeros`/`ones`/`eye`, `reshape`) lowered to `libm` `func.call`s.
+  `zeros`/`ones`/`eye`, `reshape`) lowered to `libm` calls.
 - **Indexing**: constant subscript `A(i,j)`, linear `A(i)`, `end`, and `A(:)`.
 
 ```sh
@@ -35,19 +35,18 @@ being compiled.
 
 ## Dependencies
 
-The frontend and backend crates are **mandatory** dependencies (code generation
-is the whole point of this crate, so they are not feature-gated):
+The frontend and IR crates are **mandatory** dependencies (code generation is
+the whole point of this crate, so they are not feature-gated):
 
 | Crate           | Version | Role                              | Notes                                    |
 |-----------------|---------|-----------------------------------|------------------------------------------|
 | `runmat-parser` | 0.6.2   | Parse MATLAB/Octave tokens -> HIR | MIT                                      |
 | `runmat-hir`    | 0.6.2   | High-level IR                     | MIT                                      |
 | `runmat-mir`    | 0.6.2   | Mid-level IR (lowering boundary)  | MIT                                      |
-| `melior`        | 0.27.8  | MLIR bindings (safe Rust wrapper) | Apache-2.0; requires a local MLIR build |
+| `pliron`        | 0.18    | Extensible compiler IR (pure Rust) | Apache-2.0; no C++ MLIR/LLVM needed     |
 
-`melior` requires a local **MLIR 22** install (`libMLIR` + `libMLIR-C`) and
-`mlir-translate` on `PATH` for the C backend. See the
-[melior](https://github.com/mlir-rs/melior) build instructions.
+The build is pure `cargo build` — no local MLIR/LLVM install, no `libMLIR`,
+no `mlir-translate`/`mlir-opt` on `PATH`.
 
 > `runmat-static-analysis` is deliberately not used yet: it pulls
 > `runmat-vm` -> `runmat-runtime` -> native HDF5/OpenBLAS, which the MVP does
@@ -64,10 +63,12 @@ convmat/
 │   ├── lib.rs             # library crate (pipeline + public API)
 │   ├── frontend/          # layer 1: read `.m`, drive runmat -> MIR
 │   ├── triage/            # layer 2: static vs dynamic classification + shape inference
-│   ├── mir_to_mlir/       # layer 3: MIR -> core-dialect MLIR
+│   ├── dialects/          # layer 2.5/4.5: `matlab` and `emitc` pliron dialects
+│   ├── mir_to_mlir/       # layer 3: MIR -> matlab dialect
 │   ├── builtins.rs        # builtin name -> lowering recipe table
-│   ├── passes/            # layer 4: MLIR pass pipeline (canonicalize/CSE/emitc)
-│   ├── backend/           # layer 5: emitc -> C (LLVM/GPU reserved)
+│   ├── lowering.rs        # layer 4: matlab -> emitc dialect
+│   ├── emit_c.rs          # layer 5: emitc -> C
+│   ├── backend/           # backend selection (C today; LLVM/GPU reserved)
 │   └── runtime/           # layer 6: runtime fallback seam (not implemented)
 ├── docs/
 │   └── architecture.md    # authoritative architecture
@@ -97,7 +98,7 @@ cargo clippy --all-targets -- -D warnings
   array-array broadcasting, N-D transpose.
 - Remaining shape transforms: `permute`/`repmat`/`cat`/`horzcat`/`vertcat`.
 - Advanced indexing: `A(i,:)` / `A(:,j)` slices, colon ranges, variable indices.
-- `linalg` optimization (fusion / tiling / vectorization); the pipeline today
-  runs only `canonicalize` + `cse` before the emitc conversion.
+- Optimization passes (CSE / canonicalize / linalg fusion / vectorization); the
+  pipeline today emits straightforward, unoptimized C.
 - `varargin` / `varargout` (closed-world specialization or runtime cell ABI).
 - LLVM and GPU backends (`src/backend` reserves `Llvm`/`Gpu`).

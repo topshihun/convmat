@@ -149,11 +149,11 @@ fn codegen_void_function() {
 
 #[test]
 fn lower_control_flow_to_scf() {
-    // The core-dialect MLIR uses `scf` for structured control flow and `memref`
-    // for locals, which is what the emitc conversion consumes downstream.
+    // The matlab-dialect IR uses structured control flow and stack array cells,
+    // which is what the emitc lowering consumes downstream.
     let mlir = lower_fixture("max");
-    assert!(mlir.contains("scf.if"), "got:\n{mlir}");
-    assert!(mlir.contains("memref.alloca"), "got:\n{mlir}");
+    assert!(mlir.contains("matlab.if"), "got:\n{mlir}");
+    assert!(mlir.contains("matlab.alloca"), "got:\n{mlir}");
 }
 
 // --- More complex codegen fixtures -------------------------------------------
@@ -383,10 +383,9 @@ fn codegen_nested_elementwise() {
 
 #[test]
 fn lower_builtin_to_func_call() {
-    // The core-dialect MLIR lowers `sin` to a `func.call` into libm.
+    // The matlab-dialect IR lowers `sin` to a `matlab.call` into libm.
     let mlir = lower_fixture("sin_array");
-    assert!(mlir.contains("func.call @sin"), "got:\n{mlir}");
-    assert!(mlir.contains("func.func private @sin"), "got:\n{mlir}");
+    assert!(mlir.contains("matlab.call @sin"), "got:\n{mlir}");
 }
 
 // --- Matrix / vector shape support (P1) --------------------------------------
