@@ -1,14 +1,23 @@
-//! The `emitc` dialect: C-level statements and expressions.
+//! The `emitc` dialect: C-level statements, expressions, and top-level
+//! directives.
 //!
 //! The `matlab -> emitc` lowering rewrites MATLAB-level ops into these C-level
 //! primitives (declarations, assignments, ternary expressions, `libm` calls,
 //! and C-style control flow). The C emitter then pretty-prints this dialect
 //! almost 1:1. Value types are shared with the `matlab` dialect (a `f64` is a
 //! `f64` everywhere); only the operations differ.
+//!
+//! Containers (`module`/`func`) are **pliron's builtin**
+//! [`ModuleOp`](pliron::builtin::ops::ModuleOp) /
+//! [`FuncOp`](pliron::builtin::ops::FuncOp); this dialect only contributes the
+//! C-level body ops plus the top-level directives that the builtin dialect can't
+//! express: [`IncludeOp`] (`#include`), [`DefineOp`]/[`UndefOp`]
+//! (`#define`/`#undef`), and [`VerbatimOp`] as a raw escape hatch for anything
+//! else (`typedef`, `struct`, `#pragma`, `extern`, ...).
 
 use pliron::{
     builtin::{
-        attributes::{FPDoubleAttr, StringAttr},
+        attributes::{BoolAttr, FPDoubleAttr, StringAttr},
         op_interfaces::{
             IsTerminatorInterface, NOpdsInterface, NRegionsInterface, NResultsInterface,
             OneOpdInterface, OneRegionInterface, OneResultInterface,
@@ -16,7 +25,7 @@ use pliron::{
         types::FP64Type,
     },
     context::{Context, Ptr},
-    derive::{pliron_attr, pliron_op},
+    derive::pliron_op,
     op::Op,
     operation::Operation,
     r#type::{TypeHandle, Typed},
@@ -25,43 +34,6 @@ use pliron::{
 };
 
 use crate::dialects::matlab::{BinOpKind, BoolType, CmpKind};
-
-/// A small `u64` attribute (used for scalar-result counts).
-#[pliron_attr(name = "emitc.count", format, verifier = "succ")]
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct CountAttr(pub u64);
-
-/// A function: carries its symbol name and the count of scalar results.
-#[pliron_op(
-    name = "emitc.func",
-    format,
-    interfaces = [NOpdsInterface<0>, NResultsInterface<0>, OneRegionInterface],
-    attributes = (func_name: StringAttr, func_nresults: CountAttr),
-    verifier = "succ",
-)]
-pub struct FuncOp;
-
-impl FuncOp {
-    pub fn new(ctx: &mut Context, name: &str, n_results: u64) -> Self {
-        let op = Operation::new(ctx, Self::get_concrete_op_info(), vec![], vec![], vec![], 1);
-        let op = FuncOp { op };
-        op.set_attr_func_name(ctx, StringAttr::new(name.to_string()));
-        op.set_attr_func_nresults(ctx, CountAttr(n_results));
-        op
-    }
-
-    pub fn name(&self, ctx: &Context) -> String {
-        String::from(self.get_attr_func_name(ctx).expect("func name").clone())
-    }
-
-    pub fn n_results(&self, ctx: &Context) -> u64 {
-        self.get_attr_func_nresults(ctx).expect("func n_results").0
-    }
-
-    pub fn body_region(&self, ctx: &Context) -> Ptr<Region> {
-        self.get_operation().deref(ctx).get_region(0)
-    }
-}
 
 /// Declare a local array `double <name>[<size>]`.
 #[pliron_op(
@@ -244,6 +216,34 @@ impl CallOp {
         String::from(
             self.get_attr_ecall_callee(ctx)
                 .expect("call callee")
+                .clone(),
+        )
+    }
+}
+
+/// A call to an external function returning nothing (a runtime helper that
+/// writes its result through an out-parameter).
+#[pliron_op(
+    name = "emitc.call_void",
+    format,
+    interfaces = [NResultsInterface<0>],
+    attributes = (ecall_void_callee: StringAttr),
+    verifier = "succ",
+)]
+pub struct CallVoidOp;
+
+impl CallVoidOp {
+    pub fn new(ctx: &mut Context, callee: &str, args: Vec<Value>) -> Self {
+        let op = Operation::new(ctx, Self::get_concrete_op_info(), vec![], args, vec![], 0);
+        let op = CallVoidOp { op };
+        op.set_attr_ecall_void_callee(ctx, StringAttr::new(callee.to_string()));
+        op
+    }
+
+    pub fn callee(&self, ctx: &Context) -> String {
+        String::from(
+            self.get_attr_ecall_void_callee(ctx)
+                .expect("call_void callee")
                 .clone(),
         )
     }
@@ -449,5 +449,139 @@ impl ReturnOp {
     pub fn new(ctx: &mut Context, values: Vec<Value>) -> Self {
         let op = Operation::new(ctx, Self::get_concrete_op_info(), vec![], values, vec![], 0);
         ReturnOp { op }
+    }
+}
+
+/// A `#include <header>` (system) or `#include "header"` (local) directive.
+#[pliron_op(
+    name = "emitc.include",
+    format,
+    interfaces = [NOpdsInterface<0>, NResultsInterface<0>],
+    attributes = (emitc_include_header: StringAttr, emitc_include_system: BoolAttr),
+    verifier = "succ",
+)]
+pub struct IncludeOp;
+
+impl IncludeOp {
+    pub fn new(ctx: &mut Context, header: &str, is_system: bool) -> Self {
+        let op = Operation::new(ctx, Self::get_concrete_op_info(), vec![], vec![], vec![], 0);
+        let op = IncludeOp { op };
+        op.set_attr_emitc_include_header(ctx, StringAttr::new(header.to_string()));
+        op.set_attr_emitc_include_system(ctx, BoolAttr::new(is_system));
+        op
+    }
+
+    /// The header file name (without the angle brackets or quotes).
+    pub fn header(&self, ctx: &Context) -> String {
+        String::from(
+            self.get_attr_emitc_include_header(ctx)
+                .expect("include header")
+                .clone(),
+        )
+    }
+
+    /// `true` for `#include <...>`, `false` for `#include "..."`.
+    pub fn is_system(&self, ctx: &Context) -> bool {
+        bool::from(
+            self.get_attr_emitc_include_system(ctx)
+                .expect("include system")
+                .clone(),
+        )
+    }
+}
+
+/// A `#define NAME [VALUE]` macro definition. An empty value emits a bare
+/// `#define NAME` (an object-like macro with no replacement text). Function-like
+/// macros are represented by including the parameter list in `name`.
+#[pliron_op(
+    name = "emitc.define",
+    format,
+    interfaces = [NOpdsInterface<0>, NResultsInterface<0>],
+    attributes = (emitc_define_name: StringAttr, emitc_define_value: StringAttr),
+    verifier = "succ",
+)]
+pub struct DefineOp;
+
+impl DefineOp {
+    pub fn new(ctx: &mut Context, name: &str, value: &str) -> Self {
+        let op = Operation::new(ctx, Self::get_concrete_op_info(), vec![], vec![], vec![], 0);
+        let op = DefineOp { op };
+        op.set_attr_emitc_define_name(ctx, StringAttr::new(name.to_string()));
+        op.set_attr_emitc_define_value(ctx, StringAttr::new(value.to_string()));
+        op
+    }
+
+    /// The macro name (optionally with a parameter list).
+    pub fn name(&self, ctx: &Context) -> String {
+        String::from(
+            self.get_attr_emitc_define_name(ctx)
+                .expect("define name")
+                .clone(),
+        )
+    }
+
+    /// The replacement token list (empty for a bare `#define NAME`).
+    pub fn value(&self, ctx: &Context) -> String {
+        String::from(
+            self.get_attr_emitc_define_value(ctx)
+                .expect("define value")
+                .clone(),
+        )
+    }
+}
+
+/// A `#undef NAME` directive.
+#[pliron_op(
+    name = "emitc.undef",
+    format,
+    interfaces = [NOpdsInterface<0>, NResultsInterface<0>],
+    attributes = (emitc_undef_name: StringAttr),
+    verifier = "succ",
+)]
+pub struct UndefOp;
+
+impl UndefOp {
+    pub fn new(ctx: &mut Context, name: &str) -> Self {
+        let op = Operation::new(ctx, Self::get_concrete_op_info(), vec![], vec![], vec![], 0);
+        let op = UndefOp { op };
+        op.set_attr_emitc_undef_name(ctx, StringAttr::new(name.to_string()));
+        op
+    }
+
+    pub fn name(&self, ctx: &Context) -> String {
+        String::from(
+            self.get_attr_emitc_undef_name(ctx)
+                .expect("undef name")
+                .clone(),
+        )
+    }
+}
+
+/// A verbatim top-level snippet of C source. This is the escape hatch for any C
+/// construct that has no dedicated op yet: `typedef`, `struct`/`enum`, `extern`
+/// declarations, `#pragma`, conditional compilation, and so on.
+#[pliron_op(
+    name = "emitc.verbatim",
+    format,
+    interfaces = [NOpdsInterface<0>, NResultsInterface<0>],
+    attributes = (emitc_verbatim_source: StringAttr),
+    verifier = "succ",
+)]
+pub struct VerbatimOp;
+
+impl VerbatimOp {
+    pub fn new(ctx: &mut Context, source: &str) -> Self {
+        let op = Operation::new(ctx, Self::get_concrete_op_info(), vec![], vec![], vec![], 0);
+        let op = VerbatimOp { op };
+        op.set_attr_emitc_verbatim_source(ctx, StringAttr::new(source.to_string()));
+        op
+    }
+
+    pub fn source(&self, ctx: &Context) -> String {
+        String::from(
+            self.get_attr_emitc_verbatim_source(ctx)
+                .expect("verbatim source")
+                .clone(),
+        )
     }
 }

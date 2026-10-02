@@ -17,7 +17,7 @@
 //! heuristic.
 #![allow(clippy::too_many_arguments)]
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use pliron::{
     basic_block::BasicBlock,
@@ -42,11 +42,13 @@ use pliron::{
 
 use crate::builtins::{self, Builtin, MinMax, ReduceOp};
 use crate::dialects::matlab::{
-    AllocaOp, ArrayType, BinOp, BinOpKind, CallOp, CmpKind, CmpOp, ConditionOp, ConstantOp, ForOp,
-    IfOp, LoadOp, ReturnOp, SelectOp, StoreOp, WhileOp, YieldOp,
+    AllocaOp, ArrayType, BinOp, BinOpKind, CallOp, CallVoidOp, CmpKind, CmpOp, ConditionOp,
+    ConstantOp, ForOp, IfOp, LoadOp, ReturnOp, SelectOp, StoreOp, WhileOp, YieldOp,
 };
 use crate::error::{Error, Result};
-use crate::triage::{call_name, infer_locals, LocalTy, Shape};
+use crate::triage::{
+    brace_index, call_name, infer_locals, varargout_index, LocalTy, Shape, Variadics,
+};
 
 use runmat_hir::{IndexKind, OperatorKind};
 use runmat_mir::{
@@ -67,20 +69,11 @@ pub fn lower(mir: &MirAssembly) -> Result<String> {
 /// Lower MIR into a new `matlab`-dialect module owned by `context`.
 pub fn lower_to_module(context: &mut Context, mir: &MirAssembly) -> Result<ModuleOp> {
     let f64_ty: TypeHandle = FP64Type::get(context).into();
-
-    // Declare every `libm` function the bodies call before lowering, so the
-    // emitted calls resolve and the C emitter can print the externs.
-    let symbols = collect_libm_symbols(mir);
     let module = ModuleOp::new(context, Identifier::try_from("convmat").unwrap());
 
     for (function_id, body) in &mir.bodies {
         lower_function(context, mir, *function_id, body, &module, f64_ty)?;
     }
-
-    // The emitted `libm` symbols are collected for the C emitter's use; they
-    // are not materialized as private declarations (pliron has no `func.func`
-    // private decl requirement — the emitter prints `extern` directly).
-    let _ = symbols;
 
     Ok(module)
 }
@@ -109,11 +102,15 @@ fn lower_function(
     }
 
     let tys = infer_locals(body);
+    let variadics = Variadics::compute(body);
 
-    let params: Vec<MirLocalId> = body
+    // Named (non-variadic) scalar parameters: `fixed_inputs` minus `varargin`.
+    let varargin_binding = body.abi.varargin;
+    let named_params: Vec<MirLocalId> = body
         .abi
         .fixed_inputs
         .iter()
+        .filter(|binding| Some(**binding) != varargin_binding)
         .map(|binding| {
             binding_to_local
                 .get(binding)
@@ -122,10 +119,13 @@ fn lower_function(
         })
         .collect::<Result<_>>()?;
 
-    let outputs: Vec<MirLocalId> = body
+    // Named (non-variadic) outputs: `fixed_outputs` minus `varargout`.
+    let varargout_binding = body.abi.varargout;
+    let named_outputs: Vec<MirLocalId> = body
         .abi
         .fixed_outputs
         .iter()
+        .filter(|binding| Some(**binding) != varargout_binding)
         .map(|binding| {
             binding_to_local
                 .get(binding)
@@ -134,11 +134,12 @@ fn lower_function(
         })
         .collect::<Result<_>>()?;
 
-    // Split outputs by ABI: scalars are returned; arrays become out-pointer
-    // parameters supplied (and allocated) by the caller.
+    // Split named outputs by ABI: scalars are returned; arrays become out-pointer
+    // parameters supplied (and allocated) by the caller. `varargout` elements are
+    // specialized as extra scalar outputs.
     let mut scalar_outputs = Vec::new();
     let mut array_outputs = Vec::new();
-    for output in &outputs {
+    for output in &named_outputs {
         match tys.get(&output.0).copied().unwrap_or(LocalTy::Scalar) {
             LocalTy::Scalar => scalar_outputs.push(*output),
             LocalTy::Array { .. } => array_outputs.push(*output),
@@ -148,28 +149,38 @@ fn lower_function(
         }
     }
 
+    let total_inputs = named_params.len() + variadics.varargin_count;
+    let total_scalar_outputs = scalar_outputs.len() + variadics.varargout_count;
+
     // Entry block argument types: scalar params first, then array out-params.
     let scalar_cell_ty: TypeHandle = ArrayType::get(context, vec![1]).into();
-    let mut entry_arg_types = vec![f64_ty; params.len()];
+    let mut entry_arg_types = vec![f64_ty; total_inputs];
     for output in &array_outputs {
         let LocalTy::Array { shape } = tys[&output.0] else {
             unreachable!("array output must have an array type");
         };
         entry_arg_types.push(ArrayType::get(context, vec![static_numel(shape)? as i64]).into());
     }
-    let output_types = vec![f64_ty; scalar_outputs.len()];
+    let output_types = vec![f64_ty; total_scalar_outputs];
     let fn_ty = FunctionType::get(context, entry_arg_types.clone(), output_types);
     let name_id = Identifier::try_from(name.as_str())
         .map_err(|e| Error::Backend(format!("bad function name `{name}`: {e}")))?;
     let func = FuncOp::new(context, name_id, fn_ty);
     let entry = func.get_entry_block(context);
 
-    // Allocate a stack cell per local. Array outputs are caller-provided and
-    // are wired to their incoming buffers below instead of being allocated.
-    let out_param_ids: HashSet<usize> = array_outputs.iter().map(|output| output.0).collect();
+    // Allocate a stack cell per local. Array outputs are caller-provided and are
+    // wired to their incoming buffers below; the `varargin`/`varargout` cell
+    // locals are specialized away (no cell is materialized).
+    let mut skip_ids: HashSet<usize> = array_outputs.iter().map(|output| output.0).collect();
+    if let Some(local) = variadics.varargin_local {
+        skip_ids.insert(local);
+    }
+    if let Some(local) = variadics.varargout_local {
+        skip_ids.insert(local);
+    }
     let mut locals: HashMap<usize, Value> = HashMap::new();
     for local in &body.locals {
-        if out_param_ids.contains(&local.id.0) {
+        if skip_ids.contains(&local.id.0) {
             continue;
         }
         let array_ty = match tys.get(&local.id.0).copied().unwrap_or(LocalTy::Scalar) {
@@ -185,8 +196,8 @@ fn lower_function(
         locals.insert(local.id.0, value);
     }
 
-    // Store incoming scalar parameters into their cells.
-    for (index, param) in params.iter().enumerate() {
+    // Store incoming named scalar parameters into their cells.
+    for (index, param) in named_params.iter().enumerate() {
         let argument = entry.deref(context).get_argument(index);
         let target = locals
             .get(&param.0)
@@ -196,9 +207,34 @@ fn lower_function(
         emit_store(context, entry, target, zero, argument);
     }
 
+    // `varargin{k}` resolves directly to the (k-1)-th extra scalar argument.
+    let mut varargin_args = Vec::with_capacity(variadics.varargin_count);
+    for k in 0..variadics.varargin_count {
+        varargin_args.push(entry.deref(context).get_argument(named_params.len() + k));
+    }
+
+    // `nargin`/`nargout` fold to compile-time constants (fixed arity + variadic).
+    if let Some(nargin_local) = variadics.nargin_local {
+        let value = (variadics.named_inputs + variadics.varargin_count) as f64;
+        store_constant(context, entry, locals.get(&nargin_local).copied(), value)?;
+    }
+    if let Some(nargout_local) = variadics.nargout_local {
+        let value = (variadics.named_outputs + variadics.varargout_count) as f64;
+        store_constant(context, entry, locals.get(&nargout_local).copied(), value)?;
+    }
+
+    // `varargout{k}` writes target a dedicated scalar cell per element.
+    let mut varargout_cells = Vec::with_capacity(variadics.varargout_count);
+    for _ in 0..variadics.varargout_count {
+        let alloca = AllocaOp::new(context, scalar_cell_ty);
+        let value = alloca.get_result(context);
+        append(context, entry, &alloca);
+        varargout_cells.push(value);
+    }
+
     // Wire array outputs to their incoming caller-provided buffers.
     for (offset, output) in array_outputs.iter().enumerate() {
-        let argument = entry.deref(context).get_argument(params.len() + offset);
+        let argument = entry.deref(context).get_argument(total_inputs + offset);
         locals.insert(output.0, argument);
     }
 
@@ -210,6 +246,10 @@ fn lower_function(
         tys,
         preds: cfg.preds,
         dominators: cfg.dominators,
+        varargin_local: variadics.varargin_local,
+        varargin_args,
+        varargout_local: variadics.varargout_local,
+        varargout_cells,
     };
     lowerer.lower_region(context, entry, 0, None)?;
 
@@ -260,62 +300,21 @@ fn emit_constant(context: &mut Context, block: Ptr<BasicBlock>, value: f64) -> R
     Ok(result)
 }
 
-/// Collect the `(symbol, arity)` pairs for every `libm` function referenced by
-/// a supported built-in call anywhere in the assembly.
-fn collect_libm_symbols(mir: &MirAssembly) -> BTreeSet<(String, usize)> {
-    let mut symbols = BTreeSet::new();
-    for body in mir.bodies.values() {
-        for block in &body.blocks {
-            for stmt in &block.statements {
-                collect_stmt_symbols(stmt, &mut symbols);
-            }
-        }
-    }
-    symbols
-}
-
-fn collect_stmt_symbols(stmt: &MirStmt, symbols: &mut BTreeSet<(String, usize)>) {
-    match &stmt.kind {
-        MirStmtKind::Assign { value, .. } | MirStmtKind::Expr(value) => {
-            collect_rvalue_symbols(value, symbols)
-        }
-        _ => {}
-    }
-}
-
-fn collect_rvalue_symbols(rvalue: &MirRvalue, symbols: &mut BTreeSet<(String, usize)>) {
-    match rvalue {
-        MirRvalue::Call(call) => {
-            if let Some((symbol, arity)) = libm_symbol_and_arity(call) {
-                symbols.insert((symbol.to_string(), arity));
-            }
-        }
-        MirRvalue::ShortCircuit { right_temps, .. } => {
-            for stmt in right_temps {
-                collect_stmt_symbols(stmt, symbols);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// The `libm` symbol and arity for a built-in call, when it lowers to a direct
-/// C call (reductions and `sign` are lowered inline and return `None`).
-fn libm_symbol_and_arity(call: &MirCall) -> Option<(&'static str, usize)> {
-    let name = call_name(&call.callee)?;
-    let builtin = builtins::lookup(&name)?;
-    match builtin {
-        Builtin::Unary(symbol) => Some((symbol, 1)),
-        Builtin::Binary(symbol) => Some((symbol, 2)),
-        Builtin::MinMax(minmax) if call.args.len() == 2 => {
-            let symbol = match minmax {
-                MinMax::Min => "fmin",
-                MinMax::Max => "fmax",
-            };
-            Some((symbol, 2))
-        }
-        _ => None,
-    }
+/// Store a compile-time constant `f64` into a scalar cell (at index 0).
+/// A `None` cell is a no-op (the binding is unused).
+fn store_constant(
+    context: &mut Context,
+    block: Ptr<BasicBlock>,
+    cell: Option<Value>,
+    value: f64,
+) -> Result<()> {
+    let Some(cell) = cell else {
+        return Ok(());
+    };
+    let value = emit_constant(context, block, value)?;
+    let zero = emit_constant(context, block, 0.0)?;
+    emit_store(context, block, cell, zero, value);
+    Ok(())
 }
 
 /// Per-function lowering state (all read-only during lowering; `context` is
@@ -327,6 +326,14 @@ struct FuncLowerer<'b> {
     tys: HashMap<usize, LocalTy>,
     preds: Vec<Vec<usize>>,
     dominators: Vec<HashSet<usize>>,
+    /// The MIR local backing `varargin` (if any), specialized away.
+    varargin_local: Option<usize>,
+    /// The entry-block argument `Value` for each `varargin{k}` (0-based).
+    varargin_args: Vec<Value>,
+    /// The MIR local backing `varargout` (if any), specialized away.
+    varargout_local: Option<usize>,
+    /// The scalar cell for each `varargout{k}` (0-based).
+    varargout_cells: Vec<Value>,
 }
 
 /// A reduction to apply across an array.
@@ -443,6 +450,16 @@ impl<'b> FuncLowerer<'b> {
                     }
                     let mut values = Vec::new();
                     for operand in operands {
+                        // A `varargout` return expands to its specialized scalar
+                        // outputs, in order.
+                        if let MirOperand::Local(id) = operand {
+                            if self.varargout_local == Some(id.0) {
+                                for cell in &self.varargout_cells {
+                                    values.push(self.load_local(context, block, *cell)?);
+                                }
+                                continue;
+                            }
+                        }
                         match self.operand_ty(operand) {
                             LocalTy::Scalar => {
                                 values.push(self.lower_operand(context, block, operand)?);
@@ -516,6 +533,16 @@ impl<'b> FuncLowerer<'b> {
     ) -> Result<()> {
         match &stmt.kind {
             MirStmtKind::Assign { place, value } => {
+                // `varargout{k} = expr` writes the k-th extra scalar output cell.
+                if let Some(k) = varargout_index(place, self.varargout_local) {
+                    let value = self.lower_rvalue(context, block, value)?;
+                    let cell = self.varargout_cells.get(k - 1).copied().ok_or_else(|| {
+                        Error::NotLowerable(format!("varargout{{{k}}} is out of range"))
+                    })?;
+                    let zero = emit_constant(context, block, 0.0)?;
+                    emit_store(context, block, cell, zero, value);
+                    return Ok(());
+                }
                 let MirPlace::Local(target) = place else {
                     return Err(Error::NotLowerable(format!(
                         "non-local assignment target {place:?}"
@@ -546,6 +573,8 @@ impl<'b> FuncLowerer<'b> {
                 self.lower_rvalue(context, block, value)?;
                 Ok(())
             }
+            // `varargout{k}` array-creation place mutations are folded away.
+            MirStmtKind::PlaceMutation(_) => Ok(()),
             other => Err(Error::NotLowerable(format!(
                 "unsupported statement {other:?}"
             ))),
@@ -630,7 +659,8 @@ impl<'b> FuncLowerer<'b> {
         }
     }
 
-    /// Lower scalar indexing `A(i, j)` / `A(i)` to a single `f64` load.
+    /// Lower scalar indexing `A(i, j)` / `A(i)` to a single `f64` load, or
+    /// `varargin{k}` to the `k`-th extra scalar argument.
     fn lower_index_scalar(
         &self,
         context: &mut Context,
@@ -638,6 +668,24 @@ impl<'b> FuncLowerer<'b> {
         base: &MirOperand,
         indexing: &MirIndexing,
     ) -> Result<Value> {
+        // `varargin{k}` (constant `k`) is a direct reference to an argument.
+        if indexing.kind == IndexKind::Brace {
+            if let MirOperand::Local(id) = base {
+                if self.varargin_local == Some(id.0) {
+                    let Some(k) = brace_index(indexing) else {
+                        return Err(Error::NotLowerable(
+                            "varargin index must be a constant".to_string(),
+                        ));
+                    };
+                    return self.varargin_args.get(k - 1).copied().ok_or_else(|| {
+                        Error::NotLowerable(format!("varargin{{{k}}} is out of range"))
+                    });
+                }
+            }
+            return Err(Error::NotLowerable(
+                "only paren indexing is supported".to_string(),
+            ));
+        }
         if indexing.kind != IndexKind::Paren {
             return Err(Error::NotLowerable(
                 "only paren indexing is supported".to_string(),
@@ -760,6 +808,11 @@ impl<'b> FuncLowerer<'b> {
                 let l = self.lower_operand(context, block, args[0])?;
                 let r = self.lower_operand(context, block, args[1])?;
                 self.emit_libm_call(context, block, symbol, &[l, r])
+            }
+            Builtin::Mod => {
+                let l = self.lower_operand(context, block, args[0])?;
+                let r = self.lower_operand(context, block, args[1])?;
+                self.mod_floor(context, block, l, r)
             }
             Builtin::Sign => {
                 let value = self.lower_operand(context, block, args[0])?;
@@ -1090,6 +1143,10 @@ impl<'b> FuncLowerer<'b> {
         rhs: &MirOperand,
         dest: Value,
     ) -> Result<()> {
+        // Matrix power is not elementwise: route it to its own helper.
+        if *op == OperatorKind::MatrixPower {
+            return self.lower_matrix_power(context, block, lhs, rhs, dest);
+        }
         match (self.operand_ty(lhs), self.operand_ty(rhs)) {
             (LocalTy::Scalar, LocalTy::Array { shape }) => {
                 let src = self.array_source(rhs)?;
@@ -1226,7 +1283,8 @@ impl<'b> FuncLowerer<'b> {
         })
     }
 
-    /// Compile-time 2-D transpose from `src` (`rows x cols`) into `dest`.
+    /// 2-D transpose from `src` (`rows x cols`) into `dest`, wrapped as a
+    /// runtime helper call (a pure memory-layout change).
     fn transpose(
         &self,
         context: &mut Context,
@@ -1236,24 +1294,19 @@ impl<'b> FuncLowerer<'b> {
         rows: usize,
         cols: usize,
     ) -> Result<()> {
-        let src_shape = Shape::matrix(rows, cols);
-        let dst_shape = Shape::matrix(cols, rows);
-        for row in 0..rows {
-            for col in 0..cols {
-                let src_index =
-                    emit_constant(context, block, src_shape.linear(&[row, col]) as f64)?;
-                let load = LoadOp::new(context, src, src_index);
-                let value = load.get_result(context);
-                append(context, block, &load);
-                let dst_index =
-                    emit_constant(context, block, dst_shape.linear(&[col, row]) as f64)?;
-                emit_store(context, block, dest, dst_index, value);
-            }
-        }
+        let rows = emit_constant(context, block, rows as f64)?;
+        let cols = emit_constant(context, block, cols as f64)?;
+        self.emit_extern_call(
+            context,
+            block,
+            crate::runtime::TRANSPOSE,
+            &[dest, src, rows, cols],
+        );
         Ok(())
     }
 
-    /// Compile-time matrix multiply `C = A * B` with column-major indexing.
+    /// Matrix multiply `C = A * B` with column-major indexing, wrapped as a
+    /// runtime helper call (instead of an unrolled triple loop).
     fn matmul(
         &self,
         context: &mut Context,
@@ -1265,33 +1318,72 @@ impl<'b> FuncLowerer<'b> {
         rhs: Shape,
     ) -> Result<()> {
         let (m, k, n) = (lhs.dims()[0], lhs.dims()[1], rhs.dims()[1]);
-        let c_shape = Shape::matrix(m, n);
-        for i in 0..m {
-            for j in 0..n {
-                let mut acc: Option<Value> = None;
-                for p in 0..k {
-                    let a_index = emit_constant(context, block, lhs.linear(&[i, p]) as f64)?;
-                    let a_load = LoadOp::new(context, ls, a_index);
-                    let a = a_load.get_result(context);
-                    append(context, block, &a_load);
-                    let b_index = emit_constant(context, block, rhs.linear(&[p, j]) as f64)?;
-                    let b_load = LoadOp::new(context, rs, b_index);
-                    let b = b_load.get_result(context);
-                    append(context, block, &b_load);
-                    let prod = self.append_binop(context, block, BinOpKind::Mul, a, b)?;
-                    acc = Some(match acc {
-                        Some(prev) => {
-                            self.append_binop(context, block, BinOpKind::Add, prev, prod)?
-                        }
-                        None => prod,
-                    });
-                }
-                let value = acc.expect("matrix inner dimension is non-zero");
-                let c_index = emit_constant(context, block, c_shape.linear(&[i, j]) as f64)?;
-                emit_store(context, block, dest, c_index, value);
-            }
-        }
+        let m = emit_constant(context, block, m as f64)?;
+        let k = emit_constant(context, block, k as f64)?;
+        let n = emit_constant(context, block, n as f64)?;
+        self.emit_extern_call(
+            context,
+            block,
+            crate::runtime::MATMUL,
+            &[dest, ls, rs, m, k, n],
+        );
         Ok(())
+    }
+
+    /// Matrix power `A ^ k` for a square matrix `A` and a compile-time integer
+    /// exponent `k >= 0`, wrapped as a runtime helper call. Non-integer or
+    /// negative exponents (which need `expm`/inverse) are deferred.
+    fn lower_matrix_power(
+        &self,
+        context: &mut Context,
+        block: Ptr<BasicBlock>,
+        lhs: &MirOperand,
+        rhs: &MirOperand,
+        dest: Value,
+    ) -> Result<()> {
+        let LocalTy::Array { shape } = self.operand_ty(lhs) else {
+            return Err(Error::NotLowerable(
+                "matrix power base must be an array".to_string(),
+            ));
+        };
+        if shape.rank() != 2 || shape.dims()[0] != shape.dims()[1] {
+            return Err(Error::NotLowerable(
+                "matrix power requires a square matrix".to_string(),
+            ));
+        }
+        let Some(exp) = self.const_int_exponent(rhs)? else {
+            return Err(Error::NotLowerable(
+                "matrix power with a runtime exponent is not supported".to_string(),
+            ));
+        };
+        if exp < 0 {
+            return Err(Error::NotLowerable(
+                "negative matrix power (inverse) is not supported".to_string(),
+            ));
+        }
+        let src = self.array_source(lhs)?;
+        let m = emit_constant(context, block, shape.dims()[0] as f64)?;
+        let k = emit_constant(context, block, exp as f64)?;
+        self.emit_extern_call(context, block, crate::runtime::MPOWER, &[dest, src, m, k]);
+        Ok(())
+    }
+
+    /// A compile-time integer exponent from a scalar operand, or `None` when the
+    /// operand is not a known integer constant.
+    fn const_int_exponent(&self, operand: &MirOperand) -> Result<Option<i64>> {
+        match operand {
+            MirOperand::Constant(MirConstant::Number(text)) => {
+                text.trim().parse::<i64>().map(Some).map_err(|_| {
+                    Error::NotLowerable(format!(
+                        "matrix power exponent must be a non-negative integer, got `{text}`"
+                    ))
+                })
+            }
+            MirOperand::Constant(MirConstant::IntegerLiteral(literal)) => {
+                Ok(Some(literal.bits() as i64))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Reduce a 2-D array along dimension `dim` (1 or 2).
@@ -1463,6 +1555,34 @@ impl<'b> FuncLowerer<'b> {
         Ok(result)
     }
 
+    /// Emit a call to a runtime helper that writes its result into the first
+    /// argument (an out-buffer) and returns nothing.
+    fn emit_extern_call(
+        &self,
+        context: &mut Context,
+        block: Ptr<BasicBlock>,
+        callee: &str,
+        args: &[Value],
+    ) {
+        let op = CallVoidOp::new(context, callee, args.to_vec());
+        append(context, block, &op);
+    }
+
+    /// Lower MATLAB `mod(x, y) = x - floor(x / y) * y` inline as
+    /// `fmod(fmod(x, y) + y, y)`, which carries the sign of `y` (valid for
+    /// `y != 0`).
+    fn mod_floor(
+        &self,
+        context: &mut Context,
+        block: Ptr<BasicBlock>,
+        x: Value,
+        y: Value,
+    ) -> Result<Value> {
+        let first = self.emit_libm_call(context, block, "fmod", &[x, y])?;
+        let shifted = self.append_binop(context, block, BinOpKind::Add, first, y)?;
+        self.emit_libm_call(context, block, "fmod", &[shifted, y])
+    }
+
     /// Lower `sign(x)` inline: `1` for `x > 0`, `-1` for `x < 0`, else `0`.
     fn sign(&self, context: &mut Context, block: Ptr<BasicBlock>, x: Value) -> Result<Value> {
         let zero = emit_constant(context, block, 0.0)?;
@@ -1528,6 +1648,10 @@ impl<'b> FuncLowerer<'b> {
             OperatorKind::GreaterEqual => self.cmp_select(context, block, CmpKind::Ge, l, r),
             OperatorKind::ElementwiseAnd => self.logical_and(context, block, l, r),
             OperatorKind::ElementwiseOr => self.logical_or(context, block, l, r),
+            // Scalar power: `.^` and scalar `^` both lower to `libm::pow`.
+            OperatorKind::ElementwisePower | OperatorKind::MatrixPower => {
+                self.emit_libm_call(context, block, "pow", &[l, r])
+            }
             other => Err(Error::NotLowerable(format!("binary operator {other:?}"))),
         }
     }
@@ -2040,6 +2164,8 @@ fn dump_block(context: &Context, out: &mut String, block: Ptr<BasicBlock>, inden
         let opid = Operation::get_opid(op, context);
         let pad = "  ".repeat(indent);
         if let Some(call) = Operation::get_op::<CallOp>(op, context) {
+            out.push_str(&format!("{pad}{opid} @{}\n", call.callee(context)));
+        } else if let Some(call) = Operation::get_op::<CallVoidOp>(op, context) {
             out.push_str(&format!("{pad}{opid} @{}\n", call.callee(context)));
         } else {
             out.push_str(&format!("{pad}{opid}\n"));

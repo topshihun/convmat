@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use runmat_hir::OperatorKind;
+use runmat_hir::{IndexKind, OperatorKind};
 use runmat_mir::{
     MirBody, MirCall, MirCallArg, MirCallee, MirConstant, MirIndexComponent, MirIndexing,
     MirOperand, MirPlace, MirRvalue, MirStmt, MirStmtKind, MirTerminator, MirTerminatorKind,
@@ -110,6 +110,160 @@ pub enum LocalTy {
     Dynamic,
 }
 
+/// The variadic-argument shape of a function body: which MIR locals back
+/// `varargin`/`varargout`/`nargin`/`nargout`, and how many extra scalar
+/// arguments/outputs the body actually uses.
+///
+/// In the closed-world, fixed-arity specialization (see `docs/architecture.md`
+/// §12), `nargin`/`nargout` fold to `named_* + *_count`, and `varargin{k}` /
+/// `varargout{k}` (constant `k`) resolve directly to the `k`-th extra argument
+/// or output — no cell is materialized.
+#[derive(Debug, Clone, Default)]
+pub struct Variadics {
+    pub varargin_local: Option<usize>,
+    pub varargin_count: usize,
+    pub varargout_local: Option<usize>,
+    pub varargout_count: usize,
+    pub nargin_local: Option<usize>,
+    pub nargout_local: Option<usize>,
+    /// Number of named (non-variadic) inputs: `fixed_inputs` minus `varargin`.
+    pub named_inputs: usize,
+    /// Number of named (non-variadic) outputs: `fixed_outputs` minus `varargout`.
+    pub named_outputs: usize,
+}
+
+impl Variadics {
+    /// Compute the variadic shape of `body` by mapping ABI bindings to locals
+    /// and scanning for constant `varargin{k}` / `varargout{k}` indices.
+    pub fn compute(body: &MirBody) -> Self {
+        let mut binding_to_local = HashMap::new();
+        for local in &body.locals {
+            if let Some(binding) = local.binding {
+                binding_to_local.insert(binding, local.id.0);
+            }
+        }
+        let varargin_local = body
+            .abi
+            .varargin
+            .and_then(|b| binding_to_local.get(&b).copied());
+        let varargout_local = body
+            .abi
+            .varargout
+            .and_then(|b| binding_to_local.get(&b).copied());
+        let nargin_local = body
+            .abi
+            .implicit_nargin
+            .and_then(|b| binding_to_local.get(&b).copied());
+        let nargout_local = body
+            .abi
+            .implicit_nargout
+            .and_then(|b| binding_to_local.get(&b).copied());
+
+        let mut varargin_count = 0;
+        let mut varargout_count = 0;
+        for block in &body.blocks {
+            for stmt in &block.statements {
+                match &stmt.kind {
+                    MirStmtKind::Assign { place, value } => {
+                        if let Some(k) = varargout_index(place, varargout_local) {
+                            varargout_count = varargout_count.max(k);
+                        }
+                        scan_varargin(value, varargin_local, &mut varargin_count);
+                    }
+                    MirStmtKind::Expr(value) => {
+                        scan_varargin(value, varargin_local, &mut varargin_count);
+                    }
+                    MirStmtKind::PlaceMutation(mutation) => {
+                        if let Some(k) = varargout_index(&mutation.place, varargout_local) {
+                            varargout_count = varargout_count.max(k);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Variadics {
+            varargin_local,
+            varargin_count,
+            varargout_local,
+            varargout_count,
+            nargin_local,
+            nargout_local,
+            named_inputs: body
+                .abi
+                .fixed_inputs
+                .len()
+                .saturating_sub(usize::from(body.abi.varargin.is_some())),
+            named_outputs: body
+                .abi
+                .fixed_outputs
+                .len()
+                .saturating_sub(usize::from(body.abi.varargout.is_some())),
+        }
+    }
+}
+
+/// The 1-based constant index of a single-component `{}` (cell) index, if known.
+pub(crate) fn brace_index(indexing: &MirIndexing) -> Option<usize> {
+    match indexing.components.as_slice() {
+        [MirIndexComponent::Expr(MirOperand::Constant(MirConstant::Number(text)))] => {
+            text.trim().parse::<usize>().ok()
+        }
+        [MirIndexComponent::Expr(MirOperand::Constant(MirConstant::IntegerLiteral(lit)))] => {
+            Some(lit.bits() as usize)
+        }
+        _ => None,
+    }
+}
+
+/// Accumulate the largest constant `varargin{k}` index referenced by `rvalue`.
+fn scan_varargin(rvalue: &MirRvalue, varargin_local: Option<usize>, count: &mut usize) {
+    let Some(varargin_local) = varargin_local else {
+        return;
+    };
+    match rvalue {
+        MirRvalue::Index {
+            base: MirOperand::Local(id),
+            indexing,
+        } => {
+            if id.0 == varargin_local && indexing.kind == IndexKind::Brace {
+                if let Some(k) = brace_index(indexing) {
+                    *count = (*count).max(k);
+                }
+            }
+        }
+        MirRvalue::ShortCircuit { right_temps, .. } => {
+            for stmt in right_temps {
+                match &stmt.kind {
+                    MirStmtKind::Assign { value, .. } | MirStmtKind::Expr(value) => {
+                        scan_varargin(value, Some(varargin_local), count)
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The 1-based constant index of a `varargout{k}` write target, if `place` is
+/// `varargout{k}`.
+pub(crate) fn varargout_index(place: &MirPlace, varargout_local: Option<usize>) -> Option<usize> {
+    let varargout_local = varargout_local?;
+    match place {
+        MirPlace::Index(base, indexing) => {
+            if let MirPlace::Local(id) = &**base {
+                if id.0 == varargout_local && indexing.kind == IndexKind::Brace {
+                    return brace_index(indexing);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 /// Operators supported by the current scalar lowering.
 fn supported_unary(op: &OperatorKind) -> bool {
     matches!(
@@ -130,6 +284,8 @@ fn supported_binary(op: &OperatorKind) -> bool {
             | OperatorKind::Subtract
             | OperatorKind::MatrixMultiply
             | OperatorKind::ElementwiseMultiply
+            | OperatorKind::MatrixPower
+            | OperatorKind::ElementwisePower
             | OperatorKind::Mrdivide
             | OperatorKind::ElementwiseDivide
             | OperatorKind::Mldivide
@@ -164,7 +320,7 @@ fn operand_reason(operand: &MirOperand) -> Option<String> {
     }
 }
 
-fn rvalue_reason(value: &MirRvalue) -> Option<String> {
+fn rvalue_reason(value: &MirRvalue, varargout_local: Option<usize>) -> Option<String> {
     match value {
         MirRvalue::Use(operand) => operand_reason(operand),
         MirRvalue::Unary(op, operand) => {
@@ -190,7 +346,11 @@ fn rvalue_reason(value: &MirRvalue) -> Option<String> {
             ..
         } => operand_reason(left)
             .or_else(|| operand_reason(right))
-            .or_else(|| right_temps.iter().find_map(stmt_reason)),
+            .or_else(|| {
+                right_temps
+                    .iter()
+                    .find_map(|s| stmt_reason(s, varargout_local))
+            }),
         MirRvalue::Aggregate { kind, .. } => match kind {
             runmat_mir::MirAggregateKind::Tensor => None,
             runmat_mir::MirAggregateKind::Cell => {
@@ -234,15 +394,28 @@ fn call_reason(call: &MirCall) -> Option<String> {
     })
 }
 
-fn stmt_reason(stmt: &MirStmt) -> Option<String> {
+fn stmt_reason(stmt: &MirStmt, varargout_local: Option<usize>) -> Option<String> {
     match &stmt.kind {
         MirStmtKind::Assign { place, value } => {
-            if !matches!(place, MirPlace::Local(_)) {
-                return Some(format!("non-local assignment target {place:?}"));
+            // A `varargout{k}` target is a local cell element write; the value
+            // still has to be lowerable. A plain `Local` target is the norm.
+            if varargout_index(place, varargout_local).is_some()
+                || matches!(place, MirPlace::Local(_))
+            {
+                rvalue_reason(value, varargout_local)
+            } else {
+                Some(format!("non-local assignment target {place:?}"))
             }
-            rvalue_reason(value)
         }
-        MirStmtKind::Expr(value) => rvalue_reason(value),
+        MirStmtKind::Expr(value) => rvalue_reason(value, varargout_local),
+        // `varargout{k}` array-creation place mutations are folded away; any
+        // other place mutation is unsupported.
+        MirStmtKind::PlaceMutation(mutation) => {
+            match varargout_index(&mutation.place, varargout_local) {
+                Some(_) => None,
+                None => Some(format!("unsupported place mutation {:?}", mutation.kind)),
+            }
+        }
         other => Some(format!("unsupported statement {other:?}")),
     }
 }
@@ -281,9 +454,10 @@ pub struct WhitelistClassifier;
 
 impl Classifier for WhitelistClassifier {
     fn classify(&self, body: &MirBody) -> Verdict {
+        let variadics = Variadics::compute(body);
         for block in &body.blocks {
             for stmt in &block.statements {
-                if let Some(reason) = stmt_reason(stmt) {
+                if let Some(reason) = stmt_reason(stmt, variadics.varargout_local) {
                     return Verdict::Deferred { reason };
                 }
             }
@@ -327,6 +501,7 @@ pub fn classify(body: &MirBody) -> Verdict {
 /// literals; elementwise built-ins preserve their argument's shape; reductions
 /// produce a scalar. Anything else resolves to [`LocalTy::Dynamic`].
 pub fn infer_locals(body: &MirBody) -> HashMap<usize, LocalTy> {
+    let variadics = Variadics::compute(body);
     let mut tys = HashMap::new();
 
     for local in &body.locals {
@@ -343,7 +518,7 @@ pub fn infer_locals(body: &MirBody) -> HashMap<usize, LocalTy> {
                 let MirPlace::Local(target) = place else {
                     continue;
                 };
-                let ty = rvalue_ty(value, &tys);
+                let ty = rvalue_ty(value, &tys, variadics.varargin_local);
                 tys.insert(target.0, ty);
             }
         }
@@ -360,7 +535,11 @@ fn operand_ty(operand: &MirOperand, tys: &HashMap<usize, LocalTy>) -> LocalTy {
     }
 }
 
-fn rvalue_ty(value: &MirRvalue, tys: &HashMap<usize, LocalTy>) -> LocalTy {
+fn rvalue_ty(
+    value: &MirRvalue,
+    tys: &HashMap<usize, LocalTy>,
+    varargin_local: Option<usize>,
+) -> LocalTy {
     match value {
         MirRvalue::Use(operand) => operand_ty(operand, tys),
         MirRvalue::Unary(op, operand) => unary_ty(*op, operand_ty(operand, tys)),
@@ -377,7 +556,18 @@ fn rvalue_ty(value: &MirRvalue, tys: &HashMap<usize, LocalTy>) -> LocalTy {
             runmat_mir::MirAggregateKind::Cell => LocalTy::Dynamic,
         },
         MirRvalue::Call(call) => call_ty(call, tys),
-        MirRvalue::Index { base, indexing } => index_ty(operand_ty(base, tys), indexing),
+        MirRvalue::Index { base, indexing } => {
+            // `varargin{k}` (constant `k`) resolves to a scalar extra argument.
+            if let MirOperand::Local(id) = base {
+                if varargin_local == Some(id.0)
+                    && indexing.kind == IndexKind::Brace
+                    && brace_index(indexing).is_some()
+                {
+                    return LocalTy::Scalar;
+                }
+            }
+            index_ty(operand_ty(base, tys), indexing)
+        }
         _ => LocalTy::Dynamic,
     }
 }
@@ -391,6 +581,7 @@ fn is_elementwise(op: OperatorKind) -> bool {
             | OperatorKind::ElementwiseMultiply
             | OperatorKind::ElementwiseDivide
             | OperatorKind::ElementwiseLeftDivide
+            | OperatorKind::ElementwisePower
             | OperatorKind::Equal
             | OperatorKind::NotEqual
             | OperatorKind::Less
@@ -427,6 +618,10 @@ fn binary_ty(lhs: LocalTy, op: OperatorKind, rhs: LocalTy) -> LocalTy {
     match (lhs, rhs) {
         (Scalar, Scalar) => Scalar,
         (Dynamic, _) | (_, Dynamic) => Dynamic,
+        // Matrix power `A ^ scalar` keeps `A`'s shape (a square matrix).
+        (Array { shape }, Scalar) if op == OperatorKind::MatrixPower => Array { shape },
+        // `scalar ^ matrix` is `expm`; not statically lowerable.
+        (Scalar, Array { .. }) if op == OperatorKind::MatrixPower => Dynamic,
         // Scalar broadcast against an array (`*` behaves like `.*` here).
         (Scalar, Array { shape }) | (Array { shape }, Scalar) => {
             if is_elementwise(op) || op == OperatorKind::MatrixMultiply {
@@ -435,9 +630,11 @@ fn binary_ty(lhs: LocalTy, op: OperatorKind, rhs: LocalTy) -> LocalTy {
                 Dynamic
             }
         }
-        // Two arrays: elementwise when the shapes agree; `*` is a matmul.
+        // Two arrays: elementwise when the shapes agree; `*` is a matmul; `^`
+        // (matrix ^ matrix) is not defined and is deferred.
         (Array { shape: lhs_shape }, Array { shape: rhs_shape }) => match op {
             OperatorKind::MatrixMultiply => matmul_ty(lhs_shape, rhs_shape),
+            OperatorKind::MatrixPower => Dynamic,
             _ if lhs_shape == rhs_shape && is_elementwise(op) => Array { shape: lhs_shape },
             _ => Dynamic,
         },
@@ -502,7 +699,7 @@ fn call_ty(call: &MirCall, tys: &HashMap<usize, LocalTy>) -> LocalTy {
             }
         }
         // Everything else in the supported set is scalar-valued.
-        Builtin::Binary(_) | Builtin::Sign => LocalTy::Scalar,
+        Builtin::Binary(_) | Builtin::Mod | Builtin::Sign => LocalTy::Scalar,
         // Constructors and reshape: array shapes from constant dim arguments.
         Builtin::Fill(_) | Builtin::Eye => match (constant_arg(call, 0), constant_arg(call, 1)) {
             (Some(n), None) => LocalTy::Array {

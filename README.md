@@ -13,12 +13,23 @@ End-to-end codegen works for a growing subset of MATLAB:
   structured control flow (`if` / `elseif` / `while` / `for` / `switch`), and
   multiple return values.
 - **Statically-shaped arrays and matrices** (row / column vectors, 2-D matrices,
-  stored column-major): elementwise operators with scalar broadcast, 2-D
-  transpose, and matrix multiply.
+  stored column-major): elementwise operators with scalar broadcast (incl. `.^`),
+  2-D transpose, matrix multiply, and integer matrix power `A^k`.
+- **Full operator coverage**: every `OperatorKind` binary/unary/relational/logical
+  operator is lowerable; `^` / `.^` lower to `libm::pow` (scalar) or a `convmat_mpower`
+  runtime call (square-matrix integer power).
+- **Wrapped runtime helpers**: transpose (`convmat_transpose`), matrix multiply
+  (`convmat_matmul`), and integer matrix power (`convmat_mpower`) are emitted as
+  calls to a small C runtime library (`src/runtime`) — emitted only when used —
+  instead of unrolled loops; see `docs/architecture.md` §10.2.1.
 - **Pure numeric built-ins** (`sin`/`cos`/`sqrt`/`abs`/`floor`/…,
   `sum`/`prod`/`min`/`max` with an optional dimension, `numel`/`length`/`size`,
   `zeros`/`ones`/`eye`, `reshape`) lowered to `libm` calls.
 - **Indexing**: constant subscript `A(i,j)`, linear `A(i)`, `end`, and `A(:)`.
+- **Variadic arguments (closed-world specialization)**: `nargin`/`nargout` fold to
+  compile-time constants; `varargin{k}` (constant `k`) resolves to the `k`-th extra
+  scalar input; `varargout{k} = scalar` resolves to the `k`-th extra scalar output.
+  See `docs/architecture.md` §12.
 
 ```sh
 cargo run -- tests/fixtures/add.m
@@ -94,11 +105,14 @@ cargo clippy --all-targets -- -D warnings
 - `runmat-static-analysis`-driven type/shape inference (dynamic shapes); the
   current boundary is a lightweight local inference over the static-from-literal
   subset.
-- Full matrix linear algebra: `mrdivide`/`mldivide` (`/` `\`), `^` (mpower),
-  array-array broadcasting, N-D transpose.
+- Full matrix linear algebra: `mrdivide`/`mldivide` (`/` `\`) at the matrix level,
+  `scalar ^ matrix` (`expm`), `matrix ^ matrix`, non-integer/negative matrix
+  power, array-array broadcasting, N-D transpose.
 - Remaining shape transforms: `permute`/`repmat`/`cat`/`horzcat`/`vertcat`.
 - Advanced indexing: `A(i,:)` / `A(:,j)` slices, colon ranges, variable indices.
 - Optimization passes (CSE / canonicalize / linalg fusion / vectorization); the
   pipeline today emits straightforward, unoptimized C.
-- `varargin` / `varargout` (closed-world specialization or runtime cell ABI).
+- `varargin{k}` with a variable index, `varargout{k}` with an array value, and
+  `varargin{:}` expansion (runtime cell ABI); the closed-world fixed-arity
+  specialization of `nargin`/`nargout`/`varargin`/`varargout` is implemented.
 - LLVM and GPU backends (`src/backend` reserves `Llvm`/`Gpu`).

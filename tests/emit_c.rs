@@ -533,3 +533,102 @@ fn codegen_colon_indexing() {
     let c = compile_fixture("index_colon");
     assert!(c.contains("void index_colon(double v1[4])"), "got:\n{c}");
 }
+
+// --- Power operators & wrapped runtime helpers --------------------------------
+
+#[test]
+fn codegen_power_operators() {
+    // Scalar `^` and `.^` both lower to `libm::pow`.
+    let c = compile_fixture("power_scalar");
+    assert!(c.contains("double power_scalar("), "got:\n{c}");
+    assert!(c.contains("pow("), "got:\n{c}");
+}
+
+#[test]
+fn codegen_elementwise_power_array() {
+    let c = compile_fixture("power_array");
+    assert!(c.contains("void power_array(double v1[4])"), "got:\n{c}");
+    assert!(c.contains("pow("), "got:\n{c}");
+}
+
+#[test]
+fn codegen_matrix_power_wrapped() {
+    // `A ^ 2` becomes a single `convmat_mpower` helper call, not an unrolled loop.
+    let c = compile_fixture("mpower");
+    assert!(c.contains("void mpower(double v1[4])"), "got:\n{c}");
+    assert!(c.contains("convmat_mpower("), "got:\n{c}");
+}
+
+#[test]
+fn lower_matrix_power_to_extern() {
+    // The matlab-dialect IR lowers matrix power to a `matlab.call_void` helper.
+    let mlir = lower_fixture("mpower");
+    assert!(
+        mlir.contains("matlab.call_void @convmat_mpower"),
+        "got:\n{mlir}"
+    );
+}
+
+#[test]
+fn lower_matmul_to_extern() {
+    // Matrix multiply is wrapped as a `matlab.call_void @convmat_matmul`.
+    let mlir = lower_fixture("matmul");
+    assert!(
+        mlir.contains("matlab.call_void @convmat_matmul"),
+        "got:\n{mlir}"
+    );
+}
+
+#[test]
+fn codegen_matrix_multiply_wrapped() {
+    // `*` on arrays is wrapped as a `convmat_matmul` call (no triple loop).
+    let c = compile_fixture("matmul");
+    assert!(c.contains("convmat_matmul("), "got:\n{c}");
+}
+
+#[test]
+fn codegen_matrix_transpose_wrapped() {
+    // `.'` on arrays is wrapped as a `convmat_transpose` call.
+    let c = compile_fixture("mat_transpose");
+    assert!(c.contains("convmat_transpose("), "got:\n{c}");
+}
+
+#[test]
+fn codegen_runtime_helpers_emitted() {
+    // Any wrapped operator pulls the runtime helper library into the output.
+    let c = compile_fixture("matmul");
+    assert!(c.contains("void convmat_matmul("), "got:\n{c}");
+}
+
+#[test]
+fn codegen_no_runtime_for_scalar_only() {
+    // A scalar-only program must not pull in the (unused) runtime helpers.
+    let c = compile_fixture("add");
+    assert!(!c.contains("convmat_"), "got:\n{c}");
+}
+
+// --- varargin / nargin / varargout -------------------------------------------
+
+#[test]
+fn codegen_varargin_specialized() {
+    // `varargin{1}`/`varargin{2}` synthesize two extra scalar parameters.
+    let c = compile_fixture("varargin_sum");
+    assert!(c.contains("double f(double v1, double v2)"), "got:\n{c}");
+}
+
+#[test]
+fn codegen_nargin_constant() {
+    // `nargin` folds to the fixed arity rather than reading an uninitialized cell.
+    let c = compile_fixture("nargin_guard");
+    assert!(c.contains("double g(double v1)"), "got:\n{c}");
+}
+
+#[test]
+fn codegen_varargout_specialized() {
+    // `varargout{1}`/`varargout{2}` synthesize two scalar return values.
+    let c = compile_fixture("varargout_two");
+    assert!(
+        c.contains("std::tuple<double, double> h(double v1)"),
+        "got:\n{c}"
+    );
+}

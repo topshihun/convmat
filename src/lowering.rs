@@ -7,17 +7,18 @@
 //! primitive. The result is a near-1:1 mirror of the `matlab` IR that the C
 //! emitter can print directly.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use pliron::{
     basic_block::BasicBlock,
     builtin::{
-        op_interfaces::{OneRegionInterface, SymbolOpInterface},
+        op_interfaces::{OneRegionInterface, SingleBlockRegionInterface, SymbolOpInterface},
         ops::{FuncOp, ModuleOp},
         type_interfaces::FunctionTypeInterface,
         types::FunctionType,
     },
     context::{Context, Ptr},
+    identifier::Identifier,
     irbuild::inserter::Inserter,
     linked_list::ContainsLinkedList,
     op::Op,
@@ -32,9 +33,22 @@ use crate::{
     error::{Error, Result},
 };
 
-/// Translate a `matlab`-dialect module into a list of `emitc` functions.
-pub fn lower_module(context: &mut Context, module: &ModuleOp) -> Result<Vec<emitc::FuncOp>> {
-    let mut functions = Vec::new();
+/// Translate a `matlab`-dialect module into a builtin `ModuleOp` whose bodies
+/// are C-level `emitc` ops. Containers (`module`/`func`) are pliron builtins;
+/// only the C-level body ops and directives come from the `emitc` dialect.
+pub fn lower_module(context: &mut Context, module: &ModuleOp) -> Result<ModuleOp> {
+    let emitc_module = ModuleOp::new(context, Identifier::try_from("convmat").unwrap());
+
+    // Emit only the runtime helpers this module actually references, and emit
+    // them first so the wrapped-operator calls in the functions resolve. An
+    // unknown helper name is a bug (typo) and fails loudly rather than emitting
+    // an undefined symbol.
+    for name in collect_used_helpers(context, module) {
+        let source = crate::runtime::helper_source(&name)
+            .ok_or_else(|| Error::Backend(format!("unknown runtime helper `{name}`")))?;
+        let verbatim = emitc::VerbatimOp::new(context, source);
+        emitc_module.append_operation(context, verbatim.get_operation(), 0);
+    }
 
     // Collect the `matlab` functions first (immutable pass), then lower each
     // (mutable pass) so the module borrow and the context borrow never alias.
@@ -47,26 +61,29 @@ pub fn lower_module(context: &mut Context, module: &ModuleOp) -> Result<Vec<emit
         }
     }
     for func in &matlab_funcs {
-        functions.push(lower_func(context, func)?);
+        let efunc = lower_func(context, func)?;
+        emitc_module.append_operation(context, efunc.get_operation(), 0);
     }
-    Ok(functions)
+    Ok(emitc_module)
 }
 
-/// Translate a single `matlab` function into an `emitc` function.
-fn lower_func(context: &mut Context, func: &FuncOp) -> Result<emitc::FuncOp> {
-    let fn_ty_handle = func.get_type(context);
-    let (arg_types, n_results) = {
-        let fn_ty = fn_ty_handle.deref(context);
+/// Translate a single `matlab` function into a builtin `FuncOp` whose body is
+/// C-level `emitc` ops.
+fn lower_func(context: &mut Context, func: &FuncOp) -> Result<FuncOp> {
+    let name = func.get_symbol_name(context).as_ref().to_string();
+    let (arg_types, res_types) = {
+        let fn_ty = func.get_type(context).deref(context);
         let ft = fn_ty
             .downcast_ref::<FunctionType>()
             .expect("func carries a function type");
-        (ft.arg_types(), ft.res_types().len() as u64)
+        (ft.arg_types(), ft.res_types())
     };
-    let name = func.get_symbol_name(context).as_ref().to_string();
 
-    let efunc = emitc::FuncOp::new(context, &name, n_results);
-    let entry = BasicBlock::new(context, None, arg_types.clone());
-    entry.insert_at_front(efunc.body_region(context), context);
+    let name_id = Identifier::try_from(name.as_str())
+        .map_err(|e| Error::Backend(format!("bad function name `{name}`: {e}")))?;
+    let fn_ty = FunctionType::get(context, arg_types.clone(), res_types);
+    let efunc = FuncOp::new(context, name_id, fn_ty);
+    let entry = efunc.get_entry_block(context);
 
     let mut lowerer = Lowerer {
         values: HashMap::new(),
@@ -145,6 +162,10 @@ impl Lowerer {
             let args: Vec<Value> = (0..m).map(|i| self.opd(context, op, i)).collect();
             let e = emitc::CallOp::new(context, &c.callee(context), args);
             self.map_result(context, op, &e, 0);
+            append(context, dst, &e);
+        } else if let Some(c) = Operation::get_op::<matlab::CallVoidOp>(op, context) {
+            let args: Vec<Value> = (0..m).map(|i| self.opd(context, op, i)).collect();
+            let e = emitc::CallVoidOp::new(context, &c.callee(context), args);
             append(context, dst, &e);
         } else if let Some(_c) = Operation::get_op::<matlab::AllocaOp>(op, context) {
             let array_ty = op.deref(context).get_result(0).get_type(context);
@@ -250,4 +271,29 @@ impl Lowerer {
 fn append(context: &Context, block: Ptr<BasicBlock>, op: &dyn Op) {
     pliron::irbuild::inserter::IRInserter::<pliron::irbuild::listener::DummyListener>::new_at_block_end(block)
         .append_op(context, op);
+}
+
+/// Collect the runtime helper names referenced by `matlab.call_void` ops
+/// anywhere in the module (including nested `if`/`while`/`for` regions).
+fn collect_used_helpers(context: &Context, module: &ModuleOp) -> BTreeSet<String> {
+    let mut used = BTreeSet::new();
+    if let Some(block) = module.get_region(context).deref(context).get_entry_block() {
+        for op in block.deref(context).iter(context) {
+            collect_helpers_from_op(context, op, &mut used);
+        }
+    }
+    used
+}
+
+fn collect_helpers_from_op(context: &Context, op: Ptr<Operation>, used: &mut BTreeSet<String>) {
+    if let Some(call) = Operation::get_op::<matlab::CallVoidOp>(op, context) {
+        used.insert(call.callee(context));
+    }
+    for region in op.deref(context).regions() {
+        if let Some(block) = region.deref(context).get_entry_block() {
+            for nested in block.deref(context).iter(context) {
+                collect_helpers_from_op(context, nested, used);
+            }
+        }
+    }
 }

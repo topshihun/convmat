@@ -117,9 +117,13 @@ runtime shim），负责内存管理、动态类型盒、内置函数、以及 �
    pass 框架），没有这些标准方言。要表达 MATLAB 语义，必须自建方言。
 2. **两个方言、一次降级**：`matlab` 承载「程序是什么意思」（数组、逐元素、矩阵乘、
    转置、归约、比较、控制流、`libm` 调用），`emitc` 承载「C 如何表达」（声明、赋值、
-   三元、调用、`if`/`while`/`for`/`break`/`return`）。二者之间用 pliron 的 pass 框架做
-   一次结构化降级（`src/lowering.rs`），把语义与 C 表示分开，便于测试与演进。
-3. **不追求语法完整**。方言只覆盖当前可生成代码子集需要的 op；`linalg` 级融合/向量化
+   三元、调用、`if`/`while`/`for`/`break`/`return`，以及顶层 `#include`/`#define` 等指令）。
+   二者之间用 pliron 的 pass 框架做一次结构化降级（`src/lowering.rs`），把语义与 C
+   表示分开，便于测试与演进。
+3. **容器复用 builtin**：`module`/`func` 一律用 pliron 内置的
+   `builtin::ModuleOp`/`builtin::FuncOp`（`matlab` 与 `emitc` 两侧都是），不重复定义
+   `emitc.func`/`emitc.module`。自建方言只覆盖 builtin 表达不了的 body op 与顶层指令。
+4. **不追求语法完整**。方言只覆盖当前可生成代码子集需要的 op；`linalg` 级融合/向量化
    等优化**暂不引入**（优化延后）。
 
 > **高阶语义如何降级**：MIR 降级器直接展开到 `matlab` 方言（矩阵乘/转置/归约在编译期
@@ -159,8 +163,8 @@ flowchart TD
 | 0 前端 | `src/frontend::parse_mir` | `.m` 源文本 | `runmat_parser::parse` → `runmat_hir::lower` → `runmat_mir::lowering::lower_assembly` | `MirAssembly`（lexer→parser→HIR→MIR，控制流显式、操作符已脱糖） |
 | 1 边界 | `src/triage::classify` | `MirAssembly` 的每个 `MirBody` | 自研白名单 + `infer_locals`（形状推断，区分 `Static`/`Dynamic`） | `Static`（可生成）或 `Deferred`（降运行时，MVP 报错） |
 | 2 降级 | `src/mir_to_mlir::lower_to_module` | 可生成代码的 `MirBody` | pliron + `matlab` 方言 + `builtins` 表（`matlab.call @libm`） | `matlab` 方言 module（含数组/矩阵/内建/控制流） |
-| 3 降级 | `src/lowering::lower_module` | `matlab` 方言 module | 自研 pass（pliron 框架） | `emitc` 方言函数列表（ABI 已解析、数组已命名） |
-| 4 发射 | `src/emit_c::emit` | `emitc` 方言 | 自写 pretty-printer | C 源码文本（最终产物） |
+| 3 降级 | `src/lowering::lower_module` | `matlab` 方言 module（builtin 容器） | 自研 pass（pliron 框架） | builtin module：`builtin.func`（body 为 `emitc.*` op）+ 顶层指令；ABI 已解析、数组已命名 |
+| 4 发射 | `src/emit_c::emit` | builtin module（`builtin.func` + `emitc.*`） | 自写 pretty-printer | C 源码文本（最终产物） |
 | 5 运行时兔底（分支） | `src/runtime::defer_to_runtime` | 被 `Deferred` 的函数（从阶段 1 分支） | 运行时 shim（MVP 尚未实现，当前报错） | 运行时调用（预留） |
 
 ```text
@@ -168,7 +172,7 @@ flowchart TD
   └─[0 前端 runmat]─────────────────────────────→ MirAssembly
   └─[1 边界 triage]── Static ────────────────┐   └─ Deferred → runtime（MVP 报错）
   └─[2 降级 mir_to_mlir]──────────────────────┤   → matlab 方言 module
-  └─[3 降级 lowering]─────────────────────────┤   → emitc 方言
+  └─[3 降级 lowering]─────────────────────────┤   → builtin module（func + emitc.* op）
   └─[4 发射 emit_c]───────────────────────────┘   → C 源码
 ```
 
@@ -190,7 +194,7 @@ flowchart TD
 | 3 降级 | `src/mir_to_mlir/` | MIR → `matlab` 方言；动态部分 → 运行时调用；内存分配策略 | 自研（核心） |
 | 3.5 内建表 | `src/builtins.rs` | 内建函数名 → 降级配方（`libm` 符号/归约/内联） | 自研（薄表） |
 | 4 降级 | `src/lowering.rs` | `matlab` → `emitc` 方言（ABI 解析、数组命名、op 重写） | 自研（核心） |
-| 4.5 方言 | `src/dialects/emitc.rs` | `emitc` 方言（C 级）：声明/赋值/三元/调用/控制流 | 自研（核心） |
+| 4.5 方言 | `src/dialects/emitc.rs` | `emitc` 方言（C 级）：声明/赋值/三元/调用/控制流 body op + 顶层指令（`include`/`define`/`undef`/`verbatim`）；容器复用 builtin `module`/`func` | 自研（核心） |
 | 5 后端 | `src/emit_c.rs` | `emitc` → C 源码（pretty-printer）；LLVM/GPU 预留 | 自研 |
 | 6 运行时 | `runtime/`（或复用 runmat runtime） | 内存管理、动态盒、内置函数、兜底语义 | 复用 + 薄 shim |
 
@@ -223,10 +227,30 @@ flowchart TD
 
 ### 10.2 运算符
 
-- 逐元素（同形数组或标量广播）：`+ - .* ./ .\` 及比较 `== < > ~= <= >=`、逻辑 `& |`。
-- 转置：`.'` / `'`（2-D 交换 `dims[0]`/`dims[1]`，列主序下用维度元数据做下标重排）。
-- 矩阵乘：`*`（`m×k · k×n → m×n`），编译期展开三层乘加；矩阵/向量乘由同一条路径覆盖。
-- `mrdivide`/`mldivide`（`/` `\`）、`^`（mpower）、数组×数组广播、N-D 转置 → 延后。
+全部二进制/一元/关系/逻辑运算符均已覆盖（`OperatorKind` 全量）：
+
+- 逐元素（同形数组或标量广播）：`+ - .* ./ .\ .^` 及比较 `== < > ~= <= >=`、逻辑 `& |`。
+- 幂：`.^`（逐元素 `pow`）；`^` 的标量形式 `a^b` 也是 `pow`，矩阵形式 `A^k`（方阵 +
+  常量整数指数 `k ≥ 0`）走 `convmat_mpower`。
+- 转置：`.'` / `'`（2-D 交换 `dims[0]`/`dims[1]`）。
+- 矩阵乘：`*`（`m×k · k×n → m×n`）；矩阵/向量乘由同一条路径覆盖。
+- `mrdivide`/`mldivide`（矩阵 `/` `\`）、数组×数组广播、N-D 转置 → 延后（标量 `/` `\` 已支持）。
+
+### 10.2.1 降级策略：内联 vs 封装
+
+运算符按「翻译到 C 时是否展开循环」分两类（见 `mir_to_mlir` 与 `src/runtime`）：
+
+| 策略 | 适用 | 产物 |
+|------|------|------|
+| **内联（展开）** | 便宜、可 1:1 直译的：标量算术、逐元素 `+ - .* ./ .\ .^`、比较/逻辑、归约、`libm` 内建 | `for` 循环 / `matlab.binop` / `matlab.call @libm` |
+| **封装（调用 runtime helper）** | 会「改变内存布局」或有算法复杂度的：转置、矩阵乘、矩阵幂 | `matlab.call_void` → `emitc.call_void` → `convmat_*` C 函数 |
+
+- 封装的操作不再在编译期展开循环，而是发射对 `convmat_*` 运行时函数的单次调用，
+  结果写入调用方分配的 out-buffer（延续 §5 ABI）。`>2` 维的形状变换（`permute`/`reshape`）
+  与批量矩阵乘沿用同一封装思路，未实现时归入运行时兔底。
+- 运行时函数库目前**按需内联**进生成的 C：`lowering` 扫描模块里实际引用的 `matlab.call_void`
+  callee，只发射用到的 helper（`src/runtime::helper_source`），未知名字报错；后续可移到
+  链接式 `convmat_runtime` 库（§5）。
 
 ### 10.3 内建函数降级
 
@@ -259,8 +283,8 @@ lower(MIR → matlab 方言)
 | 阶段 | 状态 | 说明 |
 |------|------|------|
 | P1 形状模型 | ✅ 完成 | `Shape`/`LocalTy`、列主序、行/列/N-D 元数据 |
-| P2 逐元素/广播/转置/逻辑 | ✅ 完成 | 同形数组 + 标量广播 + 2-D 转置 |
-| P3 矩阵乘 | ✅ 完成 | `*` 编译期展开（尚未接 linalg） |
+| P2 逐元素/广播/转置/逻辑 | ✅ 完成 | 同形数组 + 标量广播 + 2-D 转置（封装 `convmat_transpose`） |
+| P3 矩阵乘/幂 | ✅ 完成 | `*` 封装 `convmat_matmul`；`^`/`.^` 已支持（矩阵幂封装 `convmat_mpower`） |
 | P4 内建 | 🟡 部分 | 归约(含按维)+形状内省+`zeros/ones/eye/reshape` 已做；`permute/repmat/cat/horzcat/vertcat` 未做 |
 | P5 索引/冒号/`end` | 🟡 部分 | 常量下标 `A(i,j)`、线性 `A(i)`、`end`、`A(:)` 已做；`A(i,:)`/`A(:,j)`/冒号区间/变量下标未做 |
 | P6 优化 | ⛔ 未做 | 优化整体延后（无 canonicalize/CSE/linalg） |
@@ -365,6 +389,13 @@ lower(MIR → matlab 方言)
 
 ### 12.5 当前状态与建议
 
-- **未实现**：`varargin`/`varargout` 目前被 `triage` 判为不支持的构造（defer 到运行时）。
-- 建议先做**封闭世界特化**（`nargin` 常量折叠 + `varargin{k}` 常量下标直接引用），
-  这是可静态化的子集；开放世界的运行时 cell ABI 后续再接。
+- **已实现（封闭世界固定元数特化）**：
+  - `nargin`/`nargout` 常量折叠为 `named + varargin/varargout 计数`；
+  - `varargin{k}`（`k` 为常量）解析为第 `k` 个额外标量入参，不物化 cell；
+  - `varargout{k} = expr`（`k` 为常量、`expr` 标量）解析为第 `k` 个额外标量出参（并入返回值 tuple）。
+  - 可变元数由「函数体实际引用的最大常量下标」确定（`triage::Variadics`），这与
+    MATLAB Coder 的「按调用点特化到固定元数」一致。
+- **仍 defer**：`varargin{k}` 变量下标、`varargout{k}` 赋数组、`varargin{:}` 展开、
+  运行时元数（开放世界）——这些需要运行时 cell ABI（§12.3）。
+- 建议下一步：按需支持「多组不同元数」的 monomorphize（每个调用点一个固定签名），
+  以及数组形参的 varargin/varargout。

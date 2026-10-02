@@ -55,6 +55,9 @@
 - 单元测试放 `#[cfg(test)] mod tests`；集成测试放 `tests/`。
 - 每个新增的 MATLAB→IR 降级 pattern 配一个「最小 `.m` → IR → C」测试。
 - 生成 IR 用自研 dump（`mir_to_mlir::lower`）做结构断言，不再依赖 `mlir-opt`。
+- `tests/run.rs` 会额外把生成的 C++ 用系统 C++ 编译器（`g++`/`clang++`，或
+  `$CXX`）编译并运行，断言运行输出与预期一致；新增可运行语义的 pattern 时，
+  同步补一个 `run_*` 用例（纯结构断言不验证「能编译/结果对不对」）。
 
 ## 构建 / 测试 / 提交前检查
 

@@ -13,6 +13,10 @@ pub enum Builtin {
     Unary(&'static str),
     /// Binary elementwise function (scalar only): `libm` symbol.
     Binary(&'static str),
+    /// `mod(x, y)`: MATLAB remainder with the sign of `y` (floor semantics).
+    /// Unlike [`Builtin::Binary`], it cannot be a single `libm` call and is
+    /// lowered inline as `fmod(fmod(x, y) + y, y)`.
+    Mod,
     /// `sign(x)` lowered inline as `-1`/`0`/`1`.
     Sign,
     /// `min`/`max`: elementwise `fmin`/`fmax` over two scalars, or a reduction
@@ -55,7 +59,7 @@ impl Builtin {
     pub fn valid_arity(self, n: usize) -> bool {
         match self {
             Builtin::Unary(_) | Builtin::Sign | Builtin::Numel | Builtin::Length => n == 1,
-            Builtin::Binary(_) => n == 2,
+            Builtin::Binary(_) | Builtin::Mod => n == 2,
             Builtin::MinMax(_)
             | Builtin::Reduce(_)
             | Builtin::Size
@@ -92,8 +96,8 @@ pub fn lookup(name: &str) -> Option<Builtin> {
         "pow" => Builtin::Binary("pow"),
         "atan2" => Builtin::Binary("atan2"),
         "hypot" => Builtin::Binary("hypot"),
-        "mod" => Builtin::Binary("fmod"),
-        "rem" => Builtin::Binary("remainder"),
+        "mod" => Builtin::Mod,
+        "rem" => Builtin::Binary("fmod"),
         "min" => Builtin::MinMax(MinMax::Min),
         "max" => Builtin::MinMax(MinMax::Max),
         "sum" => Builtin::Reduce(ReduceOp::Sum),
@@ -114,6 +118,7 @@ pub fn lookup(name: &str) -> Option<Builtin> {
 pub fn libm_symbol(builtin: Builtin) -> Option<&'static str> {
     match builtin {
         Builtin::Unary(sym) | Builtin::Binary(sym) => Some(sym),
+        Builtin::Mod => Some("fmod"),
         Builtin::Sign
         | Builtin::Reduce(_)
         | Builtin::Numel

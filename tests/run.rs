@@ -1,0 +1,927 @@
+//! Compile-and-run tests.
+//!
+//! `emit_c.rs` only checks that the generated code *contains* the expected
+//! fragments; it cannot tell whether the generated code actually compiles or
+//! behaves correctly. These tests close that gap: each fixture is compiled all
+//! the way to C++, a tiny `main` driver is generated, the whole thing is
+//! compiled with a system C++ compiler (`g++`/`clang++`, or `$CXX`), and the
+//! program's stdout is compared against the expected value.
+//!
+//! The C backend emits C++ (it uses `<cmath>`, `<tuple>` and `std::tuple<>`),
+//! so we need a C++ compiler. A test fails loudly if none is available so that
+//! a missing compiler is never silently skipped.
+
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
+
+use convmat::backend::BackendKind;
+use convmat::frontend::SourceFile;
+use convmat::pipeline;
+
+/// Standard headers included in every generated `main.cpp`, so drivers can use
+/// `printf` and forward-declare tuple-returning functions.
+const PREAMBLE: &str = "\
+#include <cstdio>
+#include <cstdint>
+#include <tuple>
+#include <cmath>
+";
+
+/// Tolerance for floating-point runtime comparisons (generous enough to absorb
+/// platform libm rounding differences, tight enough to catch real bugs).
+const TOLERANCE: f64 = 1e-9;
+
+/// Locate a usable C++ compiler: honour `$CXX`, otherwise probe the usual
+/// suspects. The result is cached in a `OnceLock`; the returned `&str` lives
+/// for the duration of the process.
+fn find_compiler() -> Option<&'static str> {
+    static COMPILER: OnceLock<Option<String>> = OnceLock::new();
+    COMPILER
+        .get_or_init(|| {
+            if let Ok(cxx) = std::env::var("CXX") {
+                let cxx = cxx.trim().to_string();
+                if !cxx.is_empty() {
+                    return Some(cxx);
+                }
+            }
+            for name in ["g++", "clang++", "c++"] {
+                if Command::new(name).arg("--version").output().is_ok() {
+                    return Some(name.to_string());
+                }
+            }
+            None
+        })
+        .as_deref()
+}
+
+/// Create a fresh, unique scratch directory for one test.
+fn scratch_dir(fixture: &str) -> PathBuf {
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("convmat-{}-{fixture}-{n}", std::process::id()));
+    fs::create_dir_all(&dir).expect("create scratch dir");
+    dir
+}
+
+/// Compile a fixture from `tests/fixtures/<name>.m` to C++.
+fn compile_fixture(name: &str) -> String {
+    let path = format!("{}/tests/fixtures/{name}.m", env!("CARGO_MANIFEST_DIR"));
+    let source = SourceFile::read(path).expect("read fixture");
+    pipeline::compile(&source, BackendKind::C).expect("compile to C++")
+}
+
+/// Compile the generated code together with a `main` driver and run it,
+/// returning the trimmed stdout.
+fn run_program(fixture: &str, decls: &str, body: &str) -> String {
+    let cpp = compile_fixture(fixture);
+
+    let compiler = find_compiler().unwrap_or_else(|| {
+        panic!("no C++ compiler found (set `CXX`); compile-and-run tests need one")
+    });
+
+    let dir = scratch_dir(fixture);
+    let gen_path = dir.join("gen.cpp");
+    let main_path = dir.join("main.cpp");
+    let bin_path = dir.join("prog");
+
+    fs::write(&gen_path, &cpp).expect("write generated code");
+    fs::write(
+        &main_path,
+        format!("{PREAMBLE}{decls}\nint main() {{\n{body}\n    return 0;\n}}\n"),
+    )
+    .expect("write main driver");
+
+    let compile = Command::new(compiler)
+        .arg("-std=c++17")
+        .arg(&gen_path)
+        .arg(&main_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("-lm")
+        .output()
+        .expect("spawn compiler");
+
+    if !compile.status.success() {
+        panic!(
+            "compiling `{fixture}` with `{compiler}` failed:\n\
+             --- generated C++ ---\n{cpp}\n\
+             --- compiler stderr ---\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let run = Command::new(&bin_path).output().expect("run program");
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        run.status.success(),
+        "`{fixture}` program exited with {:?}\nstderr: {}",
+        run.status.code(),
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    String::from_utf8_lossy(&run.stdout).trim().to_string()
+}
+
+/// Assert that a fixture's program prints exactly `expected` (whitespace
+/// trimmed). The driver should print results with `%g` (6 significant digits),
+/// which is exact for the integer / short-decimal results covered here.
+fn run_exact(fixture: &str, decls: &str, body: &str, expected: &str) {
+    let got = run_program(fixture, decls, body);
+    assert_eq!(got, expected, "`{fixture}` produced wrong output");
+}
+
+/// Assert that a fixture's program prints the values in `expected`, one per
+/// line, matching within `TOLERANCE`. The driver should print each value with
+/// `%.17g` on its own line.
+fn run_close(fixture: &str, decls: &str, body: &str, expected: &[f64]) {
+    let stdout = run_program(fixture, decls, body);
+    let got: Vec<f64> = stdout
+        .lines()
+        .map(|line| {
+            line.trim()
+                .parse::<f64>()
+                .unwrap_or_else(|_| panic!("`{fixture}` printed non-numeric output: {line:?}"))
+        })
+        .collect();
+
+    assert_eq!(
+        got.len(),
+        expected.len(),
+        "`{fixture}` printed {} values, expected {}",
+        got.len(),
+        expected.len()
+    );
+    for (i, (got, want)) in got.iter().zip(expected).enumerate() {
+        assert!(
+            (got - want).abs() <= TOLERANCE * (1.0 + want.abs()),
+            "`{fixture}` value {i}: got {got}, expected {want}"
+        );
+    }
+}
+
+// --- Scalar arithmetic & literals ---------------------------------------------
+
+#[test]
+fn run_add() {
+    run_exact(
+        "add",
+        "double add(double, double);",
+        "printf(\"%g\\n\", add(2.0, 3.0));",
+        "5",
+    );
+}
+
+#[test]
+fn run_ops() {
+    // ops(4, 2): 4*2 + 4.*2 + 4/2 + 2.\4 + (4==2) + (4<=2) + (4 & 2)
+    //          =   8  +   8  +  2  + 0.5  +   0    +   0    +   1   = 19.5
+    run_exact(
+        "ops",
+        "double ops(double, double);",
+        "printf(\"%g\\n\", ops(4.0, 2.0));",
+        "19.5",
+    );
+}
+
+#[test]
+fn run_intlit() {
+    run_exact(
+        "intlit",
+        "double intlit();",
+        "printf(\"%g\\n\", intlit());",
+        "47",
+    );
+}
+
+#[test]
+fn run_litmix() {
+    run_exact(
+        "litmix",
+        "double litmix();",
+        "printf(\"%g\\n\", litmix());",
+        "998.025",
+    );
+}
+
+#[test]
+fn run_precedence() {
+    run_exact(
+        "precedence",
+        "double precedence(double, double, double, double);",
+        "printf(\"%g\\n\", precedence(1.0, 1.0, 3.0, 1.0));",
+        "1",
+    );
+}
+
+// --- Comparisons & logical operators ------------------------------------------
+
+#[test]
+fn run_cmp() {
+    // cmp(2, 2): == 1, ~= 0, < 0, <= 1, > 0, >= 1 -> 3
+    run_exact(
+        "cmp",
+        "double cmp(double, double);",
+        "printf(\"%g\\n\", cmp(2.0, 2.0));",
+        "3",
+    );
+}
+
+#[test]
+fn run_cmp_arith() {
+    // Exactly one of (<, >, ==, >=, <=, ~=) is true for any distinct pair,
+    // and three are true when a == b; both cases sum to 3.
+    run_exact(
+        "cmp_arith",
+        "double cmp_arith(double, double);",
+        "printf(\"%g\\n\", cmp_arith(2.0, 3.0));",
+        "3",
+    );
+}
+
+#[test]
+fn run_logic() {
+    run_exact(
+        "logic",
+        "double logic(double, double);",
+        "printf(\"%g\\n\", logic(1.0, 0.0));",
+        "0",
+    );
+}
+
+#[test]
+fn run_logic_mix() {
+    run_exact(
+        "logic_mix",
+        "double logic_mix(double, double, double);",
+        "printf(\"%g\\n\", logic_mix(1.0, 1.0, 1.0));",
+        "2",
+    );
+}
+
+// --- Unary operators ----------------------------------------------------------
+
+#[test]
+fn run_unary() {
+    // unary(2): -2 + 2 + ~2(0) + 2' (2) = 2
+    run_exact(
+        "unary",
+        "double unary(double);",
+        "printf(\"%g\\n\", unary(2.0));",
+        "2",
+    );
+}
+
+#[test]
+fn run_unary_mix() {
+    // unary_mix(2, 3): -(5) + 2 - ~(0)=1 + 2 = -2
+    run_exact(
+        "unary_mix",
+        "double unary_mix(double, double);",
+        "printf(\"%g\\n\", unary_mix(2.0, 3.0));",
+        "-2",
+    );
+}
+
+// --- Control flow -------------------------------------------------------------
+
+#[test]
+fn run_max2() {
+    run_exact(
+        "max",
+        "double max2(double, double);",
+        "printf(\"%g\\n\", max2(2.0, 5.0));",
+        "5",
+    );
+}
+
+#[test]
+fn run_sign_of() {
+    run_exact(
+        "sign",
+        "double sign_of(double);",
+        "printf(\"%g\\n\", sign_of(-5.0));",
+        "-1",
+    );
+}
+
+#[test]
+fn run_grade() {
+    run_exact(
+        "grade",
+        "double grade(double);",
+        "printf(\"%g\\n\", grade(2.0));",
+        "20",
+    );
+}
+
+#[test]
+fn run_dispatch() {
+    run_exact(
+        "dispatch",
+        "double dispatch(double);",
+        "printf(\"%g\\n\", dispatch(2.0));",
+        "20",
+    );
+}
+
+#[test]
+fn run_band() {
+    run_exact(
+        "band",
+        "double band(double);",
+        "printf(\"%g\\n\", band(7.0));",
+        "50",
+    );
+}
+
+#[test]
+fn run_clamp() {
+    run_exact(
+        "clamp",
+        "double clamp(double, double, double);",
+        "printf(\"%g\\n\", clamp(5.0, 0.0, 10.0));",
+        "5",
+    );
+}
+
+#[test]
+fn run_clamp_hi() {
+    run_exact(
+        "ifonly",
+        "double clamp_hi(double, double);",
+        "printf(\"%g\\n\", clamp_hi(20.0, 10.0));",
+        "10",
+    );
+}
+
+#[test]
+fn run_abs_diff() {
+    run_exact(
+        "abs_diff",
+        "double abs_diff(double, double);",
+        "printf(\"%g\\n\", abs_diff(3.0, 8.0));",
+        "5",
+    );
+}
+
+// --- Loops --------------------------------------------------------------------
+
+#[test]
+fn run_fact() {
+    run_exact(
+        "fact",
+        "double fact(double);",
+        "printf(\"%g\\n\", fact(5.0));",
+        "120",
+    );
+}
+
+#[test]
+fn run_sum_to() {
+    run_exact(
+        "sumto",
+        "double sum_to(double);",
+        "printf(\"%g\\n\", sum_to(10.0));",
+        "55",
+    );
+}
+
+#[test]
+fn run_odd_sum() {
+    run_exact(
+        "forstep",
+        "double odd_sum(double);",
+        "printf(\"%g\\n\", odd_sum(7.0));",
+        "16",
+    );
+}
+
+#[test]
+fn run_countdown() {
+    run_exact(
+        "countdown",
+        "double countdown(double);",
+        "printf(\"%g\\n\", countdown(5.0));",
+        "5",
+    );
+}
+
+#[test]
+fn run_count_down() {
+    run_exact(
+        "count_down",
+        "double count_down(double);",
+        "printf(\"%g\\n\", count_down(4.0));",
+        "10",
+    );
+}
+
+#[test]
+fn run_sumsq() {
+    run_exact(
+        "sumsq",
+        "double sumsq(double);",
+        "printf(\"%g\\n\", sumsq(4.0));",
+        "30",
+    );
+}
+
+#[test]
+fn run_is_even() {
+    run_exact(
+        "is_even",
+        "double is_even(double);",
+        "printf(\"%g\\n\", is_even(6.0));",
+        "1",
+    );
+}
+
+#[test]
+fn run_bounded_sum() {
+    run_exact(
+        "bounded_sum",
+        "double bounded_sum(double, double);",
+        "printf(\"%g\\n\", bounded_sum(5.0, 10.0));",
+        "45",
+    );
+}
+
+// --- Nested control flow ------------------------------------------------------
+
+#[test]
+fn run_nested() {
+    run_exact(
+        "nested",
+        "double nested(double);",
+        "printf(\"%g\\n\", nested(5.0));",
+        "12",
+    );
+}
+
+#[test]
+fn run_nested_switch() {
+    run_exact(
+        "nested_switch",
+        "double nested_switch(double);",
+        "printf(\"%g\\n\", nested_switch(4.0));",
+        "14",
+    );
+}
+
+// --- Multiple outputs ---------------------------------------------------------
+
+#[test]
+fn run_polar() {
+    run_exact(
+        "polar",
+        "std::tuple<double, double> polar(double, double);",
+        "auto [r, t] = polar(3.0, 4.0);\n    printf(\"%g %g\\n\", r, t);",
+        "25 0.75",
+    );
+}
+
+#[test]
+fn run_stats3() {
+    run_exact(
+        "stats3",
+        "std::tuple<double, double, double> stats3(double, double, double);",
+        "auto [mn, prod, diff] = stats3(1.0, 2.0, 3.0);\n    printf(\"%g %g %g\\n\", mn, prod, diff);",
+        "6 6 -4",
+    );
+}
+
+#[test]
+fn run_noop() {
+    run_exact(
+        "noop",
+        "void noop(double);",
+        "noop(1.0);\n    printf(\"ok\\n\");",
+        "ok",
+    );
+}
+
+// --- Built-in functions -------------------------------------------------------
+
+#[test]
+fn run_trig() {
+    let x = 0.5f64;
+    run_close(
+        "trig",
+        "double trig(double);",
+        "printf(\"%.17g\\n\", trig(0.5));",
+        &[x.sin() + x.cos() + x.tan()],
+    );
+}
+
+#[test]
+fn run_mathfns() {
+    let x = 2.0f64;
+    run_close(
+        "mathfns",
+        "double mathfns(double);",
+        "printf(\"%.17g\\n\", mathfns(2.0));",
+        &[x.sqrt() + x.exp() + x.ln() + x.abs() + x.floor() + x.ceil() + x.round()],
+    );
+}
+
+#[test]
+fn run_sign_builtin() {
+    run_exact(
+        "sign_builtin",
+        "double sign_builtin(double);",
+        "printf(\"%g\\n\", sign_builtin(-5.0));",
+        "-1",
+    );
+}
+
+#[test]
+fn run_binary_math() {
+    // `mod(-5, 3) = 1` (floor semantics, sign of the divisor) and
+    // `rem(-5, 3) = -2` (trunc semantics, sign of the dividend): this pair
+    // distinguishes `mod`/`rem` from plain `fmod`/`remainder`.
+    let a = -5.0f64;
+    let b = 3.0f64;
+    let matlab_mod = a - b * (a / b).floor();
+    let matlab_rem = a - b * (a / b).trunc();
+    run_close(
+        "binary_math",
+        "double binary_math(double, double);",
+        "printf(\"%.17g\\n\", binary_math(-5.0, 3.0));",
+        &[a.powf(b) + b.atan2(a) + a.hypot(b) + matlab_mod + matlab_rem + a.min(b) + a.max(b)],
+    );
+}
+
+#[test]
+fn run_horner() {
+    run_exact(
+        "horner",
+        "double horner(double, double, double, double);",
+        "printf(\"%g\\n\", horner(2.0, 1.0, 2.0, 3.0));",
+        "11",
+    );
+}
+
+// --- Array built-ins & reductions ---------------------------------------------
+
+#[test]
+fn run_sin_array() {
+    run_close(
+        "sin_array",
+        "void sin_array(double*);",
+        "double o[3]; sin_array(o);\n    printf(\"%.17g\\n%.17g\\n%.17g\\n\", o[0], o[1], o[2]);",
+        &[1.0f64.sin(), 3.0f64.sin(), 4.0f64.sin()],
+    );
+}
+
+#[test]
+fn run_abs_array() {
+    run_exact(
+        "abs_array",
+        "void abs_array(double*);",
+        "double o[3]; abs_array(o);\n    printf(\"%g %g %g\\n\", o[0], o[1], o[2]);",
+        "1 2 3",
+    );
+}
+
+#[test]
+fn run_nested_elementwise() {
+    run_close(
+        "nested_elementwise",
+        "void nested_elementwise(double*);",
+        "double o[2]; nested_elementwise(o);\n    printf(\"%.17g\\n%.17g\\n\", o[0], o[1]);",
+        &[(0.5f64.cos()).sin(), (1.0f64.cos()).sin()],
+    );
+}
+
+#[test]
+fn run_reduce_sum() {
+    run_exact(
+        "reduce_sum",
+        "double reduce_sum();",
+        "printf(\"%g\\n\", reduce_sum());",
+        "10",
+    );
+}
+
+#[test]
+fn run_reduce_prod() {
+    run_exact(
+        "reduce_prod",
+        "double reduce_prod();",
+        "printf(\"%g\\n\", reduce_prod());",
+        "24",
+    );
+}
+
+#[test]
+fn run_reduce_minmax() {
+    run_exact(
+        "reduce_minmax",
+        "double reduce_minmax();",
+        "printf(\"%g\\n\", reduce_minmax());",
+        "4",
+    );
+}
+
+// --- Matrix / vector literals -------------------------------------------------
+
+#[test]
+fn run_matrix2d() {
+    run_exact(
+        "matrix2d",
+        "void matrix2d(double*);",
+        "double o[4]; matrix2d(o);\n    printf(\"%g %g %g %g\\n\", o[0], o[1], o[2], o[3]);",
+        "1 3 2 4",
+    );
+}
+
+#[test]
+fn run_colvec() {
+    run_exact(
+        "colvec",
+        "void colvec(double*);",
+        "double o[3]; colvec(o);\n    printf(\"%g %g %g\\n\", o[0], o[1], o[2]);",
+        "1 2 3",
+    );
+}
+
+#[test]
+fn run_rowvec() {
+    run_exact(
+        "rowvec",
+        "void rowvec(double*);",
+        "double o[3]; rowvec(o);\n    printf(\"%g %g %g\\n\", o[0], o[1], o[2]);",
+        "1 2 3",
+    );
+}
+
+// --- Matrix elementwise operators / broadcast / transpose ---------------------
+
+#[test]
+fn run_mat_add() {
+    run_exact(
+        "mat_add",
+        "void mat_add(double*);",
+        "double o[4]; mat_add(o);\n    printf(\"%g %g %g %g\\n\", o[0], o[1], o[2], o[3]);",
+        "11 33 22 44",
+    );
+}
+
+#[test]
+fn run_mat_broadcast() {
+    run_exact(
+        "mat_broadcast",
+        "void mat_broadcast(double*);",
+        "double o[4]; mat_broadcast(o);\n    printf(\"%g %g %g %g\\n\", o[0], o[1], o[2], o[3]);",
+        "11 13 12 14",
+    );
+}
+
+#[test]
+fn run_mat_scale() {
+    run_exact(
+        "mat_scale",
+        "void mat_scale(double*);",
+        "double o[4]; mat_scale(o);\n    printf(\"%g %g %g %g\\n\", o[0], o[1], o[2], o[3]);",
+        "2 6 4 8",
+    );
+}
+
+#[test]
+fn run_mat_transpose() {
+    run_exact(
+        "mat_transpose",
+        "void mat_transpose(double*);",
+        "double o[4]; mat_transpose(o);\n    printf(\"%g %g %g %g\\n\", o[0], o[1], o[2], o[3]);",
+        "1 2 3 4",
+    );
+}
+
+#[test]
+fn run_mat_cmp() {
+    run_exact(
+        "mat_cmp",
+        "void mat_cmp(double*);",
+        "double o[4]; mat_cmp(o);\n    printf(\"%g %g %g %g\\n\", o[0], o[1], o[2], o[3]);",
+        "1 1 0 0",
+    );
+}
+
+// --- Matrix multiplication ----------------------------------------------------
+
+#[test]
+fn run_matmul() {
+    run_exact(
+        "matmul",
+        "void matmul(double*);",
+        "double o[4]; matmul(o);\n    printf(\"%g %g %g %g\\n\", o[0], o[1], o[2], o[3]);",
+        "19 43 22 50",
+    );
+}
+
+#[test]
+fn run_matvec() {
+    run_exact(
+        "matvec",
+        "void matvec(double*);",
+        "double o[2]; matvec(o);\n    printf(\"%g %g\\n\", o[0], o[1]);",
+        "17 39",
+    );
+}
+
+// --- Dimension reductions & shape introspection --------------------------------
+
+#[test]
+fn run_sum_dim1() {
+    run_exact(
+        "sum_dim1",
+        "void sum_dim1(double*);",
+        "double o[2]; sum_dim1(o);\n    printf(\"%g %g\\n\", o[0], o[1]);",
+        "4 6",
+    );
+}
+
+#[test]
+fn run_sum_dim2() {
+    run_exact(
+        "sum_dim2",
+        "void sum_dim2(double*);",
+        "double o[2]; sum_dim2(o);\n    printf(\"%g %g\\n\", o[0], o[1]);",
+        "3 7",
+    );
+}
+
+#[test]
+fn run_shape_intro() {
+    // size(A,1)=2 + size(A,2)=2 + numel=4 + length=2 = 10
+    run_exact(
+        "shape_intro",
+        "double shape_intro();",
+        "printf(\"%g\\n\", shape_intro());",
+        "10",
+    );
+}
+
+#[test]
+fn run_size_vec() {
+    run_exact(
+        "size_vec",
+        "void size_vec(double*);",
+        "double o[2]; size_vec(o);\n    printf(\"%g %g\\n\", o[0], o[1]);",
+        "2 2",
+    );
+}
+
+// --- Constructors & reshape ---------------------------------------------------
+
+#[test]
+fn run_zeros2x3() {
+    run_exact(
+        "zeros2x3",
+        "void zeros2x3(double*);",
+        "double o[6]; zeros2x3(o);\n    printf(\"%g %g %g %g %g %g\\n\", o[0], o[1], o[2], o[3], o[4], o[5]);",
+        "0 0 0 0 0 0",
+    );
+}
+
+#[test]
+fn run_ones2x2() {
+    run_exact(
+        "ones2x2",
+        "void ones2x2(double*);",
+        "double o[4]; ones2x2(o);\n    printf(\"%g %g %g %g\\n\", o[0], o[1], o[2], o[3]);",
+        "1 1 1 1",
+    );
+}
+
+#[test]
+fn run_eye2() {
+    run_exact(
+        "eye2",
+        "void eye2(double*);",
+        "double o[4]; eye2(o);\n    printf(\"%g %g %g %g\\n\", o[0], o[1], o[2], o[3]);",
+        "1 0 0 1",
+    );
+}
+
+#[test]
+fn run_reshape2x2() {
+    run_exact(
+        "reshape2x2",
+        "void reshape2x2(double*);",
+        "double o[4]; reshape2x2(o);\n    printf(\"%g %g %g %g\\n\", o[0], o[1], o[2], o[3]);",
+        "1 2 3 4",
+    );
+}
+
+// --- Indexing -----------------------------------------------------------------
+
+#[test]
+fn run_index_scalar() {
+    run_exact(
+        "index_scalar",
+        "double index_scalar();",
+        "printf(\"%g\\n\", index_scalar());",
+        "3",
+    );
+}
+
+#[test]
+fn run_index_end() {
+    run_exact(
+        "index_end",
+        "double index_end();",
+        "printf(\"%g\\n\", index_end());",
+        "7",
+    );
+}
+
+#[test]
+fn run_index_colon() {
+    run_exact(
+        "index_colon",
+        "void index_colon(double*);",
+        "double o[4]; index_colon(o);\n    printf(\"%g %g %g %g\\n\", o[0], o[1], o[2], o[3]);",
+        "1 3 2 4",
+    );
+}
+
+// --- Power operators (`^` / `.^`) ----------------------------------------------
+
+#[test]
+fn run_power_scalar() {
+    run_exact(
+        "power_scalar",
+        "double power_scalar(double, double);",
+        "printf(\"%g\\n\", power_scalar(2, 3));",
+        "16",
+    );
+}
+
+#[test]
+fn run_power_array() {
+    run_exact(
+        "power_array",
+        "void power_array(double*);",
+        "double o[4]; power_array(o);\n    printf(\"%g %g %g %g\\n\", o[0], o[1], o[2], o[3]);",
+        "1 9 4 16",
+    );
+}
+
+#[test]
+fn run_mpower() {
+    run_exact(
+        "mpower",
+        "void mpower(double*);",
+        "double o[4]; mpower(o);\n    printf(\"%g %g %g %g\\n\", o[0], o[1], o[2], o[3]);",
+        "7 15 10 22",
+    );
+}
+
+// --- varargin / nargin / varargout -------------------------------------------
+
+#[test]
+fn run_varargin_sum() {
+    run_exact(
+        "varargin_sum",
+        "double f(double, double);",
+        "printf(\"%g\\n\", f(3, 4));",
+        "7",
+    );
+}
+
+#[test]
+fn run_varargin_mix() {
+    // A named parameter plus a single `varargin{1}` extra argument.
+    run_exact(
+        "varargin_mix",
+        "double mix(double, double);",
+        "printf(\"%g\\n\", mix(10, 5));",
+        "15",
+    );
+}
+
+#[test]
+fn run_nargin_guard() {
+    // `nargin` folds to 1, so the guard `nargin < 1` is false and `y = a`.
+    run_exact(
+        "nargin_guard",
+        "double g(double);",
+        "printf(\"%g\\n\", g(5));",
+        "5",
+    );
+}
+
+#[test]
+fn run_varargout_two() {
+    run_exact(
+        "varargout_two",
+        "std::tuple<double, double> h(double);",
+        "auto [x, y] = h(3.0);\n    printf(\"%g %g\\n\", x, y);",
+        "4 6",
+    );
+}

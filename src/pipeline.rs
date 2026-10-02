@@ -22,8 +22,8 @@ pub fn compile(source: &SourceFile, backend: BackendKind) -> Result<String> {
 
     let mut context = Context::new();
     let module = crate::mir_to_mlir::lower_to_module(&mut context, &mir)?;
-    let functions = crate::lowering::lower_module(&mut context, &module)?;
-    let c = crate::emit_c::emit(&context, &functions)?;
+    let lowered = crate::lowering::lower_module(&mut context, &module)?;
+    let c = crate::emit_c::emit(&context, &lowered)?;
 
     match backend {
         BackendKind::C => Ok(c),

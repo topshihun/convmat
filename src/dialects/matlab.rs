@@ -256,6 +256,36 @@ impl CallOp {
     }
 }
 
+/// A call to a runtime helper that writes its result through a caller-provided
+/// out-buffer and returns nothing. This is the "wrapped" counterpart to
+/// [`CallOp`]: heavy array operations (transpose, matmul, matrix power) are
+/// emitted as these calls instead of unrolled loops (see `docs/architecture.md`).
+#[pliron_op(
+    name = "matlab.call_void",
+    format,
+    interfaces = [NResultsInterface<0>],
+    attributes = (call_void_callee: StringAttr),
+    verifier = "succ",
+)]
+pub struct CallVoidOp;
+
+impl CallVoidOp {
+    pub fn new(ctx: &mut Context, callee: &str, args: Vec<Value>) -> Self {
+        let op = Operation::new(ctx, Self::get_concrete_op_info(), vec![], args, vec![], 0);
+        let op = CallVoidOp { op };
+        op.set_attr_call_void_callee(ctx, StringAttr::new(callee.to_string()));
+        op
+    }
+
+    pub fn callee(&self, ctx: &Context) -> String {
+        let attr = self
+            .get_attr_call_void_callee(ctx)
+            .expect("call_void callee")
+            .clone();
+        String::from(attr)
+    }
+}
+
 /// Allocate a statically-shaped array local (stack slot).
 #[pliron_op(
     name = "matlab.alloca",

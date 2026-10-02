@@ -9,6 +9,12 @@ use std::collections::HashMap;
 
 use pliron::{
     basic_block::BasicBlock,
+    builtin::{
+        op_interfaces::{OneRegionInterface, SymbolOpInterface},
+        ops::{FuncOp, ModuleOp},
+        type_interfaces::FunctionTypeInterface,
+        types::FunctionType,
+    },
     context::{Context, Ptr},
     linked_list::ContainsLinkedList,
     operation::Operation,
@@ -25,19 +31,25 @@ use crate::{
     error::Result,
 };
 
-/// Emit C++ source for a list of `emitc` functions.
-pub fn emit(context: &Context, functions: &[emitc::FuncOp]) -> Result<String> {
+/// Emit C++ source for a builtin `module` whose functions carry `emitc`-level
+/// bodies: its top-level directives (`#include`, `#define`, ...) followed by its
+/// functions.
+pub fn emit(context: &Context, module: &ModuleOp) -> Result<String> {
     let mut emitter = Emitter {
         context,
         names: HashMap::new(),
         counter: 0,
         out: String::new(),
     };
+    // These standard-library headers are always required by the generated code.
     emitter
         .out
         .push_str("#include <cmath>\n#include <cstdint>\n#include <tuple>\n\n");
-    for func in functions {
-        emitter.emit_func(func);
+    if let Some(block) = module.get_region(context).deref(context).get_entry_block() {
+        let ops: Vec<Ptr<Operation>> = block.deref(context).iter(context).collect();
+        for op in ops {
+            emitter.emit_top_level(op);
+        }
     }
     Ok(emitter.out)
 }
@@ -62,14 +74,16 @@ impl<'a> Emitter<'a> {
             .unwrap_or_else(|| "<unresolved>".to_string())
     }
 
-    fn emit_func(&mut self, func: &emitc::FuncOp) {
-        let name = func.name(self.context);
-        let n_results = func.n_results(self.context);
-        let entry = func
-            .body_region(self.context)
-            .deref(self.context)
-            .get_entry_block()
-            .expect("func has an entry block");
+    fn emit_func(&mut self, func: &FuncOp) {
+        let name = func.get_symbol_name(self.context).as_ref().to_string();
+        let n_results = {
+            let fn_ty = func.get_type(self.context).deref(self.context);
+            let ft = fn_ty
+                .downcast_ref::<FunctionType>()
+                .expect("func carries a function type");
+            ft.res_types().len()
+        };
+        let entry = func.get_entry_block(self.context);
 
         let args: Vec<Value> = entry.deref(self.context).arguments().collect();
         let mut params = Vec::new();
@@ -78,11 +92,13 @@ impl<'a> Emitter<'a> {
             self.names.insert(*arg, pname.clone());
             params.push(self.param_decl(&pname, arg.get_type(self.context)));
         }
+        // Reserve the parameter names so later `fresh()` calls start after them.
+        self.counter = args.len();
 
         let ret = match n_results {
             0 => "void".to_string(),
             1 => "double".to_string(),
-            n => format!("std::tuple<{}>", vec!["double"; n as usize].join(", ")),
+            n => format!("std::tuple<{}>", vec!["double"; n].join(", ")),
         };
 
         self.out
@@ -90,6 +106,58 @@ impl<'a> Emitter<'a> {
         self.out.push_str(") {\n");
         self.emit_block(entry, 1);
         self.out.push_str("}\n\n");
+    }
+
+    /// Dispatch a top-level op (a directive or a function).
+    fn emit_top_level(&mut self, op: Ptr<Operation>) {
+        if let Some(func) = Operation::get_op::<FuncOp>(op, self.context) {
+            self.emit_func(&func);
+        } else if let Some(inc) = Operation::get_op::<emitc::IncludeOp>(op, self.context) {
+            self.emit_include(&inc);
+        } else if let Some(d) = Operation::get_op::<emitc::DefineOp>(op, self.context) {
+            self.emit_define(&d);
+        } else if let Some(u) = Operation::get_op::<emitc::UndefOp>(op, self.context) {
+            self.emit_undef(&u);
+        } else if let Some(v) = Operation::get_op::<emitc::VerbatimOp>(op, self.context) {
+            self.emit_verbatim(&v);
+        } else {
+            self.out.push_str(&format!(
+                "// unknown top-level op: {}\n",
+                Operation::get_opid(op, self.context)
+            ));
+        }
+    }
+
+    fn emit_include(&mut self, inc: &emitc::IncludeOp) {
+        let header = inc.header(self.context);
+        if inc.is_system(self.context) {
+            self.out.push_str(&format!("#include <{header}>\n"));
+        } else {
+            self.out.push_str(&format!("#include \"{header}\"\n"));
+        }
+    }
+
+    fn emit_define(&mut self, d: &emitc::DefineOp) {
+        let name = d.name(self.context);
+        let value = d.value(self.context);
+        if value.is_empty() {
+            self.out.push_str(&format!("#define {name}\n"));
+        } else {
+            self.out.push_str(&format!("#define {name} {value}\n"));
+        }
+    }
+
+    fn emit_undef(&mut self, u: &emitc::UndefOp) {
+        self.out
+            .push_str(&format!("#undef {}\n", u.name(self.context)));
+    }
+
+    fn emit_verbatim(&mut self, v: &emitc::VerbatimOp) {
+        let source = v.source(self.context);
+        self.out.push_str(&source);
+        if !source.ends_with('\n') {
+            self.out.push('\n');
+        }
     }
 
     fn param_decl(&self, name: &str, ty: TypeHandle) -> String {
@@ -102,11 +170,17 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_block(&mut self, block: Ptr<BasicBlock>, indent: usize) {
-        // Map block arguments (function params or loop induction vars) to names.
+        // Map block arguments (function params or loop induction vars) to
+        // names. Skip arguments that already have one: function params are
+        // named in `emit_func`, and `for`-loop induction variables are named in
+        // `emit_op`, so re-assigning here would desynchronise the loop header
+        // from its body.
         let args: Vec<Value> = block.deref(self.context).arguments().collect();
         for arg in args {
-            let name = self.fresh();
-            self.names.insert(arg, name);
+            if !self.names.contains_key(&arg) {
+                let name = self.fresh();
+                self.names.insert(arg, name);
+            }
         }
         for op in block.deref(self.context).iter(self.context) {
             self.emit_op(op, indent);
@@ -167,6 +241,15 @@ impl<'a> Emitter<'a> {
                 "{pad}double {name} = {callee}({});\n",
                 args.join(", ")
             ));
+        } else if let Some(c) = Operation::get_op::<emitc::CallVoidOp>(op, self.context) {
+            let callee = c.callee(self.context);
+            let args: Vec<String> = op
+                .deref(self.context)
+                .operands()
+                .map(|v| self.expr(v))
+                .collect();
+            self.out
+                .push_str(&format!("{pad}{callee}({});\n", args.join(", ")));
         } else if let Some(_l) = Operation::get_op::<emitc::LoadOp>(op, self.context) {
             let name = self.assign_name(op);
             let array = op.deref(self.context).get_operand(0);
@@ -309,5 +392,73 @@ fn fmt_f64(value: f64) -> String {
         } else {
             format!("{s}.0")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::emit;
+    use crate::dialects::emitc;
+
+    use pliron::basic_block::BasicBlock;
+    use pliron::builtin::op_interfaces::OneRegionInterface;
+    use pliron::builtin::ops::{FuncOp, ModuleOp};
+    use pliron::builtin::types::FunctionType;
+    use pliron::context::{Context, Ptr};
+    use pliron::identifier::Identifier;
+    use pliron::irbuild::inserter::{IRInserter, Inserter};
+    use pliron::irbuild::listener::DummyListener;
+    use pliron::op::Op;
+
+    /// Append an op to the end of a block (mirrors `lowering::append`).
+    fn append(ctx: &Context, block: Ptr<BasicBlock>, op: &dyn Op) {
+        IRInserter::<DummyListener>::new_at_block_end(block).append_op(ctx, op);
+    }
+
+    #[test]
+    fn emits_top_level_directives() {
+        let mut ctx = Context::new();
+
+        let module = ModuleOp::new(&mut ctx, Identifier::try_from("convmat").unwrap());
+        let body = module
+            .get_region(&ctx)
+            .deref(&ctx)
+            .get_entry_block()
+            .expect("module block");
+
+        let inc_math = emitc::IncludeOp::new(&mut ctx, "math.h", true);
+        let inc_local = emitc::IncludeOp::new(&mut ctx, "myutil.h", false);
+        let def_pi = emitc::DefineOp::new(&mut ctx, "PI", "3.14159265358979");
+        let def_nodebug = emitc::DefineOp::new(&mut ctx, "NODEBUG", "");
+        let undef_pi = emitc::UndefOp::new(&mut ctx, "PI");
+        let verbatim = emitc::VerbatimOp::new(&mut ctx, "typedef double scalar_t;");
+
+        // A bare function after the directives, to check source ordering.
+        let fn_ty = FunctionType::get(&ctx, vec![], vec![]);
+        let func = FuncOp::new(&mut ctx, Identifier::try_from("helper").unwrap(), fn_ty);
+
+        append(&ctx, body, &inc_math);
+        append(&ctx, body, &inc_local);
+        append(&ctx, body, &def_pi);
+        append(&ctx, body, &def_nodebug);
+        append(&ctx, body, &undef_pi);
+        append(&ctx, body, &verbatim);
+        append(&ctx, body, &func);
+
+        let c = emit(&ctx, &module).unwrap();
+
+        assert!(c.contains("#include <cmath>"), "got:\n{c}");
+        assert!(c.contains("#include <math.h>"), "got:\n{c}");
+        assert!(c.contains("#include \"myutil.h\""), "got:\n{c}");
+        assert!(c.contains("#define PI 3.14159265358979"), "got:\n{c}");
+        assert!(c.contains("#define NODEBUG\n"), "got:\n{c}");
+        assert!(c.contains("#undef PI"), "got:\n{c}");
+        assert!(c.contains("typedef double scalar_t;"), "got:\n{c}");
+        assert!(c.contains("void helper()"), "got:\n{c}");
+
+        // Directives precede the function in the emitted source.
+        let helper_pos = c.find("void helper()").unwrap();
+        let include_pos = c.find("#include <math.h>").unwrap();
+        assert!(include_pos < helper_pos, "got:\n{c}");
     }
 }
