@@ -52,3 +52,35 @@ fn varargin_variable_index_rejected() {
     // A non-constant `varargin{n}` index cannot be specialized.
     assert_not_lowerable("varargin_var", "unresolved shape");
 }
+
+#[test]
+fn try_catch_rejected() {
+    // C has no native exception handling; `try`/`catch` is deferred.
+    assert_not_lowerable("try_catch", "try/catch");
+}
+
+#[test]
+fn multi_assign_rejected() {
+    // `[a, b] = f()` needs multi-value call support (user functions / tuple
+    // returns), which is not implemented.
+    assert_not_lowerable("multi_assign", "multi-assignment");
+}
+
+#[test]
+fn arg_expansion_rejected() {
+    // `varargin{:}` argument expansion needs a runtime cell ABI.
+    assert_not_lowerable("arg_expansion", "expansion");
+}
+
+#[test]
+fn logical_index_rejected() {
+    // Logical indexing produces a runtime-sized result and is deferred.
+    assert_not_lowerable("logical_index", "unresolved shape");
+}
+
+#[test]
+fn cell_literal_rejected() {
+    // Cell arrays are deferred: a heterogeneous cell cannot map to a fixed C
+    // type without a runtime cell ABI (see docs/architecture.md §10.5).
+    assert_not_lowerable("cell_literal", "cell array literals are not supported yet");
+}

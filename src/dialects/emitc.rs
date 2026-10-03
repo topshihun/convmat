@@ -35,18 +35,37 @@ use pliron::{
 
 use crate::dialects::matlab::{BinOpKind, BoolType, CmpKind};
 
-/// Declare a local array `double <name>[<size>]`.
+/// Declare a local array: `double <name>[<size>]` (stack), optionally `static`,
+/// or `double* <name> = new double[<size>]` (heap).
 #[pliron_op(
     name = "emitc.declare",
     format,
     interfaces = [NOpdsInterface<0>, OneResultInterface],
-    attributes = (declare_name: StringAttr),
+    attributes = (declare_name: StringAttr, declare_static: BoolAttr, declare_heap: BoolAttr),
     verifier = "succ",
 )]
 pub struct DeclareOp;
 
 impl DeclareOp {
     pub fn new(ctx: &mut Context, name: &str, array_ty: TypeHandle) -> Self {
+        Self::with_flags(ctx, name, array_ty, false, false)
+    }
+
+    pub fn new_static(ctx: &mut Context, name: &str, array_ty: TypeHandle) -> Self {
+        Self::with_flags(ctx, name, array_ty, true, false)
+    }
+
+    pub fn new_heap(ctx: &mut Context, name: &str, array_ty: TypeHandle) -> Self {
+        Self::with_flags(ctx, name, array_ty, false, true)
+    }
+
+    fn with_flags(
+        ctx: &mut Context,
+        name: &str,
+        array_ty: TypeHandle,
+        is_static: bool,
+        is_heap: bool,
+    ) -> Self {
         let op = Operation::new(
             ctx,
             Self::get_concrete_op_info(),
@@ -57,6 +76,8 @@ impl DeclareOp {
         );
         let op = DeclareOp { op };
         op.set_attr_declare_name(ctx, StringAttr::new(name.to_string()));
+        op.set_attr_declare_static(ctx, BoolAttr::new(is_static));
+        op.set_attr_declare_heap(ctx, BoolAttr::new(is_heap));
         op
     }
 
@@ -66,6 +87,45 @@ impl DeclareOp {
                 .expect("declare name")
                 .clone(),
         )
+    }
+
+    pub fn is_static(&self, ctx: &Context) -> bool {
+        bool::from(
+            self.get_attr_declare_static(ctx)
+                .expect("declare static")
+                .clone(),
+        )
+    }
+
+    pub fn is_heap(&self, ctx: &Context) -> bool {
+        bool::from(
+            self.get_attr_declare_heap(ctx)
+                .expect("declare heap")
+                .clone(),
+        )
+    }
+}
+
+/// Free a heap-allocated array (`delete[] <name>`).
+#[pliron_op(
+    name = "emitc.delete",
+    format,
+    interfaces = [OneOpdInterface, NResultsInterface<0>],
+    verifier = "succ",
+)]
+pub struct DeleteOp;
+
+impl DeleteOp {
+    pub fn new(ctx: &mut Context, array: Value) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![],
+            vec![array],
+            vec![],
+            0,
+        );
+        DeleteOp { op }
     }
 }
 
@@ -295,6 +355,97 @@ impl AssignOp {
     }
 }
 
+/// Read a named `f64` field from a struct (`cell.field`).
+#[pliron_op(
+    name = "emitc.struct_get",
+    format,
+    interfaces = [OneOpdInterface, OneResultInterface],
+    attributes = (estruct_get_field: StringAttr),
+    verifier = "succ",
+)]
+pub struct StructGetOp;
+
+impl StructGetOp {
+    pub fn new(ctx: &mut Context, cell: Value, field: &str) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![FP64Type::get(ctx).into()],
+            vec![cell],
+            vec![],
+            0,
+        );
+        let op = StructGetOp { op };
+        op.set_attr_estruct_get_field(ctx, StringAttr::new(field.to_string()));
+        op
+    }
+
+    pub fn field(&self, ctx: &Context) -> String {
+        String::from(
+            self.get_attr_estruct_get_field(ctx)
+                .expect("struct_get field")
+                .clone(),
+        )
+    }
+}
+
+/// Write a named `f64` field into a struct (`cell.field = value`).
+#[pliron_op(
+    name = "emitc.struct_set",
+    format,
+    interfaces = [NOpdsInterface<2>, NResultsInterface<0>],
+    attributes = (estruct_set_field: StringAttr),
+    verifier = "succ",
+)]
+pub struct StructSetOp;
+
+impl StructSetOp {
+    pub fn new(ctx: &mut Context, cell: Value, field: &str, value: Value) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![],
+            vec![cell, value],
+            vec![],
+            0,
+        );
+        let op = StructSetOp { op };
+        op.set_attr_estruct_set_field(ctx, StringAttr::new(field.to_string()));
+        op
+    }
+
+    pub fn field(&self, ctx: &Context) -> String {
+        String::from(
+            self.get_attr_estruct_set_field(ctx)
+                .expect("struct_set field")
+                .clone(),
+        )
+    }
+}
+
+/// Copy a struct value into a struct cell (`dest = src`).
+#[pliron_op(
+    name = "emitc.struct_copy",
+    format,
+    interfaces = [NOpdsInterface<2>, NResultsInterface<0>],
+    verifier = "succ",
+)]
+pub struct StructCopyOp;
+
+impl StructCopyOp {
+    pub fn new(ctx: &mut Context, dest: Value, src: Value) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![],
+            vec![dest, src],
+            vec![],
+            0,
+        );
+        StructCopyOp { op }
+    }
+}
+
 /// A statement-form conditional with `then` and `else` regions.
 #[pliron_op(
     name = "emitc.if",
@@ -381,6 +532,36 @@ impl ForOp {
     }
 }
 
+/// A `for` loop with a runtime direction-aware condition:
+/// `for (iv = start; (step >= 0) ? (iv <= end) : (iv >= end); iv += step)`.
+/// This is the C form of MATLAB's `for i = start : step : end`, and it gives
+/// `break`/`continue` their natural C semantics (unlike a `while(true)` loop).
+#[pliron_op(
+    name = "emitc.range_for",
+    format,
+    interfaces = [NOpdsInterface<3>, NResultsInterface<0>, OneRegionInterface],
+    verifier = "succ",
+)]
+pub struct RangeForOp;
+
+impl RangeForOp {
+    pub fn new(ctx: &mut Context, start: Value, end: Value, step: Value) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![],
+            vec![start, end, step],
+            vec![],
+            1,
+        );
+        RangeForOp { op }
+    }
+
+    pub fn body_region(&self, ctx: &Context) -> Ptr<Region> {
+        self.get_operation().deref(ctx).get_region(0)
+    }
+}
+
 /// Terminates a `before` region with the loop condition.
 #[pliron_op(
     name = "emitc.condition",
@@ -433,6 +614,22 @@ impl BreakOp {
     pub fn new(ctx: &mut Context) -> Self {
         let op = Operation::new(ctx, Self::get_concrete_op_info(), vec![], vec![], vec![], 0);
         BreakOp { op }
+    }
+}
+
+/// A `continue` statement (jumps to the next loop iteration).
+#[pliron_op(
+    name = "emitc.continue",
+    format,
+    interfaces = [NOpdsInterface<0>, NResultsInterface<0>],
+    verifier = "succ",
+)]
+pub struct ContinueOp;
+
+impl ContinueOp {
+    pub fn new(ctx: &mut Context) -> Self {
+        let op = Operation::new(ctx, Self::get_concrete_op_info(), vec![], vec![], vec![], 0);
+        ContinueOp { op }
     }
 }
 

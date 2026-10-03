@@ -197,7 +197,6 @@ dependencies = [
  "anyhow",
  "pliron",
  "runmat-hir",
- "runmat-mir",
  "runmat-parser",
  "thiserror 2.0.20",
 ]
@@ -800,18 +799,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fafc50a83793cd7f6b81f37d220d0b43e628f494a899760a34971d65b0420c2"
 dependencies = [
  "logos",
-]
-
-[[package]]
-name = "runmat-mir"
-version = "0.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51e601e16ed5b47af1977f7e8d4b6cab27e781f82e2a3f8da0576a0fc0ceca38"
-dependencies = [
- "runmat-builtins",
- "runmat-hir",
- "runmat-types",
- "serde",
 ]
 
 [[package]]

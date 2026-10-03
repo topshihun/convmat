@@ -5,9 +5,9 @@ edition = "2021"
 description = "A MATLAB/Octave-to-C compiler aiming to be a better MATLAB Coder"
 license = "MIT OR Apache-2.0"
 
-# `runmat-*` provide the MATLAB/Octave frontend (parse -> HIR -> MIR); `pliron`
+# `runmat-*` provide the MATLAB/Octave frontend (parse -> HIR); `pliron`
 # provides the extensible compiler IR (an MLIR-inspired, pure-Rust framework) we
-# lower MIR into. Both are mandatory: code generation is the whole point of
+# lower HIR into. Both are mandatory: code generation is the whole point of
 # this crate. pliron is pure Rust (no C++ libMLIR needed).
 #
 # NOTE: runmat-static-analysis is deliberately excluded: it pulls runmat-vm ->
@@ -19,5 +19,4 @@ thiserror = "2"
 anyhow = "1"
 runmat-parser = "0.6.2"
 runmat-hir = "0.6.2"
-runmat-mir = "0.6.2"
 pliron = "0.18"

@@ -16,8 +16,8 @@ fn compile_fixture(name: &str) -> String {
 fn lower_fixture(name: &str) -> String {
     let path = format!("{}/tests/fixtures/{name}.m", env!("CARGO_MANIFEST_DIR"));
     let source = SourceFile::read(path).expect("read fixture");
-    let mir = convmat::frontend::parse_mir(&source).expect("parse to MIR");
-    convmat::mir_to_mlir::lower(&mir).expect("lower to MLIR")
+    let hir = convmat::frontend::parse_hir(&source).expect("parse to HIR");
+    convmat::hir_to_mlir::lower(&hir).expect("lower to MLIR")
 }
 
 /// The fixture used to prove the original scalar add path still works.
@@ -94,7 +94,7 @@ fn codegen_while_loop() {
 fn codegen_for_loop() {
     let c = compile_fixture("sumto");
     assert!(c.contains("double sum_to("), "got:\n{c}");
-    assert!(c.contains("while ("), "got:\n{c}");
+    assert!(c.contains("for ("), "got:\n{c}");
 }
 
 #[test]
@@ -129,7 +129,7 @@ fn codegen_for_loop_with_step() {
     // `for i = 1:2:n` iterates an explicit stride.
     let c = compile_fixture("forstep");
     assert!(c.contains("double odd_sum("), "got:\n{c}");
-    assert!(c.contains("while ("), "got:\n{c}");
+    assert!(c.contains("for ("), "got:\n{c}");
 }
 
 #[test]
@@ -162,7 +162,7 @@ fn lower_control_flow_to_scf() {
 fn codegen_factorial_for_loop() {
     let c = compile_fixture("fact");
     assert!(c.contains("double fact("), "got:\n{c}");
-    assert!(c.contains("while ("), "got:\n{c}");
+    assert!(c.contains("for ("), "got:\n{c}");
     assert!(c.contains('*'), "got:\n{c}");
 }
 
@@ -170,7 +170,7 @@ fn codegen_factorial_for_loop() {
 fn codegen_sum_of_squares() {
     let c = compile_fixture("sumsq");
     assert!(c.contains("double sumsq("), "got:\n{c}");
-    assert!(c.contains("while ("), "got:\n{c}");
+    assert!(c.contains("for ("), "got:\n{c}");
     assert!(c.contains('*'), "got:\n{c}");
 }
 
@@ -218,7 +218,7 @@ fn codegen_while_compound_condition() {
 fn codegen_for_loop_descending() {
     let c = compile_fixture("count_down");
     assert!(c.contains("double count_down("), "got:\n{c}");
-    assert!(c.contains("while ("), "got:\n{c}");
+    assert!(c.contains("for ("), "got:\n{c}");
     assert!(c.contains('-'), "got:\n{c}");
 }
 
@@ -275,7 +275,7 @@ fn codegen_elseif_band_chain() {
 fn codegen_switch_in_for_loop() {
     let c = compile_fixture("nested_switch");
     assert!(c.contains("double nested_switch("), "got:\n{c}");
-    assert!(c.contains("while ("), "got:\n{c}");
+    assert!(c.contains("for ("), "got:\n{c}");
     assert!(c.contains("else"), "got:\n{c}");
 }
 
@@ -605,6 +605,23 @@ fn codegen_no_runtime_for_scalar_only() {
     // A scalar-only program must not pull in the (unused) runtime helpers.
     let c = compile_fixture("add");
     assert!(!c.contains("convmat_"), "got:\n{c}");
+}
+
+#[test]
+fn codegen_heap_allocation_for_large_arrays() {
+    // A `100x50` array (5000 elements) exceeds the stack budget and is heap
+    // allocated, then freed before returning.
+    let c = compile_fixture("big_array");
+    assert!(c.contains("new double[5000]"), "got:\n{c}");
+    assert!(c.contains("delete[]"), "got:\n{c}");
+}
+
+#[test]
+fn codegen_stack_allocation_for_small_arrays() {
+    // A small array stays on the stack (no `new`/`delete`).
+    let c = compile_fixture("matrix2d");
+    assert!(!c.contains("new double"), "got:\n{c}");
+    assert!(!c.contains("delete[]"), "got:\n{c}");
 }
 
 // --- varargin / nargin / varargout -------------------------------------------

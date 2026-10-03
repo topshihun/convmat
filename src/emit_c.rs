@@ -26,7 +26,7 @@ use pliron::{
 use crate::{
     dialects::{
         emitc,
-        matlab::{ArrayType, BinOpKind, CmpKind},
+        matlab::{ArrayType, BinOpKind, CmpKind, StructType},
     },
     error::Result,
 };
@@ -38,6 +38,7 @@ pub fn emit(context: &Context, module: &ModuleOp) -> Result<String> {
     let mut emitter = Emitter {
         context,
         names: HashMap::new(),
+        struct_types: HashMap::new(),
         counter: 0,
         out: String::new(),
     };
@@ -45,6 +46,9 @@ pub fn emit(context: &Context, module: &ModuleOp) -> Result<String> {
     emitter
         .out
         .push_str("#include <cmath>\n#include <cstdint>\n#include <tuple>\n\n");
+    // First pass: emit every `struct` definition at file scope (before the
+    // functions that reference them).
+    emitter.emit_struct_definitions(module);
     if let Some(block) = module.get_region(context).deref(context).get_entry_block() {
         let ops: Vec<Ptr<Operation>> = block.deref(context).iter(context).collect();
         for op in ops {
@@ -57,6 +61,8 @@ pub fn emit(context: &Context, module: &ModuleOp) -> Result<String> {
 struct Emitter<'a> {
     context: &'a Context,
     names: HashMap<Value, String>,
+    /// Map a `matlab.struct` type to its emitted C `struct` tag name.
+    struct_types: HashMap<TypeHandle, String>,
     counter: usize,
     out: String,
 }
@@ -76,12 +82,12 @@ impl<'a> Emitter<'a> {
 
     fn emit_func(&mut self, func: &FuncOp) {
         let name = func.get_symbol_name(self.context).as_ref().to_string();
-        let n_results = {
+        let res_types = {
             let fn_ty = func.get_type(self.context).deref(self.context);
             let ft = fn_ty
                 .downcast_ref::<FunctionType>()
                 .expect("func carries a function type");
-            ft.res_types().len()
+            ft.res_types()
         };
         let entry = func.get_entry_block(self.context);
 
@@ -95,10 +101,16 @@ impl<'a> Emitter<'a> {
         // Reserve the parameter names so later `fresh()` calls start after them.
         self.counter = args.len();
 
-        let ret = match n_results {
-            0 => "void".to_string(),
-            1 => "double".to_string(),
-            n => format!("std::tuple<{}>", vec!["double"; n].join(", ")),
+        let ret = match res_types.as_slice() {
+            [] => "void".to_string(),
+            [ty] => self.c_type(*ty),
+            tys => format!(
+                "std::tuple<{}>",
+                tys.iter()
+                    .map(|ty| self.c_type(*ty))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         };
 
         self.out
@@ -106,6 +118,49 @@ impl<'a> Emitter<'a> {
         self.out.push_str(") {\n");
         self.emit_block(entry, 1);
         self.out.push_str("}\n\n");
+    }
+
+    /// Emit every `struct` definition referenced by the module at file scope.
+    fn emit_struct_definitions(&mut self, module: &ModuleOp) {
+        if let Some(block) = module
+            .get_region(self.context)
+            .deref(self.context)
+            .get_entry_block()
+        {
+            for op in block.deref(self.context).iter(self.context) {
+                // Function signatures may reference `struct` types as parameters
+                // or results.
+                if let Some(func) = Operation::get_op::<FuncOp>(op, self.context) {
+                    let fn_ty = func.get_type(self.context).deref(self.context);
+                    if let Some(ft) = fn_ty.downcast_ref::<FunctionType>() {
+                        for ty in ft.arg_types().into_iter().chain(ft.res_types()) {
+                            if is_struct(self.context, ty) {
+                                self.struct_type_name(ty);
+                            }
+                        }
+                    }
+                }
+                self.collect_structs_in_op(op);
+            }
+        }
+    }
+
+    /// Recurse through `op` and emit `struct` definitions for any `matlab.struct`
+    /// result type (a `DeclareOp` result, or a function argument/result).
+    fn collect_structs_in_op(&mut self, op: Ptr<Operation>) {
+        for i in 0..op.deref(self.context).get_num_results() {
+            let ty = op.deref(self.context).get_result(i).get_type(self.context);
+            if is_struct(self.context, ty) {
+                self.struct_type_name(ty);
+            }
+        }
+        for region in op.deref(self.context).regions() {
+            if let Some(block) = region.deref(self.context).get_entry_block() {
+                for nested in block.deref(self.context).iter(self.context) {
+                    self.collect_structs_in_op(nested);
+                }
+            }
+        }
     }
 
     /// Dispatch a top-level op (a directive or a function).
@@ -160,12 +215,46 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn param_decl(&self, name: &str, ty: TypeHandle) -> String {
+    fn param_decl(&mut self, name: &str, ty: TypeHandle) -> String {
         if is_array(self.context, ty) {
             let numel = array_numel(self.context, ty);
             format!("double {name}[{numel}]")
+        } else if is_struct(self.context, ty) {
+            format!("struct {} {name}", self.struct_type_name(ty))
         } else {
             format!("double {name}")
+        }
+    }
+
+    /// The emitted C `struct` tag name for a `matlab.struct` type, defining the
+    /// struct (once) on first use.
+    fn struct_type_name(&mut self, ty: TypeHandle) -> String {
+        if let Some(name) = self.struct_types.get(&ty).cloned() {
+            return name;
+        }
+        let name = format!("s{}", self.struct_types.len());
+        self.struct_types.insert(ty, name.clone());
+        let struct_ty = ty.deref(self.context);
+        let fields = struct_ty
+            .downcast_ref::<StructType>()
+            .expect("struct type")
+            .fields();
+        let mut body = String::new();
+        for (field_name, _field_ty) in fields {
+            body.push_str(&format!("  double {field_name};\n"));
+        }
+        self.out.push_str(&format!("struct {name} {{\n{body}}};\n"));
+        name
+    }
+
+    /// The C type spelling of a `f64`, array, or `matlab.struct` type.
+    fn c_type(&mut self, ty: TypeHandle) -> String {
+        if is_array(self.context, ty) {
+            format!("double[{}]", array_numel(self.context, ty))
+        } else if is_struct(self.context, ty) {
+            format!("struct {}", self.struct_type_name(ty))
+        } else {
+            "double".to_string()
         }
     }
 
@@ -195,12 +284,27 @@ impl<'a> Emitter<'a> {
             let name = d.name(self.context);
             self.names.insert(result, name.clone());
             let ty = result.get_type(self.context);
-            if is_array(self.context, ty) && array_numel(self.context, ty) == 1 {
-                self.out.push_str(&format!("{pad}double {name};\n"));
-            } else {
+            if d.is_heap(self.context) {
                 let numel = array_numel(self.context, ty);
                 self.out
-                    .push_str(&format!("{pad}double {name}[{numel}];\n"));
+                    .push_str(&format!("{pad}double* {name} = new double[{numel}];\n"));
+            } else if is_struct(self.context, ty) {
+                let tag = self.struct_type_name(ty);
+                self.out.push_str(&format!("{pad}struct {tag} {name};\n"));
+            } else {
+                let static_kw = if d.is_static(self.context) {
+                    "static "
+                } else {
+                    ""
+                };
+                if is_array(self.context, ty) && array_numel(self.context, ty) == 1 {
+                    self.out
+                        .push_str(&format!("{pad}{static_kw}double {name};\n"));
+                } else {
+                    let numel = array_numel(self.context, ty);
+                    self.out
+                        .push_str(&format!("{pad}{static_kw}double {name}[{numel}];\n"));
+                }
             }
         } else if let Some(l) = Operation::get_op::<emitc::LiteralOp>(op, self.context) {
             let name = self.assign_name(op);
@@ -263,6 +367,22 @@ impl<'a> Emitter<'a> {
             let value = self.expr(op.deref(self.context).get_operand(2));
             let access = self.access(array, index);
             self.out.push_str(&format!("{pad}{access} = {value};\n"));
+        } else if let Some(g) = Operation::get_op::<emitc::StructGetOp>(op, self.context) {
+            let name = self.assign_name(op);
+            let cell = self.expr(op.deref(self.context).get_operand(0));
+            let field = g.field(self.context);
+            self.out
+                .push_str(&format!("{pad}double {name} = {cell}.{field};\n"));
+        } else if let Some(s) = Operation::get_op::<emitc::StructSetOp>(op, self.context) {
+            let cell = self.expr(op.deref(self.context).get_operand(0));
+            let value = self.expr(op.deref(self.context).get_operand(1));
+            let field = s.field(self.context);
+            self.out
+                .push_str(&format!("{pad}{cell}.{field} = {value};\n"));
+        } else if let Some(_c) = Operation::get_op::<emitc::StructCopyOp>(op, self.context) {
+            let dest = self.expr(op.deref(self.context).get_operand(0));
+            let src = self.expr(op.deref(self.context).get_operand(1));
+            self.out.push_str(&format!("{pad}{dest} = {src};\n"));
         } else if let Some(i) = Operation::get_op::<emitc::IfOp>(op, self.context) {
             let cond = self.expr(i.condition(self.context));
             self.out.push_str(&format!("{pad}if ({cond}) {{\n"));
@@ -292,6 +412,23 @@ impl<'a> Emitter<'a> {
             ));
             self.emit_region(f.body_region(self.context), indent + 1);
             self.out.push_str(&format!("{pad}}}\n"));
+        } else if let Some(f) = Operation::get_op::<emitc::RangeForOp>(op, self.context) {
+            let start = self.expr(op.deref(self.context).get_operand(0));
+            let end = self.expr(op.deref(self.context).get_operand(1));
+            let step = self.expr(op.deref(self.context).get_operand(2));
+            let body = f
+                .body_region(self.context)
+                .deref(self.context)
+                .get_entry_block()
+                .expect("range for body");
+            let iv = body.deref(self.context).get_argument(0);
+            let iv_name = self.fresh();
+            self.names.insert(iv, iv_name.clone());
+            self.out.push_str(&format!(
+                "{pad}for (double {iv_name} = {start}; ({step} >= 0) ? ({iv_name} <= {end}) : ({iv_name} >= {end}); {iv_name} += {step}) {{\n"
+            ));
+            self.emit_region(f.body_region(self.context), indent + 1);
+            self.out.push_str(&format!("{pad}}}\n"));
         } else if let Some(_c) = Operation::get_op::<emitc::ConditionOp>(op, self.context) {
             let cond = self.expr(op.deref(self.context).get_operand(0));
             self.out.push_str(&format!("{pad}if (!{cond}) break;\n"));
@@ -299,6 +436,12 @@ impl<'a> Emitter<'a> {
             // Yield carries no values; nothing to emit.
         } else if let Some(_b) = Operation::get_op::<emitc::BreakOp>(op, self.context) {
             self.out.push_str(&format!("{pad}break;\n"));
+        } else if let Some(_c) = Operation::get_op::<emitc::ContinueOp>(op, self.context) {
+            self.out.push_str(&format!("{pad}continue;\n"));
+        } else if let Some(_d) = Operation::get_op::<emitc::DeleteOp>(op, self.context) {
+            let array = op.deref(self.context).get_operand(0);
+            let name = self.expr(array);
+            self.out.push_str(&format!("{pad}delete[] {name};\n"));
         } else if let Some(_r) = Operation::get_op::<emitc::ReturnOp>(op, self.context) {
             let values: Vec<String> = op
                 .deref(self.context)
@@ -349,6 +492,10 @@ impl<'a> Emitter<'a> {
 
 fn is_array(context: &Context, ty: TypeHandle) -> bool {
     ty.deref(context).is::<ArrayType>()
+}
+
+fn is_struct(context: &Context, ty: TypeHandle) -> bool {
+    ty.deref(context).is::<StructType>()
 }
 
 fn array_numel(context: &Context, ty: TypeHandle) -> i64 {

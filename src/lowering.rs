@@ -167,11 +167,17 @@ impl Lowerer {
             let args: Vec<Value> = (0..m).map(|i| self.opd(context, op, i)).collect();
             let e = emitc::CallVoidOp::new(context, &c.callee(context), args);
             append(context, dst, &e);
-        } else if let Some(_c) = Operation::get_op::<matlab::AllocaOp>(op, context) {
+        } else if let Some(c) = Operation::get_op::<matlab::AllocaOp>(op, context) {
             let array_ty = op.deref(context).get_result(0).get_type(context);
             let name = format!("a{}", self.decl_counter);
             self.decl_counter += 1;
-            let e = emitc::DeclareOp::new(context, &name, array_ty);
+            let e = if c.is_heap(context) {
+                emitc::DeclareOp::new_heap(context, &name, array_ty)
+            } else if c.is_static(context) {
+                emitc::DeclareOp::new_static(context, &name, array_ty)
+            } else {
+                emitc::DeclareOp::new(context, &name, array_ty)
+            };
             self.map_result(context, op, &e, 0);
             append(context, dst, &e);
         } else if let Some(_c) = Operation::get_op::<matlab::LoadOp>(op, context) {
@@ -185,6 +191,28 @@ impl Lowerer {
                 self.opd(context, op, 1),
                 self.opd(context, op, 2),
             );
+            append(context, dst, &e);
+        } else if let Some(g) = Operation::get_op::<matlab::StructGetOp>(op, context) {
+            let e = emitc::StructGetOp::new(context, self.opd(context, op, 0), &g.field(context));
+            self.map_result(context, op, &e, 0);
+            append(context, dst, &e);
+        } else if let Some(s) = Operation::get_op::<matlab::StructSetOp>(op, context) {
+            let e = emitc::StructSetOp::new(
+                context,
+                self.opd(context, op, 0),
+                &s.field(context),
+                self.opd(context, op, 1),
+            );
+            append(context, dst, &e);
+        } else if let Some(_c) = Operation::get_op::<matlab::StructCopyOp>(op, context) {
+            let e = emitc::StructCopyOp::new(
+                context,
+                self.opd(context, op, 0),
+                self.opd(context, op, 1),
+            );
+            append(context, dst, &e);
+        } else if let Some(_c) = Operation::get_op::<matlab::DeleteOp>(op, context) {
+            let e = emitc::DeleteOp::new(context, self.opd(context, op, 0));
             append(context, dst, &e);
         } else if let Some(c) = Operation::get_op::<matlab::IfOp>(op, context) {
             let e = emitc::IfOp::new(context, self.opd(context, op, 0));
@@ -205,11 +233,26 @@ impl Lowerer {
             );
             append(context, dst, &e);
             self.lower_region(context, c.body_region(context), e.body_region(context))?;
+        } else if let Some(c) = Operation::get_op::<matlab::RangeForOp>(op, context) {
+            let e = emitc::RangeForOp::new(
+                context,
+                self.opd(context, op, 0),
+                self.opd(context, op, 1),
+                self.opd(context, op, 2),
+            );
+            append(context, dst, &e);
+            self.lower_region(context, c.body_region(context), e.body_region(context))?;
         } else if let Some(_c) = Operation::get_op::<matlab::ConditionOp>(op, context) {
             let e = emitc::ConditionOp::new(context, self.opd(context, op, 0));
             append(context, dst, &e);
         } else if let Some(_c) = Operation::get_op::<matlab::YieldOp>(op, context) {
             let e = emitc::YieldOp::new(context);
+            append(context, dst, &e);
+        } else if let Some(_c) = Operation::get_op::<matlab::BreakOp>(op, context) {
+            let e = emitc::BreakOp::new(context);
+            append(context, dst, &e);
+        } else if let Some(_c) = Operation::get_op::<matlab::ContinueOp>(op, context) {
+            let e = emitc::ContinueOp::new(context);
             append(context, dst, &e);
         } else if let Some(_c) = Operation::get_op::<matlab::ReturnOp>(op, context) {
             let values: Vec<Value> = (0..m).map(|i| self.opd(context, op, i)).collect();

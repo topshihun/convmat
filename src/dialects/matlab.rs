@@ -1,4 +1,4 @@
-//! The `matlab` dialect: MATLAB-level semantics produced by `mir_to_mlir`.
+//! The `matlab` dialect: MATLAB-level semantics produced by `hir_to_mlir`.
 //!
 //! This is the high-level IR that the MIR lowerer emits. It captures what a
 //! MATLAB program *means*: dense column-major arrays, scalar arithmetic,
@@ -8,7 +8,7 @@
 
 use pliron::{
     builtin::{
-        attributes::{FPDoubleAttr, StringAttr},
+        attributes::{BoolAttr, FPDoubleAttr, StringAttr},
         op_interfaces::{
             IsTerminatorInterface, NOpdsInterface, NRegionsInterface, NResultsInterface,
             OneOpdInterface, OneRegionInterface, OneResultInterface,
@@ -74,6 +74,56 @@ impl ArrayType {
     /// The flattened element count.
     pub fn numel(&self) -> i64 {
         self.dims.iter().product()
+    }
+}
+
+/// A statically-typed MATLAB `struct`: an ordered list of named fields, each
+/// with a fixed type. Fields are accessed by name (see [`StructGetOp`] and
+/// [`StructSetOp`]); the emitted C `struct` lays them out in declaration order.
+#[pliron_type(name = "matlab.struct", generate_get = true, verifier = "succ")]
+#[derive(Hash, PartialEq, Eq, Debug, Clone)]
+pub struct StructType {
+    fields: Vec<(String, TypeHandle)>,
+}
+
+impl StructType {
+    /// The ordered field names and their types.
+    pub fn fields(&self) -> &[(String, TypeHandle)] {
+        &self.fields
+    }
+
+    /// The 0-based index of the named field, if present.
+    pub fn field_index(&self, name: &str) -> Option<usize> {
+        self.fields.iter().position(|(n, _)| n == name)
+    }
+}
+
+impl pliron::printable::Printable for StructType {
+    fn fmt(
+        &self,
+        _ctx: &Context,
+        _state: &pliron::printable::State,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result {
+        let names: Vec<&str> = self.fields.iter().map(|(n, _)| n.as_str()).collect();
+        write!(f, "struct<{}>", names.join(","))
+    }
+}
+
+// Struct types are never parsed from text.
+impl pliron::parsable::Parsable for StructType {
+    type Arg = ();
+    type Parsed = pliron::r#type::TypedHandle<Self>;
+
+    fn parse<'a>(
+        state_stream: &mut pliron::parsable::StateStream<'a>,
+        _arg: Self::Arg,
+    ) -> pliron::parsable::ParseResult<'a, Self::Parsed> {
+        use pliron::combine::Parser;
+        let ctx = &*state_stream.state.ctx;
+        pliron::combine::value(StructType::get(ctx, vec![]))
+            .parse_stream(state_stream)
+            .into()
     }
 }
 
@@ -286,17 +336,32 @@ impl CallVoidOp {
     }
 }
 
-/// Allocate a statically-shaped array local (stack slot).
+/// Allocate a statically-shaped array local. The storage class is chosen by the
+/// allocation policy in `hir_to_mlir`: a plain stack slot, a `static` slot
+/// (for `persistent`/`global` bindings), or a heap allocation (large arrays).
 #[pliron_op(
     name = "matlab.alloca",
     format,
     interfaces = [NOpdsInterface<0>, OneResultInterface],
+    attributes = (alloca_static: BoolAttr, alloca_heap: BoolAttr),
     verifier = "succ",
 )]
 pub struct AllocaOp;
 
 impl AllocaOp {
     pub fn new(ctx: &mut Context, array_ty: TypeHandle) -> Self {
+        Self::with_flags(ctx, array_ty, false, false)
+    }
+
+    pub fn new_static(ctx: &mut Context, array_ty: TypeHandle) -> Self {
+        Self::with_flags(ctx, array_ty, true, false)
+    }
+
+    pub fn new_heap(ctx: &mut Context, array_ty: TypeHandle) -> Self {
+        Self::with_flags(ctx, array_ty, false, true)
+    }
+
+    fn with_flags(ctx: &mut Context, array_ty: TypeHandle, is_static: bool, is_heap: bool) -> Self {
         let op = Operation::new(
             ctx,
             Self::get_concrete_op_info(),
@@ -305,7 +370,45 @@ impl AllocaOp {
             vec![],
             0,
         );
-        AllocaOp { op }
+        let op = AllocaOp { op };
+        op.set_attr_alloca_static(ctx, BoolAttr::new(is_static));
+        op.set_attr_alloca_heap(ctx, BoolAttr::new(is_heap));
+        op
+    }
+
+    pub fn is_static(&self, ctx: &Context) -> bool {
+        bool::from(
+            self.get_attr_alloca_static(ctx)
+                .expect("alloca static")
+                .clone(),
+        )
+    }
+
+    pub fn is_heap(&self, ctx: &Context) -> bool {
+        bool::from(self.get_attr_alloca_heap(ctx).expect("alloca heap").clone())
+    }
+}
+
+/// Free a heap-allocated array (`matlab.alloca` with `alloca_heap`).
+#[pliron_op(
+    name = "matlab.delete",
+    format,
+    interfaces = [OneOpdInterface, NResultsInterface<0>],
+    verifier = "succ",
+)]
+pub struct DeleteOp;
+
+impl DeleteOp {
+    pub fn new(ctx: &mut Context, array: Value) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![],
+            vec![array],
+            vec![],
+            0,
+        );
+        DeleteOp { op }
     }
 }
 
@@ -352,6 +455,97 @@ impl StoreOp {
             0,
         );
         StoreOp { op }
+    }
+}
+
+/// Read a named `f64` field from a struct cell.
+#[pliron_op(
+    name = "matlab.struct_get",
+    format,
+    interfaces = [OneOpdInterface, OneResultInterface],
+    attributes = (struct_get_field: StringAttr),
+    verifier = "succ",
+)]
+pub struct StructGetOp;
+
+impl StructGetOp {
+    pub fn new(ctx: &mut Context, cell: Value, field: &str) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![FP64Type::get(ctx).into()],
+            vec![cell],
+            vec![],
+            0,
+        );
+        let op = StructGetOp { op };
+        op.set_attr_struct_get_field(ctx, StringAttr::new(field.to_string()));
+        op
+    }
+
+    pub fn field(&self, ctx: &Context) -> String {
+        String::from(
+            self.get_attr_struct_get_field(ctx)
+                .expect("struct_get field")
+                .clone(),
+        )
+    }
+}
+
+/// Write a named `f64` field into a struct cell.
+#[pliron_op(
+    name = "matlab.struct_set",
+    format,
+    interfaces = [NOpdsInterface<2>, NResultsInterface<0>],
+    attributes = (struct_set_field: StringAttr),
+    verifier = "succ",
+)]
+pub struct StructSetOp;
+
+impl StructSetOp {
+    pub fn new(ctx: &mut Context, cell: Value, field: &str, value: Value) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![],
+            vec![cell, value],
+            vec![],
+            0,
+        );
+        let op = StructSetOp { op };
+        op.set_attr_struct_set_field(ctx, StringAttr::new(field.to_string()));
+        op
+    }
+
+    pub fn field(&self, ctx: &Context) -> String {
+        String::from(
+            self.get_attr_struct_set_field(ctx)
+                .expect("struct_set field")
+                .clone(),
+        )
+    }
+}
+
+/// Copy a struct value into a struct cell (`dest = src`).
+#[pliron_op(
+    name = "matlab.struct_copy",
+    format,
+    interfaces = [NOpdsInterface<2>, NResultsInterface<0>],
+    verifier = "succ",
+)]
+pub struct StructCopyOp;
+
+impl StructCopyOp {
+    pub fn new(ctx: &mut Context, dest: Value, src: Value) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![],
+            vec![dest, src],
+            vec![],
+            0,
+        );
+        StructCopyOp { op }
     }
 }
 
@@ -443,6 +637,37 @@ impl ForOp {
     }
 }
 
+/// A MATLAB `for i = start : step : end` loop with a runtime-evaluated,
+/// direction-aware condition (`i <= end` when ascending, `i >= end` when
+/// descending). The body region's single block has one argument: the induction
+/// variable (`f64`), which the lowerer stores into the loop variable's cell at
+/// the top of each iteration so the body reads it through its normal cell.
+#[pliron_op(
+    name = "matlab.range_for",
+    format,
+    interfaces = [NOpdsInterface<3>, NResultsInterface<0>, OneRegionInterface],
+    verifier = "succ",
+)]
+pub struct RangeForOp;
+
+impl RangeForOp {
+    pub fn new(ctx: &mut Context, start: Value, end: Value, step: Value) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![],
+            vec![start, end, step],
+            vec![],
+            1,
+        );
+        RangeForOp { op }
+    }
+
+    pub fn body_region(&self, ctx: &Context) -> Ptr<Region> {
+        self.get_operation().deref(ctx).get_region(0)
+    }
+}
+
 /// Terminates the `before` region of a [`WhileOp`], carrying the loop condition.
 #[pliron_op(
     name = "matlab.condition",
@@ -479,6 +704,38 @@ impl YieldOp {
     pub fn new(ctx: &mut Context) -> Self {
         let op = Operation::new(ctx, Self::get_concrete_op_info(), vec![], vec![], vec![], 0);
         YieldOp { op }
+    }
+}
+
+/// A `break` statement (exits the innermost loop).
+#[pliron_op(
+    name = "matlab.break",
+    format,
+    interfaces = [NOpdsInterface<0>, NResultsInterface<0>],
+    verifier = "succ",
+)]
+pub struct BreakOp;
+
+impl BreakOp {
+    pub fn new(ctx: &mut Context) -> Self {
+        let op = Operation::new(ctx, Self::get_concrete_op_info(), vec![], vec![], vec![], 0);
+        BreakOp { op }
+    }
+}
+
+/// A `continue` statement (jumps to the next loop iteration).
+#[pliron_op(
+    name = "matlab.continue",
+    format,
+    interfaces = [NOpdsInterface<0>, NResultsInterface<0>],
+    verifier = "succ",
+)]
+pub struct ContinueOp;
+
+impl ContinueOp {
+    pub fn new(ctx: &mut Context) -> Self {
+        let op = Operation::new(ctx, Self::get_concrete_op_info(), vec![], vec![], vec![], 0);
+        ContinueOp { op }
     }
 }
 

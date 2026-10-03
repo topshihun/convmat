@@ -9,10 +9,10 @@
 
 | 模块 | 职责 |
 |------|------|
-| `src/frontend/` | 读 `.m` + 驱动 runmat 前端（parse → HIR → MIR） |
+| `src/frontend/` | 读 `.m` + 驱动 runmat 前端（parse → HIR） |
 | `src/triage/` | 静态 vs 动态边界 + 形状推断（`Shape`/`LocalTy`） |
 | `src/dialects/matlab.rs` | `matlab` 方言（语义）：数组类型 + 标量/数组/控制流 op |
-| `src/mir_to_mlir/` | MIR → `matlab` 方言（降级器，含内存分配决策） |
+| `src/hir_to_mlir/` | HIR → `matlab` 方言（降级器，含内存分配决策） |
 | `src/builtins.rs` | 内建函数名 → 降级配方表 |
 | `src/lowering.rs` | `matlab` → `emitc` 方言降级（ABI 解析、数组命名、op 重写） |
 | `src/dialects/emitc.rs` | `emitc` 方言（C 级）：声明/赋值/三元/调用/控制流 |
@@ -26,19 +26,20 @@
 - 不重复造轮子：解析/名字解析用 runmat；IR 骨架（SSA/region/block/dialect/op/type/
   verifier/pass 框架）用 pliron；C 发射器与两级降级器自研。
 - 不再依赖 melior/libMLIR/`mlir-translate`/`mlir-opt`；构建是纯 `cargo build`。
-- 允许自研的只有：MIR→`matlab` 降级器、`matlab`→`emitc` 降级器、C 发射器、
+- 允许自研的只有：HIR→`matlab` 降级器、`matlab`→`emitc` 降级器、C 发射器、
   静态/动态分类（triage）、运行时 shim。**优化 pass（CSE/canonicalize/linalg）本期不做。**
 
 ## 工作约定
 
-1. 改前端接入或 MIR 依赖时，集中在 `src/frontend/` 与 `src/mir_to_mlir/`，隔离 runmat
+1. 改前端接入或 HIR 依赖时，集中在 `src/frontend/` 与 `src/hir_to_mlir/`，隔离 runmat
    版本演进的影响。
 2. 新增后端实现 `src/emit_c.rs`（或 `src/backend/`）的策略，不要改动降级器和前端。
 3. 新增 `matlab`/`emitc` op 前，先确认「现有方言 + 运行时调用」确实无法表达；否则一律否。
    方言 op 只覆盖当前可生成代码子集需要的语义，不追求语法完整。
 4. 不要臆造 `runmat`/`pliron` 的 API，落地前查对应 crate 文档（两者目前都是 pre-1.0，
    API 可能变化）。
-5. 与 runmat/MIR 相关的类型只出现在 `src/frontend/` 与 `src/mir_to_mlir/`，
+5. 与 runmat/HIR 相关的类型只出现在 `src/frontend/` 与 `src/hir_to_mlir/`（以及
+   `src/triage/`，它是边界层，需直接读 HIR 做分类/形状推断），
    其余模块不得直接引用 runmat 类型。
 6. pliron 的 attribute 名（`dict_key`）必须**全局唯一**（跨所有方言）；新属性名用
    `<方言>_<op>_<字段>` 命名，避免与既有 op 冲突。
@@ -54,7 +55,7 @@
 
 - 单元测试放 `#[cfg(test)] mod tests`；集成测试放 `tests/`。
 - 每个新增的 MATLAB→IR 降级 pattern 配一个「最小 `.m` → IR → C」测试。
-- 生成 IR 用自研 dump（`mir_to_mlir::lower`）做结构断言，不再依赖 `mlir-opt`。
+- 生成 IR 用自研 dump（`hir_to_mlir::lower`）做结构断言，不再依赖 `mlir-opt`。
 - `tests/run.rs` 会额外把生成的 C++ 用系统 C++ 编译器（`g++`/`clang++`，或
   `$CXX`）编译并运行，断言运行输出与预期一致；新增可运行语义的 pattern 时，
   同步补一个 `run_*` 用例（纯结构断言不验证「能编译/结果对不对」）。

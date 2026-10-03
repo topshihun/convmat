@@ -1,6 +1,6 @@
 //! Layer 2: the codegen boundary.
 //!
-//! Classifies each MIR body as statically lowerable (`Verdict::Static`) or
+//! Classifies each HIR function as statically lowerable (`Verdict::Static`) or
 //! deferred to the runtime (`Verdict::Deferred`). This is a function-level
 //! decision, so a program can mix compiled and runtime code.
 //!
@@ -10,12 +10,11 @@
 //! classifier (type/shape inference, definite assignment) can replace it
 //! without changing callers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use runmat_hir::{IndexKind, OperatorKind};
-use runmat_mir::{
-    MirBody, MirCall, MirCallArg, MirCallee, MirConstant, MirIndexComponent, MirIndexing,
-    MirOperand, MirPlace, MirRvalue, MirStmt, MirStmtKind, MirTerminator, MirTerminatorKind,
+use runmat_hir::{
+    BindingId, HirCall, HirCallableRef, HirExpr, HirExprKind, HirFunction, HirPlace, HirStmt,
+    HirStmtKind, IndexComponent, IndexKind, IndexResultContext, IndexingSemantics, OperatorKind,
 };
 
 use crate::builtins::{self, Builtin};
@@ -98,19 +97,22 @@ impl Shape {
     }
 }
 
-/// The static type of a MIR local, as inferred by the boundary's lightweight
+/// The static type of a HIR binding, as inferred by the boundary's lightweight
 /// shape analysis (a stand-in for `runmat-static-analysis` in the MVP).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalTy {
     /// A scalar `f64` value.
     Scalar,
     /// A `f64` array, with either a static or dynamic shape.
     Array { shape: Shape },
+    /// A `struct` with an ordered field list (name + type). Field types may be
+    /// scalar, array, or (recursively) struct.
+    Struct { fields: Vec<(String, LocalTy)> },
     /// Not a numeric value / not statically resolvable; deferred to the runtime.
     Dynamic,
 }
 
-/// The variadic-argument shape of a function body: which MIR locals back
+/// The variadic-argument shape of a function body: which bindings back
 /// `varargin`/`varargout`/`nargin`/`nargout`, and how many extra scalar
 /// arguments/outputs the body actually uses.
 ///
@@ -120,12 +122,12 @@ pub enum LocalTy {
 /// or output — no cell is materialized.
 #[derive(Debug, Clone, Default)]
 pub struct Variadics {
-    pub varargin_local: Option<usize>,
+    pub varargin_local: Option<BindingId>,
     pub varargin_count: usize,
-    pub varargout_local: Option<usize>,
+    pub varargout_local: Option<BindingId>,
     pub varargout_count: usize,
-    pub nargin_local: Option<usize>,
-    pub nargout_local: Option<usize>,
+    pub nargin_local: Option<BindingId>,
+    pub nargout_local: Option<BindingId>,
     /// Number of named (non-variadic) inputs: `fixed_inputs` minus `varargin`.
     pub named_inputs: usize,
     /// Number of named (non-variadic) outputs: `fixed_outputs` minus `varargout`.
@@ -133,129 +135,298 @@ pub struct Variadics {
 }
 
 impl Variadics {
-    /// Compute the variadic shape of `body` by mapping ABI bindings to locals
-    /// and scanning for constant `varargin{k}` / `varargout{k}` indices.
-    pub fn compute(body: &MirBody) -> Self {
-        let mut binding_to_local = HashMap::new();
-        for local in &body.locals {
-            if let Some(binding) = local.binding {
-                binding_to_local.insert(binding, local.id.0);
-            }
-        }
-        let varargin_local = body
-            .abi
-            .varargin
-            .and_then(|b| binding_to_local.get(&b).copied());
-        let varargout_local = body
-            .abi
-            .varargout
-            .and_then(|b| binding_to_local.get(&b).copied());
-        let nargin_local = body
-            .abi
-            .implicit_nargin
-            .and_then(|b| binding_to_local.get(&b).copied());
-        let nargout_local = body
-            .abi
-            .implicit_nargout
-            .and_then(|b| binding_to_local.get(&b).copied());
+    /// Compute the variadic shape of `function` by scanning its body for
+    /// constant `varargin{k}` / `varargout{k}` indices.
+    pub fn compute(function: &HirFunction) -> Self {
+        let varargin_local = function.abi.varargin;
+        let varargout_local = function.abi.varargout;
 
         let mut varargin_count = 0;
         let mut varargout_count = 0;
-        for block in &body.blocks {
-            for stmt in &block.statements {
-                match &stmt.kind {
-                    MirStmtKind::Assign { place, value } => {
-                        if let Some(k) = varargout_index(place, varargout_local) {
-                            varargout_count = varargout_count.max(k);
-                        }
-                        scan_varargin(value, varargin_local, &mut varargin_count);
-                    }
-                    MirStmtKind::Expr(value) => {
-                        scan_varargin(value, varargin_local, &mut varargin_count);
-                    }
-                    MirStmtKind::PlaceMutation(mutation) => {
-                        if let Some(k) = varargout_index(&mutation.place, varargout_local) {
-                            varargout_count = varargout_count.max(k);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
+        scan_block(
+            &function.body.statements,
+            varargin_local,
+            varargout_local,
+            &mut varargin_count,
+            &mut varargout_count,
+        );
 
         Variadics {
             varargin_local,
             varargin_count,
             varargout_local,
             varargout_count,
-            nargin_local,
-            nargout_local,
-            named_inputs: body
+            nargin_local: function.abi.implicit_nargin,
+            nargout_local: function.abi.implicit_nargout,
+            named_inputs: function
                 .abi
                 .fixed_inputs
                 .len()
-                .saturating_sub(usize::from(body.abi.varargin.is_some())),
-            named_outputs: body
+                .saturating_sub(usize::from(function.abi.varargin.is_some())),
+            named_outputs: function
                 .abi
                 .fixed_outputs
                 .len()
-                .saturating_sub(usize::from(body.abi.varargout.is_some())),
+                .saturating_sub(usize::from(function.abi.varargout.is_some())),
         }
     }
 }
 
-/// The 1-based constant index of a single-component `{}` (cell) index, if known.
-pub(crate) fn brace_index(indexing: &MirIndexing) -> Option<usize> {
-    match indexing.components.as_slice() {
-        [MirIndexComponent::Expr(MirOperand::Constant(MirConstant::Number(text)))] => {
-            text.trim().parse::<usize>().ok()
+/// Recursively scan a statement list for `varargin{k}` reads and `varargout{k}`
+/// writes, updating the maximum constant index of each.
+fn scan_block(
+    stmts: &[HirStmt],
+    varargin_local: Option<BindingId>,
+    varargout_local: Option<BindingId>,
+    varargin_count: &mut usize,
+    varargout_count: &mut usize,
+) {
+    for stmt in stmts {
+        match &stmt.kind {
+            HirStmtKind::Assign(place, value, _) => {
+                if let Some(k) = varargout_index(place, varargout_local) {
+                    *varargout_count = (*varargout_count).max(k);
+                }
+                scan_varargin(value, varargin_local, varargin_count);
+            }
+            HirStmtKind::ExprStmt(value, _) => {
+                scan_varargin(value, varargin_local, varargin_count);
+            }
+            HirStmtKind::If {
+                cond,
+                then_body,
+                elseif_blocks,
+                else_body,
+            } => {
+                scan_varargin(cond, varargin_local, varargin_count);
+                scan_block(
+                    &then_body.statements,
+                    varargin_local,
+                    varargout_local,
+                    varargin_count,
+                    varargout_count,
+                );
+                for (cond, block) in elseif_blocks {
+                    scan_varargin(cond, varargin_local, varargin_count);
+                    scan_block(
+                        &block.statements,
+                        varargin_local,
+                        varargout_local,
+                        varargin_count,
+                        varargout_count,
+                    );
+                }
+                if let Some(block) = else_body {
+                    scan_block(
+                        &block.statements,
+                        varargin_local,
+                        varargout_local,
+                        varargin_count,
+                        varargout_count,
+                    );
+                }
+            }
+            HirStmtKind::While { cond, body } => {
+                scan_varargin(cond, varargin_local, varargin_count);
+                scan_block(
+                    &body.statements,
+                    varargin_local,
+                    varargout_local,
+                    varargin_count,
+                    varargout_count,
+                );
+            }
+            HirStmtKind::For { range, body, .. } => {
+                scan_varargin(range, varargin_local, varargin_count);
+                scan_block(
+                    &body.statements,
+                    varargin_local,
+                    varargout_local,
+                    varargin_count,
+                    varargout_count,
+                );
+            }
+            HirStmtKind::Switch {
+                expr,
+                cases,
+                otherwise,
+                ..
+            } => {
+                scan_varargin(expr, varargin_local, varargin_count);
+                for (case, block) in cases {
+                    scan_varargin(case, varargin_local, varargin_count);
+                    scan_block(
+                        &block.statements,
+                        varargin_local,
+                        varargout_local,
+                        varargin_count,
+                        varargout_count,
+                    );
+                }
+                if let Some(block) = otherwise {
+                    scan_block(
+                        &block.statements,
+                        varargin_local,
+                        varargout_local,
+                        varargin_count,
+                        varargout_count,
+                    );
+                }
+            }
+            _ => {}
         }
-        [MirIndexComponent::Expr(MirOperand::Constant(MirConstant::IntegerLiteral(lit)))] => {
-            Some(lit.bits() as usize)
-        }
-        _ => None,
     }
 }
 
-/// Accumulate the largest constant `varargin{k}` index referenced by `rvalue`.
-fn scan_varargin(rvalue: &MirRvalue, varargin_local: Option<usize>, count: &mut usize) {
+/// Accumulate the largest constant `varargin{k}` index referenced anywhere in
+/// `expr`.
+fn scan_varargin(expr: &HirExpr, varargin_local: Option<BindingId>, count: &mut usize) {
     let Some(varargin_local) = varargin_local else {
         return;
     };
-    match rvalue {
-        MirRvalue::Index {
-            base: MirOperand::Local(id),
-            indexing,
-        } => {
-            if id.0 == varargin_local && indexing.kind == IndexKind::Brace {
-                if let Some(k) = brace_index(indexing) {
-                    *count = (*count).max(k);
+    match &expr.kind {
+        HirExprKind::Index(base, indexing) => {
+            if indexing.kind == IndexKind::Brace {
+                if let HirExprKind::Binding(id) = base.kind {
+                    if id == varargin_local {
+                        if let Some(k) = brace_index(indexing) {
+                            *count = (*count).max(k);
+                        }
+                    }
+                }
+            }
+            scan_varargin(base, Some(varargin_local), count);
+            for component in &indexing.components {
+                if let IndexComponent::Expr(e) = component {
+                    scan_varargin(e, Some(varargin_local), count);
                 }
             }
         }
-        MirRvalue::ShortCircuit { right_temps, .. } => {
-            for stmt in right_temps {
-                match &stmt.kind {
-                    MirStmtKind::Assign { value, .. } | MirStmtKind::Expr(value) => {
-                        scan_varargin(value, Some(varargin_local), count)
-                    }
-                    _ => {}
+        HirExprKind::Unary(_, operand) => scan_varargin(operand, Some(varargin_local), count),
+        HirExprKind::Binary(lhs, _, rhs) => {
+            scan_varargin(lhs, Some(varargin_local), count);
+            scan_varargin(rhs, Some(varargin_local), count);
+        }
+        HirExprKind::Range(start, step, end) => {
+            scan_varargin(start, Some(varargin_local), count);
+            if let Some(step) = step {
+                scan_varargin(step, Some(varargin_local), count);
+            }
+            scan_varargin(end, Some(varargin_local), count);
+        }
+        HirExprKind::Tensor(rows) | HirExprKind::Cell(rows) => {
+            for row in rows {
+                for element in row {
+                    scan_varargin(element, Some(varargin_local), count);
                 }
+            }
+        }
+        HirExprKind::Call(call) => {
+            for arg in &call.args {
+                scan_varargin(arg, Some(varargin_local), count);
             }
         }
         _ => {}
     }
 }
 
+/// The 1-based constant index of a single-component `{}` (cell) index, if known.
+pub(crate) fn brace_index(indexing: &IndexingSemantics) -> Option<usize> {
+    match indexing.components.as_slice() {
+        [IndexComponent::Expr(expr)] => constant_expr_value(expr),
+        _ => None,
+    }
+}
+
+/// The constant `usize` value of an expression, if it is a numeric/integer
+/// literal.
+fn constant_expr_value(expr: &HirExpr) -> Option<usize> {
+    match &expr.kind {
+        HirExprKind::Number(text) => text.trim().parse::<usize>().ok(),
+        HirExprKind::IntegerLiteral(literal) => Some(literal.bits() as usize),
+        _ => None,
+    }
+}
+
+/// Strip one level of single/double quotes from a string literal (`'a'` -> `a`).
+pub(crate) fn unquote_str(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 && matches!(bytes[0], b'\'' | b'"') && bytes[bytes.len() - 1] == bytes[0] {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
+/// Whether an index component is the colon operator `:`.
+///
+/// runmat represents `a(:)` (identifier base) as
+/// `IndexComponent::Expr(HirExprKind::Colon)` and `expr(:)` (expression base)
+/// as `IndexComponent::Colon`; both must be treated uniformly.
+pub(crate) fn component_is_colon(component: &IndexComponent) -> bool {
+    match component {
+        IndexComponent::Colon => true,
+        IndexComponent::Expr(expr) => matches!(expr.kind, HirExprKind::Colon),
+        _ => false,
+    }
+}
+
+/// The relative offset of an `end` index component (`end`, `end+k`, `end-k`),
+/// or `None` if the component is not an `end` expression.
+pub(crate) fn component_end_offset(component: &IndexComponent) -> Option<isize> {
+    match component {
+        IndexComponent::End { offset, .. } => Some(*offset),
+        IndexComponent::Expr(expr) => expr_end_offset(expr),
+        _ => None,
+    }
+}
+
+/// The relative offset of an `end` expression (`end`, `end+k`, `end-k`).
+fn expr_end_offset(expr: &HirExpr) -> Option<isize> {
+    match &expr.kind {
+        HirExprKind::End => Some(0),
+        HirExprKind::Binary(lhs, op, rhs) => match op {
+            OperatorKind::Add => {
+                if matches!(lhs.kind, HirExprKind::End) {
+                    int_literal(rhs)
+                } else if matches!(rhs.kind, HirExprKind::End) {
+                    int_literal(lhs)
+                } else {
+                    None
+                }
+            }
+            OperatorKind::Subtract if matches!(lhs.kind, HirExprKind::End) => {
+                int_literal(rhs).and_then(|offset| offset.checked_neg())
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The integer value of a numeric/integer literal expression, as an `isize`.
+fn int_literal(expr: &HirExpr) -> Option<isize> {
+    match &expr.kind {
+        HirExprKind::Number(text) => text.trim().parse::<isize>().ok(),
+        HirExprKind::IntegerLiteral(literal) => Some(literal.bits() as isize),
+        _ => None,
+    }
+}
+
 /// The 1-based constant index of a `varargout{k}` write target, if `place` is
 /// `varargout{k}`.
-pub(crate) fn varargout_index(place: &MirPlace, varargout_local: Option<usize>) -> Option<usize> {
+pub(crate) fn varargout_index(
+    place: &HirPlace,
+    varargout_local: Option<BindingId>,
+) -> Option<usize> {
     let varargout_local = varargout_local?;
     match place {
-        MirPlace::Index(base, indexing) => {
-            if let MirPlace::Local(id) = &**base {
-                if id.0 == varargout_local && indexing.kind == IndexKind::Brace {
-                    return brace_index(indexing);
+        HirPlace::Index(base, indexing) | HirPlace::IndexCell(base, indexing) => {
+            if indexing.kind == IndexKind::Brace {
+                if let HirExprKind::Binding(id) = base.kind {
+                    if id == varargout_local {
+                        return brace_index(indexing);
+                    }
                 }
             }
             None
@@ -296,85 +467,84 @@ fn supported_binary(op: &OperatorKind) -> bool {
             | OperatorKind::LessEqual
             | OperatorKind::Greater
             | OperatorKind::GreaterEqual
+            | OperatorKind::ShortCircuitAnd
+            | OperatorKind::ShortCircuitOr
             | OperatorKind::ElementwiseAnd
             | OperatorKind::ElementwiseOr
     )
 }
 
 /// Resolve a callable to its source-level name, when one exists.
-pub fn call_name(callee: &MirCallee) -> Option<String> {
-    match callee {
-        MirCallee::Static(identity) => identity.display_name(),
-        _ => None,
-    }
+pub fn call_name(callee: &HirCallableRef) -> Option<String> {
+    callee
+        .identity()
+        .and_then(|identity| identity.display_name())
 }
 
-fn operand_reason(operand: &MirOperand) -> Option<String> {
-    match operand {
-        MirOperand::Local(_) => None,
-        MirOperand::Constant(constant) => match constant {
-            MirConstant::Number(_) | MirConstant::IntegerLiteral(_) | MirConstant::Bool(_) => None,
-            other => Some(format!("unsupported constant {other:?}")),
+fn expr_reason(expr: &HirExpr) -> Option<String> {
+    match &expr.kind {
+        HirExprKind::Binding(_) => None,
+        HirExprKind::Number(_) | HirExprKind::IntegerLiteral(_) => None,
+        HirExprKind::End | HirExprKind::Colon => None,
+        HirExprKind::Constant(symbol) => match symbol.0.as_str() {
+            "true" | "false" => None,
+            other => Some(format!("unsupported constant `{other}`")),
         },
-        other => Some(format!("unsupported operand {other:?}")),
-    }
-}
-
-fn rvalue_reason(value: &MirRvalue, varargout_local: Option<usize>) -> Option<String> {
-    match value {
-        MirRvalue::Use(operand) => operand_reason(operand),
-        MirRvalue::Unary(op, operand) => {
+        HirExprKind::Unary(op, operand) => {
             if supported_unary(op) {
-                operand_reason(operand)
+                expr_reason(operand)
             } else {
                 Some(format!("unsupported unary operator {op:?}"))
             }
         }
-        MirRvalue::Binary(lhs, op, rhs) => operand_reason(lhs)
-            .or_else(|| operand_reason(rhs))
-            .or_else(|| {
+        HirExprKind::Binary(lhs, op, rhs) => {
+            expr_reason(lhs).or_else(|| expr_reason(rhs)).or_else(|| {
                 if supported_binary(op) {
                     None
                 } else {
                     Some(format!("unsupported operator {op:?}"))
                 }
-            }),
-        MirRvalue::ShortCircuit {
-            left,
-            right,
-            right_temps,
-            ..
-        } => operand_reason(left)
-            .or_else(|| operand_reason(right))
-            .or_else(|| {
-                right_temps
-                    .iter()
-                    .find_map(|s| stmt_reason(s, varargout_local))
-            }),
-        MirRvalue::Aggregate { kind, .. } => match kind {
-            runmat_mir::MirAggregateKind::Tensor => None,
-            runmat_mir::MirAggregateKind::Cell => {
-                Some("cell array literals are not supported yet".to_string())
+            })
+        }
+        HirExprKind::Tensor(rows) => rows.iter().flatten().find_map(expr_reason),
+        HirExprKind::Cell(_) => Some("cell array literals are not supported yet".to_string()),
+        HirExprKind::Range(start, step, end) => expr_reason(start)
+            .or_else(|| step.as_deref().and_then(expr_reason))
+            .or_else(|| expr_reason(end)),
+        HirExprKind::Index(base, indexing) => {
+            if indexing.result_context == IndexResultContext::FunctionArgumentExpansion {
+                return Some("argument expansion (`{:}`/`varargin`) is not supported".to_string());
             }
-        },
-        MirRvalue::Call(call) => call_reason(call),
-        MirRvalue::Index { base, indexing } => operand_reason(base).or_else(|| {
-            indexing
-                .components
-                .iter()
-                .find_map(|component| match component {
-                    MirIndexComponent::Expr(operand) => operand_reason(operand),
-                    MirIndexComponent::Colon | MirIndexComponent::End { .. } => None,
-                })
-        }),
-        other => Some(format!("unsupported rvalue {other:?}")),
+            expr_reason(base).or_else(|| {
+                indexing
+                    .components
+                    .iter()
+                    .find_map(|component| match component {
+                        IndexComponent::Expr(expr) => expr_reason(expr),
+                        IndexComponent::Logical(expr) => expr_reason(expr)
+                            .or(Some("logical indexing is not supported yet".to_string())),
+                        IndexComponent::Colon | IndexComponent::End { .. } => None,
+                    })
+            })
+        }
+        HirExprKind::Member(base, _) => expr_reason(base),
+        HirExprKind::StructLiteral(fields) => {
+            fields.iter().find_map(|(_, value)| expr_reason(value))
+        }
+        HirExprKind::Call(call) => call_reason(call),
+        other => Some(format!("unsupported expression {other:?}")),
     }
 }
 
-fn call_reason(call: &MirCall) -> Option<String> {
+fn call_reason(call: &HirCall) -> Option<String> {
     let Some(name) = call_name(&call.callee) else {
         return Some("dynamic or non-static function call is not supported".to_string());
     };
+    // `struct('a', 1, ...)` is a special constructor: alternating string field
+    // names and values.
+    if name == "struct" {
+        return struct_reason(call);
+    }
     let Some(builtin) = builtins::lookup(&name) else {
         return Some(format!(
             "unsupported builtin `{name}` (deferred to runtime)"
@@ -386,65 +556,70 @@ fn call_reason(call: &MirCall) -> Option<String> {
             call.args.len()
         ));
     }
-    call.args.iter().find_map(|arg| match arg {
-        MirCallArg::Single(operand) => operand_reason(operand),
-        MirCallArg::Expansion { .. } => {
-            Some("argument expansion (`{:}`/`varargin`) is not supported".to_string())
-        }
-    })
+    call.args.iter().find_map(expr_reason)
 }
 
-fn stmt_reason(stmt: &MirStmt, varargout_local: Option<usize>) -> Option<String> {
+/// Whether a `struct(...)` construction is lowerable: alternating string field
+/// names and lowerable values.
+fn struct_reason(call: &HirCall) -> Option<String> {
+    let mut args = call.args.iter();
+    while let Some(name_arg) = args.next() {
+        if !matches!(name_arg.kind, HirExprKind::String(_)) {
+            return Some("struct field names must be string literals".to_string());
+        }
+        let Some(value_arg) = args.next() else {
+            return Some("struct requires a value for every field".to_string());
+        };
+        if let Some(reason) = expr_reason(value_arg) {
+            return Some(reason);
+        }
+    }
+    None
+}
+
+/// Whether a statement itself (excluding its nested sub-statements) is
+/// lowerable.
+fn stmt_reason(stmt: &HirStmt, varargout_local: Option<BindingId>) -> Option<String> {
     match &stmt.kind {
-        MirStmtKind::Assign { place, value } => {
-            // A `varargout{k}` target is a local cell element write; the value
-            // still has to be lowerable. A plain `Local` target is the norm.
+        HirStmtKind::ExprStmt(expr, _) => expr_reason(expr),
+        HirStmtKind::Assign(place, value, _) => {
+            // A `varargout{k}` target is a cell element write; a plain `Binding`
+            // target is the norm; a `Member` target is a struct field write.
             if varargout_index(place, varargout_local).is_some()
-                || matches!(place, MirPlace::Local(_))
+                || matches!(place, HirPlace::Binding(_))
             {
-                rvalue_reason(value, varargout_local)
+                expr_reason(value)
+            } else if let HirPlace::Member(base, _) = place {
+                expr_reason(base).or_else(|| expr_reason(value))
             } else {
                 Some(format!("non-local assignment target {place:?}"))
             }
         }
-        MirStmtKind::Expr(value) => rvalue_reason(value, varargout_local),
-        // `varargout{k}` array-creation place mutations are folded away; any
-        // other place mutation is unsupported.
-        MirStmtKind::PlaceMutation(mutation) => {
-            match varargout_index(&mutation.place, varargout_local) {
-                Some(_) => None,
-                None => Some(format!("unsupported place mutation {:?}", mutation.kind)),
-            }
+        HirStmtKind::If { cond, .. } => expr_reason(cond),
+        HirStmtKind::While { cond, .. } => expr_reason(cond),
+        HirStmtKind::For { range, .. } => expr_reason(range),
+        HirStmtKind::Switch { expr, cases, .. } => {
+            expr_reason(expr).or_else(|| cases.iter().find_map(|(case, _)| expr_reason(case)))
         }
+        HirStmtKind::MultiAssign(..) => {
+            Some("multi-assignment (`[a, b] = f()`) is not supported".to_string())
+        }
+        HirStmtKind::TryCatch { .. } => Some("try/catch is not supported".to_string()),
+        HirStmtKind::Global(_) | HirStmtKind::Persistent(_) => None,
+        HirStmtKind::Break | HirStmtKind::Continue => None,
+        HirStmtKind::Return | HirStmtKind::Import(_) => None,
         other => Some(format!("unsupported statement {other:?}")),
     }
 }
 
-fn terminator_reason(terminator: &MirTerminator) -> Option<String> {
-    match &terminator.kind {
-        MirTerminatorKind::Return(operands) => operands.iter().find_map(operand_reason),
-        MirTerminatorKind::Goto(_) | MirTerminatorKind::Unreachable => None,
-        MirTerminatorKind::Branch { cond, .. } => operand_reason(cond),
-        MirTerminatorKind::Switch { discr, cases, .. } => operand_reason(discr)
-            .or_else(|| cases.iter().find_map(|(case, _)| operand_reason(case))),
-        MirTerminatorKind::For { iterable, .. } => match iterable {
-            MirRvalue::Range { start, step, end } => operand_reason(start)
-                .or_else(|| step.as_ref().and_then(operand_reason))
-                .or_else(|| operand_reason(end)),
-            other => Some(format!("unsupported for-loop iterable {other:?}")),
-        },
-        other => Some(format!("unsupported terminator {other:?}")),
-    }
-}
-
-/// The codegen boundary: decide whether a body is statically lowerable.
+/// The codegen boundary: decide whether a function is statically lowerable.
 ///
 /// This is the seam where `runmat-static-analysis` (type/shape inference,
 /// definite assignment) will plug in to replace the operator whitelist and
 /// cover the architecture's type-determined / shape-controlled / closed-world
 /// criteria.
 pub trait Classifier {
-    fn classify(&self, body: &MirBody) -> Verdict;
+    fn classify(&self, function: &HirFunction) -> Verdict;
 }
 
 /// The current classifier: a hand-written whitelist of the scalar-double
@@ -453,31 +628,36 @@ pub trait Classifier {
 pub struct WhitelistClassifier;
 
 impl Classifier for WhitelistClassifier {
-    fn classify(&self, body: &MirBody) -> Verdict {
-        let variadics = Variadics::compute(body);
-        for block in &body.blocks {
-            for stmt in &block.statements {
-                if let Some(reason) = stmt_reason(stmt, variadics.varargout_local) {
-                    return Verdict::Deferred { reason };
-                }
+    fn classify(&self, function: &HirFunction) -> Verdict {
+        let variadics = Variadics::compute(function);
+
+        let mut reason = None;
+        for_each_stmt(&function.body.statements, &mut |stmt| {
+            if reason.is_none() {
+                reason = stmt_reason(stmt, variadics.varargout_local);
             }
-            if let Some(reason) = terminator_reason(&block.terminator) {
-                return Verdict::Deferred { reason };
-            }
+        });
+        if let Some(reason) = reason {
+            return Verdict::Deferred { reason };
         }
 
         // Shape analysis must fully resolve every local; anything dynamic
         // (`LocalTy::Dynamic` or a dynamic-shape array) crosses the static
         // boundary and is deferred to the runtime.
-        for (local, ty) in infer_locals(body) {
+        for (local, ty) in infer_locals(function) {
             let is_dynamic = match ty {
                 LocalTy::Dynamic => true,
                 LocalTy::Array { shape } => shape.is_dynamic(),
+                // Struct fields must be fully static; a dynamic field defers the
+                // whole struct.
+                LocalTy::Struct { fields } => fields
+                    .iter()
+                    .any(|(_, field_ty)| matches!(field_ty, LocalTy::Dynamic)),
                 LocalTy::Scalar => false,
             };
             if is_dynamic {
                 return Verdict::Deferred {
-                    reason: format!("unresolved shape for local {local}"),
+                    reason: format!("unresolved shape for local {}", local.0),
                 };
             }
         }
@@ -486,87 +666,357 @@ impl Classifier for WhitelistClassifier {
     }
 }
 
-/// Classify a MIR body with the default ([`WhitelistClassifier`]) classifier.
-pub fn classify(body: &MirBody) -> Verdict {
-    WhitelistClassifier.classify(body)
+/// Classify a HIR function with the default ([`WhitelistClassifier`]) classifier.
+pub fn classify(function: &HirFunction) -> Verdict {
+    WhitelistClassifier.classify(function)
+}
+
+/// Recursively visit every statement in `stmts` (descending into nested
+/// control-flow bodies).
+fn for_each_stmt<'a>(stmts: &'a [HirStmt], visit: &mut dyn FnMut(&'a HirStmt)) {
+    for stmt in stmts {
+        visit(stmt);
+        match &stmt.kind {
+            HirStmtKind::If {
+                then_body,
+                elseif_blocks,
+                else_body,
+                ..
+            } => {
+                for_each_stmt(&then_body.statements, visit);
+                for (_, block) in elseif_blocks {
+                    for_each_stmt(&block.statements, visit);
+                }
+                if let Some(block) = else_body {
+                    for_each_stmt(&block.statements, visit);
+                }
+            }
+            HirStmtKind::While { body, .. } | HirStmtKind::For { body, .. } => {
+                for_each_stmt(&body.statements, visit);
+            }
+            HirStmtKind::Switch {
+                cases, otherwise, ..
+            } => {
+                for (_, block) in cases {
+                    for_each_stmt(&block.statements, visit);
+                }
+                if let Some(block) = otherwise {
+                    for_each_stmt(&block.statements, visit);
+                }
+            }
+            HirStmtKind::TryCatch {
+                try_body,
+                catch_body,
+                ..
+            } => {
+                for_each_stmt(&try_body.statements, visit);
+                for_each_stmt(&catch_body.statements, visit);
+            }
+            _ => {}
+        }
+    }
 }
 
 // --- Lightweight local type / shape inference ---------------------------------
 
-/// Infer the static type of every local in `body`.
+/// Infer the static type of every local in `function`.
 ///
 /// Parameters default to [`LocalTy::Scalar`] (the MVP has no
 /// `runmat-static-analysis`, so array-typed parameters are out of scope and are
-/// treated as scalars). Array shapes are only known for tensor `Aggregate`
-/// literals; elementwise built-ins preserve their argument's shape; reductions
-/// produce a scalar. Anything else resolves to [`LocalTy::Dynamic`].
-pub fn infer_locals(body: &MirBody) -> HashMap<usize, LocalTy> {
-    let variadics = Variadics::compute(body);
+/// treated as scalars). Array shapes are only known for tensor literals;
+/// elementwise built-ins preserve their argument's shape; reductions produce a
+/// scalar. Anything else resolves to [`LocalTy::Dynamic`].
+pub fn infer_locals(function: &HirFunction) -> HashMap<BindingId, LocalTy> {
+    let variadics = Variadics::compute(function);
     let mut tys = HashMap::new();
 
-    for local in &body.locals {
-        if let Some(binding) = local.binding {
-            if body.abi.fixed_inputs.contains(&binding) {
-                tys.insert(local.id.0, LocalTy::Scalar);
-            }
-        }
+    for binding in &function.abi.fixed_inputs {
+        tys.insert(*binding, LocalTy::Scalar);
     }
 
-    for block in &body.blocks {
-        for stmt in &block.statements {
-            if let MirStmtKind::Assign { place, value } = &stmt.kind {
-                let MirPlace::Local(target) = place else {
-                    continue;
-                };
-                let ty = rvalue_ty(value, &tys, variadics.varargin_local);
-                tys.insert(target.0, ty);
-            }
-        }
-    }
+    // Promote untyped parameters to structs based on their field-access usage,
+    // so `function y = f(s); y = s.a + s.b; end` compiles without an explicit
+    // type annotation (mirroring MATLAB Coder's use-site struct inference).
+    infer_struct_params(function, &mut tys);
+
+    infer_block(&function.body.statements, &variadics, &mut tys);
 
     tys
 }
 
-fn operand_ty(operand: &MirOperand, tys: &HashMap<usize, LocalTy>) -> LocalTy {
-    match operand {
-        MirOperand::Local(id) => tys.get(&id.0).copied().unwrap_or(LocalTy::Scalar),
-        MirOperand::Constant(_) => LocalTy::Scalar,
-        _ => LocalTy::Dynamic,
+/// Infer struct types for fixed-input parameters that still carry the default
+/// `Scalar` type, by scanning field reads (`s.a`) and writes (`s.a = ...`).
+/// Fields are collected in first-seen order; every field is `Scalar` for now
+/// (struct fields are scalar-only in the current lowering).
+fn infer_struct_params(function: &HirFunction, tys: &mut HashMap<BindingId, LocalTy>) {
+    let params: HashSet<BindingId> = function
+        .abi
+        .fixed_inputs
+        .iter()
+        .copied()
+        .filter(|id| matches!(tys.get(id), Some(LocalTy::Scalar)))
+        .collect();
+    if params.is_empty() {
+        return;
+    }
+
+    let mut fields: HashMap<BindingId, Vec<(String, LocalTy)>> = HashMap::new();
+    for id in &params {
+        fields.insert(*id, Vec::new());
+    }
+    collect_stmt_fields(&function.body.statements, &params, &mut fields);
+
+    for (id, field_list) in fields {
+        if field_list.is_empty() {
+            continue;
+        }
+        tys.insert(id, LocalTy::Struct { fields: field_list });
     }
 }
 
-fn rvalue_ty(
-    value: &MirRvalue,
-    tys: &HashMap<usize, LocalTy>,
-    varargin_local: Option<usize>,
-) -> LocalTy {
-    match value {
-        MirRvalue::Use(operand) => operand_ty(operand, tys),
-        MirRvalue::Unary(op, operand) => unary_ty(*op, operand_ty(operand, tys)),
-        MirRvalue::Binary(lhs, op, rhs) => {
-            binary_ty(operand_ty(lhs, tys), *op, operand_ty(rhs, tys))
+/// Record `name` as a scalar field of struct parameter `id`, if `id` is one of
+/// the parameters under inference and the field is not already recorded.
+fn record_struct_field(
+    id: BindingId,
+    name: &str,
+    params: &HashSet<BindingId>,
+    fields: &mut HashMap<BindingId, Vec<(String, LocalTy)>>,
+) {
+    if !params.contains(&id) {
+        return;
+    }
+    let list = fields.entry(id).or_default();
+    if !list.iter().any(|(n, _)| n == name) {
+        list.push((name.to_string(), LocalTy::Scalar));
+    }
+}
+
+/// Scan statements for struct-field access on parameters under inference.
+fn collect_stmt_fields(
+    stmts: &[HirStmt],
+    params: &HashSet<BindingId>,
+    fields: &mut HashMap<BindingId, Vec<(String, LocalTy)>>,
+) {
+    for stmt in stmts {
+        match &stmt.kind {
+            HirStmtKind::ExprStmt(expr, _) => collect_expr_fields(expr, params, fields),
+            HirStmtKind::Assign(place, value, _) => {
+                collect_place_fields(place, params, fields);
+                collect_expr_fields(value, params, fields);
+            }
+            HirStmtKind::If {
+                cond,
+                then_body,
+                elseif_blocks,
+                else_body,
+            } => {
+                collect_expr_fields(cond, params, fields);
+                collect_stmt_fields(&then_body.statements, params, fields);
+                for (cond, block) in elseif_blocks {
+                    collect_expr_fields(cond, params, fields);
+                    collect_stmt_fields(&block.statements, params, fields);
+                }
+                if let Some(block) = else_body {
+                    collect_stmt_fields(&block.statements, params, fields);
+                }
+            }
+            HirStmtKind::While { cond, body } => {
+                collect_expr_fields(cond, params, fields);
+                collect_stmt_fields(&body.statements, params, fields);
+            }
+            HirStmtKind::For { range, body, .. } => {
+                collect_expr_fields(range, params, fields);
+                collect_stmt_fields(&body.statements, params, fields);
+            }
+            HirStmtKind::Switch {
+                expr,
+                cases,
+                otherwise,
+                ..
+            } => {
+                collect_expr_fields(expr, params, fields);
+                for (case, block) in cases {
+                    collect_expr_fields(case, params, fields);
+                    collect_stmt_fields(&block.statements, params, fields);
+                }
+                if let Some(block) = otherwise {
+                    collect_stmt_fields(&block.statements, params, fields);
+                }
+            }
+            _ => {}
         }
-        MirRvalue::ShortCircuit { .. } => LocalTy::Scalar,
-        MirRvalue::Aggregate {
-            kind, rows, cols, ..
-        } => match kind {
-            runmat_mir::MirAggregateKind::Tensor => LocalTy::Array {
-                shape: Shape::matrix(*rows, *cols),
-            },
-            runmat_mir::MirAggregateKind::Cell => LocalTy::Dynamic,
+    }
+}
+
+/// Scan a `HirPlace` for struct-field writes on parameters under inference.
+fn collect_place_fields(
+    place: &HirPlace,
+    params: &HashSet<BindingId>,
+    fields: &mut HashMap<BindingId, Vec<(String, LocalTy)>>,
+) {
+    match place {
+        HirPlace::Member(base, name) => {
+            if let HirExprKind::Binding(id) = base.kind {
+                record_struct_field(id, &name.0, params, fields);
+            }
+            collect_expr_fields(base, params, fields);
+        }
+        HirPlace::MemberDynamic(base, expr) => {
+            collect_expr_fields(base, params, fields);
+            collect_expr_fields(expr, params, fields);
+        }
+        HirPlace::Index(base, indexing) | HirPlace::IndexCell(base, indexing) => {
+            collect_expr_fields(base, params, fields);
+            for component in &indexing.components {
+                if let IndexComponent::Expr(e) = component {
+                    collect_expr_fields(e, params, fields);
+                }
+            }
+        }
+        HirPlace::Binding(_) => {}
+    }
+}
+
+/// Scan an expression for struct-field reads on parameters under inference.
+fn collect_expr_fields(
+    expr: &HirExpr,
+    params: &HashSet<BindingId>,
+    fields: &mut HashMap<BindingId, Vec<(String, LocalTy)>>,
+) {
+    match &expr.kind {
+        HirExprKind::Member(base, name) => {
+            if let HirExprKind::Binding(id) = base.kind {
+                record_struct_field(id, &name.0, params, fields);
+            }
+            collect_expr_fields(base, params, fields);
+        }
+        HirExprKind::Unary(_, operand) => collect_expr_fields(operand, params, fields),
+        HirExprKind::Binary(lhs, _, rhs) => {
+            collect_expr_fields(lhs, params, fields);
+            collect_expr_fields(rhs, params, fields);
+        }
+        HirExprKind::Index(base, indexing) => {
+            collect_expr_fields(base, params, fields);
+            for component in &indexing.components {
+                if let IndexComponent::Expr(e) = component {
+                    collect_expr_fields(e, params, fields);
+                }
+            }
+        }
+        HirExprKind::Range(start, step, end) => {
+            collect_expr_fields(start, params, fields);
+            if let Some(step) = step {
+                collect_expr_fields(step, params, fields);
+            }
+            collect_expr_fields(end, params, fields);
+        }
+        HirExprKind::Tensor(rows) | HirExprKind::Cell(rows) => {
+            for row in rows {
+                for element in row {
+                    collect_expr_fields(element, params, fields);
+                }
+            }
+        }
+        HirExprKind::Call(call) => {
+            for arg in &call.args {
+                collect_expr_fields(arg, params, fields);
+            }
+        }
+        HirExprKind::StructLiteral(pairs) => {
+            for (_, value) in pairs {
+                collect_expr_fields(value, params, fields);
+            }
+        }
+        HirExprKind::ObjectLiteral { fields: pairs, .. } => {
+            for (_, value) in pairs {
+                collect_expr_fields(value, params, fields);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn infer_block(stmts: &[HirStmt], variadics: &Variadics, tys: &mut HashMap<BindingId, LocalTy>) {
+    for stmt in stmts {
+        match &stmt.kind {
+            HirStmtKind::Assign(HirPlace::Binding(target), value, _) => {
+                let ty = expr_ty(value, tys, variadics.varargin_local);
+                tys.insert(*target, ty);
+            }
+            HirStmtKind::If {
+                then_body,
+                elseif_blocks,
+                else_body,
+                ..
+            } => {
+                infer_block(&then_body.statements, variadics, tys);
+                for (_, block) in elseif_blocks {
+                    infer_block(&block.statements, variadics, tys);
+                }
+                if let Some(block) = else_body {
+                    infer_block(&block.statements, variadics, tys);
+                }
+            }
+            HirStmtKind::While { body, .. } | HirStmtKind::For { body, .. } => {
+                infer_block(&body.statements, variadics, tys);
+            }
+            HirStmtKind::Switch {
+                cases, otherwise, ..
+            } => {
+                for (_, block) in cases {
+                    infer_block(&block.statements, variadics, tys);
+                }
+                if let Some(block) = otherwise {
+                    infer_block(&block.statements, variadics, tys);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+pub(crate) fn expr_ty(
+    expr: &HirExpr,
+    tys: &HashMap<BindingId, LocalTy>,
+    varargin_local: Option<BindingId>,
+) -> LocalTy {
+    match &expr.kind {
+        HirExprKind::Binding(id) => tys.get(id).cloned().unwrap_or(LocalTy::Scalar),
+        HirExprKind::Number(_) | HirExprKind::IntegerLiteral(_) => LocalTy::Scalar,
+        HirExprKind::Constant(symbol) => match symbol.0.as_str() {
+            "true" | "false" => LocalTy::Scalar,
+            _ => LocalTy::Dynamic,
         },
-        MirRvalue::Call(call) => call_ty(call, tys),
-        MirRvalue::Index { base, indexing } => {
+        HirExprKind::Unary(op, operand) => unary_ty(*op, expr_ty(operand, tys, varargin_local)),
+        HirExprKind::Binary(lhs, op, rhs) => binary_ty(
+            expr_ty(lhs, tys, varargin_local),
+            *op,
+            expr_ty(rhs, tys, varargin_local),
+        ),
+        HirExprKind::Tensor(rows) => LocalTy::Array {
+            shape: Shape::matrix(rows.len(), rows.first().map_or(0, |row| row.len())),
+        },
+        HirExprKind::Cell(_) => LocalTy::Dynamic,
+        HirExprKind::Call(call) => call_ty(call, tys),
+        HirExprKind::Member(base, name) => match expr_ty(base, tys, varargin_local) {
+            LocalTy::Struct { fields } => fields
+                .iter()
+                .find(|(field, _)| field == &name.0)
+                .map(|(_, ty)| ty.clone())
+                .unwrap_or(LocalTy::Dynamic),
+            _ => LocalTy::Dynamic,
+        },
+        HirExprKind::Index(base, indexing) => {
             // `varargin{k}` (constant `k`) resolves to a scalar extra argument.
-            if let MirOperand::Local(id) = base {
-                if varargin_local == Some(id.0)
+            if let HirExprKind::Binding(id) = base.kind {
+                if varargin_local == Some(id)
                     && indexing.kind == IndexKind::Brace
                     && brace_index(indexing).is_some()
                 {
                     return LocalTy::Scalar;
                 }
             }
-            index_ty(operand_ty(base, tys), indexing)
+            index_ty(expr_ty(base, tys, varargin_local), indexing)
         }
         _ => LocalTy::Dynamic,
     }
@@ -608,7 +1058,7 @@ fn unary_ty(op: OperatorKind, ty: LocalTy) -> LocalTy {
         // Unary minus/plus/not preserve the shape elementwise.
         (_, LocalTy::Array { shape }) => LocalTy::Array { shape },
         (_, LocalTy::Scalar) => LocalTy::Scalar,
-        (_, LocalTy::Dynamic) => LocalTy::Dynamic,
+        (_, LocalTy::Struct { .. }) | (_, LocalTy::Dynamic) => LocalTy::Dynamic,
     }
 }
 
@@ -617,7 +1067,7 @@ fn binary_ty(lhs: LocalTy, op: OperatorKind, rhs: LocalTy) -> LocalTy {
 
     match (lhs, rhs) {
         (Scalar, Scalar) => Scalar,
-        (Dynamic, _) | (_, Dynamic) => Dynamic,
+        (Struct { .. }, _) | (_, Struct { .. }) | (Dynamic, _) | (_, Dynamic) => Dynamic,
         // Matrix power `A ^ scalar` keeps `A`'s shape (a square matrix).
         (Array { shape }, Scalar) if op == OperatorKind::MatrixPower => Array { shape },
         // `scalar ^ matrix` is `expm`; not statically lowerable.
@@ -655,10 +1105,15 @@ fn matmul_ty(lhs: Shape, rhs: Shape) -> LocalTy {
     }
 }
 
-fn call_ty(call: &MirCall, tys: &HashMap<usize, LocalTy>) -> LocalTy {
+fn call_ty(call: &HirCall, tys: &HashMap<BindingId, LocalTy>) -> LocalTy {
     let Some(name) = call_name(&call.callee) else {
         return LocalTy::Dynamic;
     };
+    // `struct('a', 1, 'b', 2, ...)` constructs a struct with alternating
+    // field-name/field-value arguments.
+    if name == "struct" {
+        return struct_ty(call, tys);
+    }
     let Some(builtin) = builtins::lookup(&name) else {
         return LocalTy::Dynamic;
     };
@@ -666,15 +1121,12 @@ fn call_ty(call: &MirCall, tys: &HashMap<usize, LocalTy>) -> LocalTy {
     let args: Vec<LocalTy> = call
         .args
         .iter()
-        .map(|arg| match arg {
-            MirCallArg::Single(operand) => operand_ty(operand, tys),
-            MirCallArg::Expansion { .. } => LocalTy::Dynamic,
-        })
+        .map(|arg| expr_ty(arg, tys, None))
         .collect();
 
     match builtin {
         // Elementwise unary: preserves the argument's shape.
-        Builtin::Unary(_) => args.first().copied().unwrap_or(LocalTy::Dynamic),
+        Builtin::Unary(_) => args.first().cloned().unwrap_or(LocalTy::Dynamic),
         // Reductions: one array argument reduces to a scalar; a second numeric
         // argument selects the dimension to reduce along (array result).
         Builtin::MinMax(_) | Builtin::Reduce(_) => match args.as_slice() {
@@ -719,27 +1171,38 @@ fn call_ty(call: &MirCall, tys: &HashMap<usize, LocalTy>) -> LocalTy {
     }
 }
 
-/// The constant `usize` value of the `index`-th argument of a call, if present.
-fn constant_arg(call: &MirCall, index: usize) -> Option<usize> {
-    match call.args.get(index) {
-        Some(MirCallArg::Single(MirOperand::Constant(MirConstant::Number(text)))) => {
-            text.trim().parse::<usize>().ok()
-        }
-        _ => None,
+/// The type of a `struct('a', 1, 'b', 2, ...)` construction: alternating
+/// field-name (`String`) / field-value arguments, in declaration order.
+fn struct_ty(call: &HirCall, tys: &HashMap<BindingId, LocalTy>) -> LocalTy {
+    let mut fields = Vec::new();
+    let mut args = call.args.iter();
+    while let Some(name_arg) = args.next() {
+        let Some(value_arg) = args.next() else {
+            return LocalTy::Dynamic;
+        };
+        let HirExprKind::String(field_name) = &name_arg.kind else {
+            return LocalTy::Dynamic;
+        };
+        let field_ty = expr_ty(value_arg, tys, None);
+        fields.push((unquote_str(&field_name.0).to_string(), field_ty));
     }
+    if fields.is_empty() {
+        return LocalTy::Dynamic;
+    }
+    LocalTy::Struct { fields }
+}
+
+/// The constant `usize` value of the `index`-th argument of a call, if present.
+fn constant_arg(call: &HirCall, index: usize) -> Option<usize> {
+    call.args.get(index).and_then(constant_expr_value)
 }
 
 /// The 1-based dimension argument of a reduction call, if present and constant.
-fn reduction_dim(call: &MirCall) -> Option<usize> {
+fn reduction_dim(call: &HirCall) -> Option<usize> {
     if call.args.len() < 2 {
         return None;
     }
-    match &call.args[1] {
-        MirCallArg::Single(MirOperand::Constant(MirConstant::Number(text))) => {
-            text.trim().parse::<usize>().ok()
-        }
-        _ => None,
-    }
+    constant_expr_value(&call.args[1])
 }
 
 /// The shape of reducing a 2-D array along dimension `dim` (1 or 2).
@@ -761,19 +1224,14 @@ fn reduce_axis_ty(shape: Shape, dim: usize) -> LocalTy {
 }
 
 /// The type of an indexing expression `base(...)`.
-fn index_ty(base: LocalTy, indexing: &MirIndexing) -> LocalTy {
+fn index_ty(base: LocalTy, indexing: &IndexingSemantics) -> LocalTy {
     let LocalTy::Array { shape } = base else {
         return LocalTy::Dynamic;
     };
-    let has_colon = indexing
-        .components
-        .iter()
-        .any(|component| matches!(component, MirIndexComponent::Colon));
+    let has_colon = indexing.components.iter().any(component_is_colon);
     if has_colon {
         // `A(:)` flattens to a column vector; other slices are deferred.
-        if indexing.components.len() == 1
-            && matches!(indexing.components[0], MirIndexComponent::Colon)
-        {
+        if indexing.components.len() == 1 && component_is_colon(&indexing.components[0]) {
             LocalTy::Array {
                 shape: Shape::matrix(shape.numel(), 1),
             }
@@ -781,8 +1239,18 @@ fn index_ty(base: LocalTy, indexing: &MirIndexing) -> LocalTy {
             LocalTy::Dynamic
         }
     } else {
-        // Constant or `end` subscript reads produce a scalar.
-        LocalTy::Scalar
+        // A scalar subscript read requires every component to be a constant or
+        // `end`. Anything else (variable subscript or logical indexing) is
+        // deferred to the runtime.
+        let all_static = indexing.components.iter().all(|component| {
+            component_end_offset(component).is_some()
+                || matches!(component, IndexComponent::Expr(expr) if constant_expr_value(expr).is_some())
+        });
+        if all_static {
+            LocalTy::Scalar
+        } else {
+            LocalTy::Dynamic
+        }
     }
 }
 

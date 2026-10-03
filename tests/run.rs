@@ -925,3 +925,127 @@ fn run_varargout_two() {
         "4 6",
     );
 }
+
+#[test]
+fn run_break_sum() {
+    // `break` exits the `for` loop once `i > 3`, so `y = 1 + 2 + 3 = 6`.
+    run_exact(
+        "break_sum",
+        "double break_sum(double);",
+        "printf(\"%g\\n\", break_sum(10.0));",
+        "6",
+    );
+}
+
+#[test]
+fn run_continue_sum() {
+    // `continue` skips `i == 2`, so `y = 1 + 3 + 4 = 8` (for `n = 4`).
+    run_exact(
+        "continue_sum",
+        "double continue_sum(double);",
+        "printf(\"%g\\n\", continue_sum(4.0));",
+        "8",
+    );
+}
+
+#[test]
+fn run_while_break() {
+    // `break` exits the `while` loop once `i > 3`, so `y = 1 + 2 + 3 = 6`.
+    run_exact(
+        "while_break",
+        "double while_break(double);",
+        "printf(\"%g\\n\", while_break(10.0));",
+        "6",
+    );
+}
+
+#[test]
+fn run_persistent_counter() {
+    // `persistent` maps to a C `static`, so `count` retains its value across
+    // calls: `counter(1)` -> 1, then `counter(2)` -> 3.
+    run_exact(
+        "counter",
+        "double counter(double);",
+        "double a = counter(1.0);\n    double b = counter(2.0);\n    printf(\"%g %g\\n\", a, b);",
+        "1 3",
+    );
+}
+
+#[test]
+fn run_global_counter() {
+    // `global` (single-function world) also maps to a C `static`.
+    run_exact(
+        "global_count",
+        "double global_count(double);",
+        "double a = global_count(1.0);\n    double b = global_count(2.0);\n    printf(\"%g %g\\n\", a, b);",
+        "1 3",
+    );
+}
+
+#[test]
+fn run_heap_allocation() {
+    // A `100x50` array (5000 elements) is heap-allocated and still reads
+    // correctly (`a(1)` == 1).
+    run_exact(
+        "big_array",
+        "double big_array();",
+        "printf(\"%g\\n\", big_array());",
+        "1",
+    );
+}
+
+#[test]
+fn run_struct_field_access() {
+    // `struct('a', 1, 'b', 2)`, then `s.a = 10`, so `y = 10 + 2 = 12`.
+    run_exact(
+        "struct_test",
+        "double struct_test();",
+        "printf(\"%g\\n\", struct_test());",
+        "12",
+    );
+}
+
+#[test]
+fn run_struct_return() {
+    // A function can return a struct by value.
+    run_exact(
+        "make_struct",
+        "struct s0 { double x; double y; };\nstruct s0 make_struct();",
+        "auto s = make_struct();\n    printf(\"%g %g\\n\", s.x, s.y);",
+        "1 2",
+    );
+}
+
+#[test]
+fn run_struct_arg() {
+    // A function can take a struct parameter by value; its fields are inferred
+    // from use (`s.a + s.b`), mirroring MATLAB Coder.
+    run_exact(
+        "struct_arg",
+        "struct s0 { double a; double b; };\ndouble struct_arg(struct s0);",
+        "struct s0 s{3.0, 4.0};\n    printf(\"%g\\n\", struct_arg(s));",
+        "7",
+    );
+}
+
+#[test]
+fn run_struct_mix() {
+    // A function can return a struct and a scalar together (tuple ABI).
+    run_exact(
+        "struct_mix",
+        "struct s0 { double x; double y; };\nstd::tuple<struct s0, double> struct_mix();",
+        "auto [s, n] = struct_mix();\n    printf(\"%g %g %g\\n\", s.x, s.y, n);",
+        "1 2 3",
+    );
+}
+
+#[test]
+fn run_struct_inout() {
+    // A struct parameter and struct return: copy in, transform, copy out.
+    run_exact(
+        "struct_inout",
+        "struct s0 { double a; double b; };\nstruct s0 struct_inout(struct s0);",
+        "struct s0 s{5.0, 7.0};\n    auto t = struct_inout(s);\n    printf(\"%g %g\\n\", t.a, t.b);",
+        "6 7",
+    );
+}

@@ -1,4 +1,4 @@
-//! Layer 1: read `.m` sources and drive the runmat frontend to produce MIR.
+//! Layer 1: read `.m` sources and drive the runmat frontend to produce HIR.
 
 use std::fs;
 use std::path::Path;
@@ -24,11 +24,12 @@ impl SourceFile {
     }
 }
 
-/// Parse a source file through the runmat frontend into MIR.
+/// Parse a source file through the runmat frontend into HIR.
 ///
-/// Pipeline: `runmat_parser::parse` -> `runmat_hir::lower` ->
-/// `runmat_mir::lowering::lower_assembly`.
-pub fn parse_mir(source: &SourceFile) -> Result<runmat_mir::MirAssembly> {
+/// Pipeline: `runmat_parser::parse` -> `runmat_hir::lower` (name resolution,
+/// operator desugaring). HIR is convmat's input boundary: it is structured,
+/// name-resolved, and type/shape information is carried at the binding level.
+pub fn parse_hir(source: &SourceFile) -> Result<runmat_hir::HirAssembly> {
     use std::collections::HashMap;
 
     let program =
@@ -37,6 +38,5 @@ pub fn parse_mir(source: &SourceFile) -> Result<runmat_mir::MirAssembly> {
     let context = runmat_hir::LoweringContext::new(&variables);
     let lowering = runmat_hir::lower(&program, &context)
         .map_err(|e| Error::Frontend(format!("HIR lowering: {e}")))?;
-    runmat_mir::lowering::lower_assembly(&lowering.assembly)
-        .map_err(|e| Error::Frontend(format!("MIR lowering: {e}")))
+    Ok(lowering.assembly)
 }
