@@ -14,7 +14,11 @@
 | `varargin{k}` 变量下标 | defer（无法特化） | `triage::rvalue_ty` / `mir_to_mlir::lower_index_scalar` |
 | `varargout{k}` 赋数组 | defer（仅标量特化） | `triage::stmt_reason` |
 | 参数展开 `{:}` / cell 展开 | 报错 `argument expansion ({:}/varargin) is not supported` | `triage::call_reason` |
-| 动态 / 非静态调用（`feval`、函数句柄、匿名函数 `@`、字符串调用） | 报错 `dynamic or non-static function call is not supported` | `triage::call_reason`（`call_name` 返回 `None`） |
+| 匿名函数句柄 `f = @(x) …`（同作用域、不逃逸、标量参数/捕获） | 支持：编译期特化 + 捕获按创建时快照作为额外形参（见 `docs/architecture.md` §4、§13） | `triage::analyze_handles`、`hir_to_mlir::lower_handle_creation`/`lower_handle_call` |
+| 逃逸的函数句柄（作为返回值/实参、存入容器、赋值给其他变量、参与非调用表达式）、在控制流内定义的句柄 | 报错 `function handle N escapes …` / `… defined inside control flow …` | `triage::analyze_handles`、`triage::check_handle_uses_*` |
+| 匿名函数的数组实参/捕获/返回值 | 报错 `arguments must be scalar` / `captures must be scalar` / `must return a scalar` | `hir_to_mlir::lower_handle_call`/`lower_handle_creation` |
+| 命名函数句柄 `@f`、内建句柄 `@sin`、立即调用 `(@(x) …)(3)` | 报错 `unsupported expression FunctionHandle(...)` / `unsupported expression AnonymousFunction(...)` | `triage::expr_reason`（非赋值位置的 `AnonymousFunction`/`FunctionHandle`） |
+| 动态 / 非静态调用（`feval`、多返回值句柄调用、字符串调用） | 报错 `dynamic or non-static function call is not supported` | `triage::call_reason`（`call_name` 返回 `None`） |
 | `eval` / `evalin` / `assignin` | 边界外构造（设计上排除，见 §4） | 架构决策，未显式检测 |
 
 ## 2. 动态类型与容器

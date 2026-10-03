@@ -114,3 +114,77 @@ fn matrix_sort_rejected() {
     // `sort` on a matrix (column sort) is not supported yet; only vectors.
     assert_not_lowerable("sort_matrix", "sort is only supported for vectors");
 }
+
+#[test]
+fn anonymous_function_escape_rejected() {
+    // Returning an anonymous-function handle needs the dynamic closure tier.
+    assert_not_lowerable("anon_escape", "escapes as a return value");
+}
+
+#[test]
+fn anonymous_function_array_argument_rejected() {
+    // A scalar-parameter lambda called with an array would be truncated to the
+    // first element, so it is rejected rather than miscompiled.
+    assert_not_lowerable("anon_array", "arguments must be scalar");
+}
+
+#[test]
+fn anonymous_function_array_capture_rejected() {
+    // Capturing an array is not supported (scalar captures only).
+    assert_not_lowerable("anon_array_capture", "captures must be scalar");
+}
+
+#[test]
+fn anonymous_function_nested_definition_rejected() {
+    // A handle defined inside a loop/conditional is deferred.
+    assert_not_lowerable("anon_nested", "defined inside control flow");
+}
+
+#[test]
+fn anonymous_function_array_result_rejected() {
+    // A lambda returning an array needs the array-result ABI, which handle
+    // calls do not express yet.
+    assert_not_lowerable("anon_array_result", "must return a scalar");
+}
+
+#[test]
+fn anonymous_function_copy_rejected() {
+    // Copying a handle to another binding makes it escape as a value.
+    assert_not_lowerable("anon_copy", "escapes");
+}
+
+#[test]
+fn anonymous_function_arithmetic_rejected() {
+    // Using a handle in a non-call expression is an escape.
+    assert_not_lowerable("anon_arith", "escapes");
+}
+
+#[test]
+fn anonymous_function_as_argument_rejected() {
+    // Passing a handle as a call argument is an escape.
+    assert_not_lowerable("anon_as_arg", "escapes");
+}
+
+#[test]
+fn anonymous_function_reassign_rejected() {
+    // A handle binding that is assigned twice has no single target.
+    assert_not_lowerable("anon_reassign", "assigned more than once");
+}
+
+#[test]
+fn anonymous_function_struct_field_rejected() {
+    // Storing a handle in a struct field is out of the scalar-handle subset.
+    assert_not_lowerable("anon_struct_field", "AnonymousFunction");
+}
+
+#[test]
+fn anonymous_function_builtin_handle_rejected() {
+    // A handle to a built-in (`@sin`) is not in the subset yet.
+    assert_not_lowerable("anon_builtin_handle", "FunctionHandle");
+}
+
+#[test]
+fn anonymous_function_immediate_call_rejected() {
+    // Immediate invocation of an unbound literal is not in the subset.
+    assert_not_lowerable("anon_immediate", "AnonymousFunction");
+}

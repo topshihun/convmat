@@ -74,8 +74,9 @@ MATLAB 是动态语言，无法（也不应）要求所有代码都静态可编�
 4. **不含不支持的构造**：如 `eval`/`evalin`、字符串形式的 `feval`、`assignin`、动态
    字段/元胞索引、cell 字面量（`{...}`）、`classdef` 动态分派、`try`/`catch`、多返回值调用
    （`[a,b]=f()`）、参数展开（`{:}`）、逻辑下标（`A(mask)`）等。`break`/`continue`、
-   `persistent`、已知类型的 `global`（编译为 C `static`）、以及标量字段的 `struct`
-   （构造/字段读写/按值传参与返回）已支持。
+   `persistent`、已知类型的 `global`（编译为 C `static`）、标量字段的 `struct`
+   （构造/字段读写/按值传参与返回）、以及**非逃逸的匿名函数句柄**（同作用域、标量
+   参数/捕获，见 §13）已支持。
 
 **边界两侧的处理**：
 
@@ -315,6 +316,7 @@ lower(HIR → matlab 方言)
 | 存储类 | 🟡 部分 | 局部栈变量；`persistent`/`global` 编译为 C `static`（单函数封闭世界）；多返回值调用 `[a,b]=f()` 未做 |
 | struct 类型 | 🟡 部分 | `struct('a',1,...)` 构造、`s.a` 读/写、struct 按值传参/返回（含多出参 tuple）、struct 形参字段使用点推断；数组/嵌套 struct 字段、struct 数组未做 |
 | cell 类型 | ⛔ 未做 | cell 字面量 `{...}`、`c{i}` 花括号索引、`cell(...)` 构造均 defer（需运行时 cell ABI，见 §12）；`varargin`/`varargout` 的 cell 语义已通过封闭世界特化覆盖 |
+| 匿名函数句柄 | 🟡 部分 | 同函数、非逃逸、标量参数/捕获的匿名函数 `f = @(x) …` 编译期特化（捕获作为额外形参，创建时快照，见 §13）；数组参数/捕获、逃逸句柄、命名/内建句柄、立即调用、`arrayfun` 未做 |
 | 内存调度 | ✅ 完成 | 静态数组按 `numel` 调度：小数组入栈、超过 `STACK_ELEMS_LIMIT`（默认 4096 元素）的大数组堆分配并在返回前 `delete[]`；动态形状堆分配未做（见 P7） |
 | P6 优化 | ⛔ 未做 | 优化整体延后（无 canonicalize/CSE/linalg） |
 | P7 动态形状 | 🟡 部分 | 动态形状数组形参与输出均已实现：形参「指针 + 长度」ABI、输出「缓冲 + 长度回填」ABI（`matlab.ptr` 类型）。支持 `sum/prod/min/max(A)`、`numel/length(A)`、运行时下标 `A(i)`、`end`、运行时区间循环 `for i = 1:numel(A)`，以及动态数组输出 `y = A(:)`、`y = -A(:)`、`y = k * A`（标量广播）、`y = A(:) ± B(:)`、`y = A(:) .* B(:)`（两个等长动态数组逐元素，`convmat_*` helper）；动态数组*中间值*、其他逐元素运算、参数展开 `{:}`/逻辑下标、cell/string 等待做 |
@@ -440,3 +442,44 @@ lower(HIR → matlab 方言)
   运行时元数（开放世界）——这些需要运行时 cell ABI（§12.3）。
 - 建议下一步：按需支持「多组不同元数」的 monomorphize（每个调用点一个固定签名），
   以及数组形参的 varargin/varargout。
+
+## 13. 匿名函数（函数句柄）
+
+### 13.1 边界：非逃逸才静态化
+
+匿名函数 `@(x) …` 与函数句柄在 MATLAB 里是一等值；把一等值接进静态 tier 会把
+运行时闭包模型拉进 `matlab` 方言（违反 §6 分层）。因此按 §4 的封闭世界规则切分：
+
+- **静态路径（已支持）**：句柄在**同一函数内创建、只被直接调用、不逃逸**，且参数/捕获
+  均为标量。编译期解析目标函数并由 `hir_to_mlir` 特化到固定签名。
+- **动态路径（defer）**：句柄作为返回值/实参、存入 struct/cell/数组、赋值给其他变量、
+  参与非调用表达式，或调用需要多返回值分派——需要闭包值（函数指针 + 环境，§11.2）。
+
+### 13.2 HIR 形态（一个陷阱）
+
+runmat 已把 `@(x) …` 降为真实 `HirFunction`（`kind = FunctionKind::Anonymous`，
+唯一输出 `__anon_out`），表达式点是 `HirExprKind::AnonymousFunction(FunctionId)`。
+关键陷阱：**句柄调用 `f(args)` 在 HIR 里不是 `Call`，而是 `Index(Binding(f), Paren)`**
+（仅需多返回值/`{:}` 分派时才成 `Call{DynamicExpr}`）。因此「句柄 vs 数组下标」的
+裁决必须集中在 `triage`，不能在降级器里零散猜测（§3、§4）。
+
+### 13.3 分层实现
+
+| 层 | 职责 |
+|----|------|
+| `triage` | `analyze_handles` 单一裁决点：识别顶层单次 `f = @(…)`；扫描所有使用确认非逃逸（只允许 `f(args)`）；`expr_ty` 把句柄调用归为标量；`classify` 与 `infer_locals` 跳过句柄绑定 |
+| `hir_to_mlir` | 匿名函数名 sanitize（`anonymous#1` → `convmat_anon_1`）；`function.captures` 接为**尾部额外形参**；`f = @(…)` 落成捕获快照；`f(args)` 落成 `matlab.call @convmat_anon_N(args…, captures…)` |
+| `lowering`/`emit_c` | 无需新 op；匿名 helper 是模块内普通 `builtin.func`，helper 收集时按「已定义函数名」排除 |
+
+### 13.4 捕获语义（正确性红线）
+
+MATLAB 在**创建时按值快照**捕获变量。生成的 C 在 `f = @(…)` 处把每个捕获存入
+调用方帧内的快照单元，调用时读出作为 helper 的尾部实参；helper 内捕获是可读局部。
+
+### 13.5 现状与后续
+
+- **已支持**：标量参数/捕获、任意参数个数（含 0）、同函数多句柄、创建后变量再赋值仍
+  按创建值（快照）——均有 `tests/fixtures/anon_*.m` + `tests/run.rs::run_anon_*` 覆盖，
+  逃逸用例见 `tests/errors.rs`。
+- **仍 defer**：数组参数/捕获/返回值、逃逸句柄、在控制流内定义句柄、命名函数句柄 `@f`、内建句柄 `@sin`、
+  立即调用 `(@(x) …)(3)`、跨函数句柄传递（需闭包值或跨函数调用，后者与「用户函数直接调用」一并补齐）。

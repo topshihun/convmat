@@ -42,8 +42,11 @@ pub fn lower_module(context: &mut Context, module: &ModuleOp) -> Result<ModuleOp
     // Emit only the runtime helpers this module actually references, and emit
     // them first so the wrapped-operator calls in the functions resolve. An
     // unknown helper name is a bug (typo) and fails loudly rather than emitting
-    // an undefined symbol.
-    for name in collect_used_helpers(context, module) {
+    // an undefined symbol. Callees that name a function defined in this module
+    // (e.g. an anonymous-function helper) are ordinary calls, not runtime
+    // helpers, and are skipped.
+    let defined = defined_func_names(context, module);
+    for name in collect_used_helpers(context, module, &defined) {
         let source = crate::runtime::helper_source(&name)
             .ok_or_else(|| Error::Backend(format!("unknown runtime helper `{name}`")))?;
         let verbatim = emitc::VerbatimOp::new(context, source);
@@ -319,30 +322,57 @@ fn append(context: &Context, block: Ptr<BasicBlock>, op: &dyn Op) {
 /// Collect the runtime helper names referenced anywhere in the module (including
 /// nested `if`/`while`/`for` regions): every `matlab.call_void` callee, plus any
 /// value-returning `matlab.call` whose callee is a `convmat_*` helper (libm calls
-/// like `sin` are skipped).
-fn collect_used_helpers(context: &Context, module: &ModuleOp) -> BTreeSet<String> {
+/// like `sin` are skipped). Callees in `defined` name module-local functions and
+/// are not helpers.
+fn collect_used_helpers(
+    context: &Context,
+    module: &ModuleOp,
+    defined: &BTreeSet<String>,
+) -> BTreeSet<String> {
     let mut used = BTreeSet::new();
     if let Some(block) = module.get_region(context).deref(context).get_entry_block() {
         for op in block.deref(context).iter(context) {
-            collect_helpers_from_op(context, op, &mut used);
+            collect_helpers_from_op(context, op, defined, &mut used);
         }
     }
     used
 }
 
-fn collect_helpers_from_op(context: &Context, op: Ptr<Operation>, used: &mut BTreeSet<String>) {
+/// The names of every `builtin.func` defined in `module` (including anonymous
+/// functions lowered to top-level helpers).
+fn defined_func_names(context: &Context, module: &ModuleOp) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    if let Some(block) = module.get_region(context).deref(context).get_entry_block() {
+        for op in block.deref(context).iter(context) {
+            if let Some(func) = Operation::get_op::<FuncOp>(op, context) {
+                names.insert(func.get_symbol_name(context).as_ref().to_string());
+            }
+        }
+    }
+    names
+}
+
+fn collect_helpers_from_op(
+    context: &Context,
+    op: Ptr<Operation>,
+    defined: &BTreeSet<String>,
+    used: &mut BTreeSet<String>,
+) {
     if let Some(call) = Operation::get_op::<matlab::CallVoidOp>(op, context) {
-        used.insert(call.callee(context));
+        let callee = call.callee(context);
+        if !defined.contains(&callee) {
+            used.insert(callee);
+        }
     } else if let Some(call) = Operation::get_op::<matlab::CallOp>(op, context) {
         let callee = call.callee(context);
-        if callee.starts_with("convmat_") {
+        if callee.starts_with("convmat_") && !defined.contains(&callee) {
             used.insert(callee);
         }
     }
     for region in op.deref(context).regions() {
         if let Some(block) = region.deref(context).get_entry_block() {
             for nested in block.deref(context).iter(context) {
-                collect_helpers_from_op(context, nested, used);
+                collect_helpers_from_op(context, nested, defined, used);
             }
         }
     }

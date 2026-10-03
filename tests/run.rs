@@ -1183,3 +1183,153 @@ fn run_struct_inout() {
         "6 7",
     );
 }
+
+// --- Anonymous functions -------------------------------------------------------
+
+#[test]
+fn run_anon_scale() {
+    // `f = @(t) t + 2; y = f(x)` inlines to `x + 2`; no captures.
+    run_exact(
+        "anon_scale",
+        "double anon_scale(double);",
+        "printf(\"%g\\n\", anon_scale(5.0));",
+        "7",
+    );
+}
+
+#[test]
+fn run_anon_capture() {
+    // `f = @(x) x * x + a` captures `a`; `f(3)` with a = 10 is 9 + 10 = 19.
+    run_exact(
+        "anon_capture",
+        "double anon_capture(double);",
+        "printf(\"%g\\n\", anon_capture(10.0));",
+        "19",
+    );
+}
+
+#[test]
+fn run_anon_two() {
+    // Two handles in one function: (3 + a) + (4 * a) with a = 2 is 5 + 8 = 13.
+    run_exact(
+        "anon_two",
+        "double anon_two(double);",
+        "printf(\"%g\\n\", anon_two(2.0));",
+        "13",
+    );
+}
+
+#[test]
+fn run_anon_snapshot() {
+    // MATLAB captures by value at creation: `a` is mutated to 100 *after* the
+    // handle is created, so `f(1)` still sees the original a = 5 -> 1 + 5 = 6.
+    run_exact(
+        "anon_snapshot",
+        "double anon_snapshot(double);",
+        "printf(\"%g\\n\", anon_snapshot(5.0));",
+        "6",
+    );
+}
+
+#[test]
+fn run_anon_lin() {
+    // Two lambda parameters plus a capture: `x * t + a` with x = 3, t = 4, a = 1
+    // is 12 + 1 = 13.
+    run_exact(
+        "anon_lin",
+        "double anon_lin(double);",
+        "printf(\"%g\\n\", anon_lin(1.0));",
+        "13",
+    );
+}
+
+#[test]
+fn run_anon_zero() {
+    // A zero-argument lambda that only reads a capture: `a * 2` with a = 5 is 10.
+    run_exact(
+        "anon_zero",
+        "double anon_zero(double);",
+        "printf(\"%g\\n\", anon_zero(5.0));",
+        "10",
+    );
+}
+
+#[test]
+fn run_anon_loop() {
+    // The handle is created at the top level but called inside a `for` loop:
+    // sum of 2*i for i = 1..3 is 2 + 4 + 6 = 12.
+    run_exact(
+        "anon_loop",
+        "double anon_loop(double);",
+        "printf(\"%g\\n\", anon_loop(3.0));",
+        "12",
+    );
+}
+
+#[test]
+fn run_anon_while() {
+    // The handle is called in a `while` condition/body: `y = y + 1` until y >= 5.
+    run_exact(
+        "anon_while",
+        "double anon_while(double);",
+        "printf(\"%g\\n\", anon_while(5.0));",
+        "5",
+    );
+}
+
+#[test]
+fn run_anon_expr() {
+    // Two handles composed in one expression: f(3)*g(4) + f(1) with a = 2 is
+    // 5 * 8 + 3 = 43.
+    run_exact(
+        "anon_expr",
+        "double anon_expr(double);",
+        "printf(\"%g\\n\", anon_expr(2.0));",
+        "43",
+    );
+}
+
+#[test]
+fn run_anon_cond() {
+    // A handle call as an `if` condition: `f(3) > 4` with a = 2 is 5 > 4 -> 1.
+    run_exact(
+        "anon_cond",
+        "double anon_cond(double);",
+        "printf(\"%g\\n\", anon_cond(2.0));",
+        "1",
+    );
+}
+
+#[test]
+fn run_anon_multi_capture() {
+    // Two captures in one lambda: `x + a * b` with x = 2, a = 3, b = 4 is 14.
+    run_exact(
+        "anon_multi_capture",
+        "double anon_multi_capture(double, double);",
+        "printf(\"%g\\n\", anon_multi_capture(3.0, 4.0));",
+        "14",
+    );
+}
+
+#[test]
+fn run_anon_computed_capture() {
+    // A capture of a computed local (not a parameter): k = 5*5, then f(1) = 26.
+    run_exact(
+        "anon_computed_capture",
+        "double anon_computed_capture(double);",
+        "printf(\"%g\\n\", anon_computed_capture(5.0));",
+        "26",
+    );
+}
+
+#[test]
+fn run_anon_dead() {
+    // A handle that is defined but never called still compiles (the helper is
+    // emitted but unused; the snapshot is still taken at creation).
+    run_exact(
+        "anon_dead",
+        "double anon_dead(double);",
+        "printf(\"%g\\n\", anon_dead(7.0));",
+        "7",
+    );
+}

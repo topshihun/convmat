@@ -48,13 +48,14 @@ use crate::dialects::matlab::{
 };
 use crate::error::{Error, Result};
 use crate::triage::{
-    brace_index, call_name, component_end_offset, component_is_colon, expr_ty, infer_locals,
-    unquote_str, varargout_index, LocalTy, Shape, Variadics,
+    analyze_handles, brace_index, call_name, component_end_offset, component_is_colon, expr_ty,
+    infer_locals, unquote_str, varargout_index, LocalTy, Shape, Variadics,
 };
 
 use runmat_hir::{
-    BindingId, BindingStorage, HirAssembly, HirBlock, HirCall, HirExpr, HirExprKind, HirFunction,
-    HirPlace, HirStmt, HirStmtKind, IndexComponent, IndexKind, IndexingSemantics, OperatorKind,
+    BindingId, BindingStorage, FunctionId, FunctionKind, HirAssembly, HirBlock, HirCall, HirExpr,
+    HirExprKind, HirFunction, HirPlace, HirStmt, HirStmtKind, IndexComponent, IndexKind,
+    IndexingSemantics, OperatorKind,
 };
 
 type OpInserter = IRInserter<DummyListener>;
@@ -91,23 +92,75 @@ pub fn lower_to_module(context: &mut Context, hir: &HirAssembly) -> Result<Modul
         .collect();
 
     for function in &hir.functions {
-        lower_function(context, function, &storage, &module, f64_ty)?;
+        lower_function(context, function, hir, &storage, &module, f64_ty)?;
     }
 
     Ok(module)
+}
+
+/// The C-level name of a HIR function. Anonymous functions carry a
+/// non-identifier source name (`anonymous#1`), so they are renamed to a stable
+/// valid C identifier; every other function keeps its source name.
+fn c_function_name(function: &HirFunction) -> String {
+    match function.kind {
+        FunctionKind::Anonymous => format!("convmat_anon_{}", function.id.0),
+        _ => function.name.0.clone(),
+    }
+}
+
+/// The ordered captured bindings of an anonymous function, matching the extra
+/// trailing parameters [`lower_function`] adds for captures.
+fn anon_capture_bindings(hir: &HirAssembly, id: FunctionId) -> Result<Vec<BindingId>> {
+    let function = hir
+        .functions
+        .iter()
+        .find(|function| function.id == id)
+        .ok_or_else(|| Error::Backend(format!("anonymous function #{} not found", id.0)))?;
+    Ok(function
+        .captures
+        .iter()
+        .map(|capture| capture.binding)
+        .collect())
+}
+
+/// Whether an anonymous function returns a single scalar value (the only result
+/// ABI a handle call can currently express).
+fn anon_returns_scalar(hir: &HirAssembly, id: FunctionId) -> bool {
+    let Some(function) = hir.functions.iter().find(|function| function.id == id) else {
+        return false;
+    };
+    if function.outputs.len() != 1 {
+        return false;
+    }
+    matches!(
+        infer_locals(function).get(&function.outputs[0]),
+        None | Some(LocalTy::Scalar)
+    )
+}
+
+/// A statically-resolved anonymous-function handle in a caller: the target
+/// function, its ordered captured bindings, and one caller-frame snapshot cell
+/// per capture (written at handle creation, read at every call).
+struct HandleRuntime {
+    function: FunctionId,
+    captures: Vec<BindingId>,
+    snapshot_cells: Vec<Value>,
+    /// Whether the target returns a single scalar (the only supported ABI).
+    scalar_result: bool,
 }
 
 /// Lower a single HIR function into a `builtin.func` appended to `module`.
 fn lower_function(
     context: &mut Context,
     function: &HirFunction,
+    hir: &HirAssembly,
     storage: &HashMap<BindingId, BindingStorage>,
     module: &ModuleOp,
     f64_ty: TypeHandle,
 ) -> Result<()> {
-    let name = function.name.0.clone();
+    let name = c_function_name(function);
 
-    let tys = infer_locals(function);
+    let mut tys = infer_locals(function);
     let variadics = Variadics::compute(function);
 
     // Named (non-variadic) scalar parameters: `fixed_inputs` minus `varargin`.
@@ -128,6 +181,15 @@ fn lower_function(
         .iter()
         .filter(|binding| Some(**binding) != varargout_binding)
         .copied()
+        .collect();
+
+    // Captured bindings of an anonymous function. They are not part of
+    // `function.locals` (they belong to the enclosing function), so they become
+    // extra trailing parameters of the generated C function.
+    let capture_bindings: Vec<BindingId> = function
+        .captures
+        .iter()
+        .map(|capture| capture.binding)
         .collect();
 
     // Split named outputs by ABI: scalars and structs are returned by value;
@@ -192,6 +254,10 @@ fn lower_function(
         entry_arg_types.push(PtrType::get(context).into());
         entry_arg_types.push(PtrType::get(context).into());
     }
+    // Anonymous-function captures: one trailing scalar parameter per captured
+    // binding, snapshotted by the caller at handle creation.
+    let capture_base = entry_arg_types.len();
+    entry_arg_types.extend(vec![f64_ty; capture_bindings.len()]);
     // Result types: value outputs (scalar/struct) first, then the extra scalar
     // `varargout` cells.
     let mut output_types: Vec<TypeHandle> = return_outputs.iter().map(|(_, ty)| *ty).collect();
@@ -254,6 +320,19 @@ fn lower_function(
         locals.insert(*binding, value);
     }
 
+    // Anonymous-function captures: one scalar cell per captured binding, wired
+    // from the trailing parameters below. Their types are scalar by definition
+    // of the MVP (only scalar captures are supported).
+    let mut capture_cells: Vec<Value> = Vec::with_capacity(capture_bindings.len());
+    for binding in &capture_bindings {
+        let alloca = AllocaOp::new(context, scalar_cell_ty);
+        let value = alloca.get_result(context);
+        append(context, entry, &alloca);
+        capture_cells.push(value);
+        locals.insert(*binding, value);
+        tys.insert(*binding, LocalTy::Scalar);
+    }
+
     // Wire incoming named parameters into their cells. Scalar params are stored
     // element-wise into a length-1 cell; struct params are copied by value
     // (`StructCopyOp`); dynamic-array params are caller-provided pointers wired
@@ -283,6 +362,14 @@ fn lower_function(
                 }
             }
         }
+    }
+
+    // Anonymous-function captures arrive as trailing scalar arguments; store
+    // each into its cell so the body can read it like any other local.
+    for (offset, cell) in capture_cells.iter().enumerate() {
+        let argument = entry.deref(context).get_argument(capture_base + offset);
+        let zero = emit_constant(context, entry, 0.0)?;
+        emit_store(context, entry, *cell, zero, argument);
     }
 
     // `varargin{k}` resolves directly to the (k-1)-th extra scalar argument.
@@ -329,6 +416,33 @@ fn lower_function(
         array_out_lens.insert(*output, len);
     }
 
+    // Resolve anonymous-function handles defined in this function and allocate
+    // one snapshot cell per capture. The cells are written at the handle's
+    // definition and read at every call, giving MATLAB's capture-at-creation
+    // semantics.
+    let mut handles: HashMap<BindingId, HandleRuntime> = HashMap::new();
+    let mut handle_targets: HashMap<BindingId, FunctionId> = HashMap::new();
+    for (binding, function_id) in analyze_handles(function).map_err(Error::NotLowerable)? {
+        let captures = anon_capture_bindings(hir, function_id)?;
+        let mut snapshot_cells = Vec::with_capacity(captures.len());
+        for _ in &captures {
+            let alloca = AllocaOp::new(context, scalar_cell_ty);
+            let value = alloca.get_result(context);
+            append(context, entry, &alloca);
+            snapshot_cells.push(value);
+        }
+        handles.insert(
+            binding,
+            HandleRuntime {
+                function: function_id,
+                captures,
+                snapshot_cells,
+                scalar_result: anon_returns_scalar(hir, function_id),
+            },
+        );
+        handle_targets.insert(binding, function_id);
+    }
+
     let lowerer = FuncLowerer {
         f64_ty,
         locals,
@@ -341,6 +455,8 @@ fn lower_function(
         array_lens,
         array_out_lens,
         return_outputs,
+        handles,
+        handle_targets,
     };
     lowerer.lower_block(context, entry, &function.body)?;
 
@@ -435,6 +551,10 @@ struct FuncLowerer {
     array_out_lens: HashMap<BindingId, Value>,
     /// Value outputs (scalar or struct), in ABI order, with their return type.
     return_outputs: Vec<(BindingId, TypeHandle)>,
+    /// Statically-resolved anonymous-function handles: target + capture cells.
+    handles: HashMap<BindingId, HandleRuntime>,
+    /// Just the handle targets, for `expr_ty`'s call typing.
+    handle_targets: HashMap<BindingId, FunctionId>,
 }
 
 /// A reduction to apply across an array.
@@ -523,6 +643,13 @@ impl FuncLowerer {
                         "non-local assignment target {place:?}"
                     )));
                 };
+                // `f = @(...)`: snapshot the captured bindings at creation time.
+                // The handle binding itself has no runtime cell.
+                if matches!(value.kind, HirExprKind::AnonymousFunction(_)) {
+                    if let Some(handle) = self.handles.get(target) {
+                        return self.lower_handle_creation(context, block, handle);
+                    }
+                }
                 let cell = self
                     .locals
                     .get(target)
@@ -633,6 +760,14 @@ impl FuncLowerer {
             }
             HirExprKind::Call(call) => self.lower_scalar_call(context, block, call),
             HirExprKind::Index(base, indexing) => {
+                // A call through an anonymous-function handle. HIR represents
+                // `f(args)` on a binding as paren indexing, so this must be
+                // resolved before the array-index path.
+                if let HirExprKind::Binding(id) = &base.kind {
+                    if let Some(handle) = self.handles.get(id) {
+                        return self.lower_handle_call(context, block, handle, indexing);
+                    }
+                }
                 self.lower_index_scalar(context, block, base, indexing)
             }
             HirExprKind::Member(base, name) => {
@@ -658,6 +793,90 @@ impl FuncLowerer {
                 "struct field base must be a binding".to_string(),
             )),
         }
+    }
+
+    /// Lower a handle definition `f = @(...)`: snapshot each captured binding
+    /// into its cell. MATLAB captures the current value at handle creation, so
+    /// the snapshot is taken here, not at the call site.
+    fn lower_handle_creation(
+        &self,
+        context: &mut Context,
+        block: Ptr<BasicBlock>,
+        handle: &HandleRuntime,
+    ) -> Result<()> {
+        for (capture, cell) in handle.captures.iter().zip(&handle.snapshot_cells) {
+            // Only scalar captures are supported; an array/struct capture would
+            // be silently truncated to its first element by `load_local`.
+            let ty = self.tys.get(capture).cloned().unwrap_or(LocalTy::Scalar);
+            if !matches!(ty, LocalTy::Scalar) {
+                return Err(Error::NotLowerable(
+                    "anonymous function captures must be scalar \
+                     (only scalar captures are supported)"
+                        .to_string(),
+                ));
+            }
+            let source = self.locals.get(capture).copied().ok_or_else(|| {
+                Error::Backend(format!("captured binding {capture:?} has no cell"))
+            })?;
+            let value = self.load_local(context, block, source)?;
+            let zero = emit_constant(context, block, 0.0)?;
+            emit_store(context, block, *cell, zero, value);
+        }
+        Ok(())
+    }
+
+    /// Lower a call through an anonymous-function handle to a `matlab.call` on
+    /// the specialized helper, passing the call arguments followed by the
+    /// captured snapshots (the helper's trailing parameters).
+    fn lower_handle_call(
+        &self,
+        context: &mut Context,
+        block: Ptr<BasicBlock>,
+        handle: &HandleRuntime,
+        indexing: &IndexingSemantics,
+    ) -> Result<Value> {
+        if indexing.kind != IndexKind::Paren {
+            return Err(Error::NotLowerable(
+                "function handle must be called with `()`".to_string(),
+            ));
+        }
+        if !handle.scalar_result {
+            return Err(Error::NotLowerable(
+                "anonymous function must return a scalar \
+                 (array results are not supported)"
+                    .to_string(),
+            ));
+        }
+        let mut args: Vec<Value> =
+            Vec::with_capacity(indexing.components.len() + handle.snapshot_cells.len());
+        for component in &indexing.components {
+            let IndexComponent::Expr(expr) = component else {
+                return Err(Error::NotLowerable(
+                    "function handle call arguments must be values".to_string(),
+                ));
+            };
+            // Only scalar arguments are supported; an array argument would be
+            // silently truncated to its first element by `lower_expr`.
+            if !matches!(self.operand_type(expr), LocalTy::Scalar) {
+                return Err(Error::NotLowerable(
+                    "anonymous function arguments must be scalar \
+                     (only scalar parameters are supported)"
+                        .to_string(),
+                ));
+            }
+            args.push(self.lower_expr(context, block, expr)?);
+        }
+        for cell in &handle.snapshot_cells {
+            args.push(self.load_local(context, block, *cell)?);
+        }
+        let op = CallOp::new(
+            context,
+            &format!("convmat_anon_{}", handle.function.0),
+            args,
+        );
+        let result = op.get_result(context);
+        append(context, block, &op);
+        Ok(result)
     }
 
     /// Lower a struct-producing expression into `dest` (a struct cell). Only
@@ -703,7 +922,7 @@ impl FuncLowerer {
     /// The static type of an operand expression, as determined by triage's shape
     /// analysis.
     fn operand_type(&self, expr: &HirExpr) -> LocalTy {
-        expr_ty(expr, &self.tys, self.varargin_local)
+        expr_ty(expr, &self.tys, self.varargin_local, &self.handle_targets)
     }
 
     /// Allocate a temporary array cell of the given static shape in `block`.

@@ -40,6 +40,12 @@ End-to-end codegen works for a growing subset of MATLAB:
   scalar input; `varargout{k} = scalar` resolves to the `k`-th extra scalar output.
   See `docs/architecture.md` §12.
 
+- **Anonymous functions** (non-escaping, closed-world): `f = @(x) x.^2 + a;`
+  assigned in the same function and only called as `f(args)` is specialized at
+  compile time to a helper whose captured variables are passed as extra
+  arguments, snapshotted at creation (MATLAB capture-by-value semantics); see
+  `docs/architecture.md` §13.
+
 ```sh
 cargo run -- tests/fixtures/add.m
 ```
