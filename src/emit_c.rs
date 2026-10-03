@@ -26,7 +26,7 @@ use pliron::{
 use crate::{
     dialects::{
         emitc,
-        matlab::{ArrayType, BinOpKind, CmpKind, StructType},
+        matlab::{ArrayType, BinOpKind, CmpKind, PtrType, StructType},
     },
     error::Result,
 };
@@ -219,6 +219,8 @@ impl<'a> Emitter<'a> {
         if is_array(self.context, ty) {
             let numel = array_numel(self.context, ty);
             format!("double {name}[{numel}]")
+        } else if is_ptr(self.context, ty) {
+            format!("double* {name}")
         } else if is_struct(self.context, ty) {
             format!("struct {} {name}", self.struct_type_name(ty))
         } else {
@@ -492,6 +494,10 @@ impl<'a> Emitter<'a> {
 
 fn is_array(context: &Context, ty: TypeHandle) -> bool {
     ty.deref(context).is::<ArrayType>()
+}
+
+fn is_ptr(context: &Context, ty: TypeHandle) -> bool {
+    ty.deref(context).is::<PtrType>()
 }
 
 fn is_struct(context: &Context, ty: TypeHandle) -> bool {

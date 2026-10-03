@@ -36,6 +36,41 @@ pub struct ArrayType {
     dims: Vec<i64>,
 }
 
+/// An opaque `double*` data pointer: the in-memory representation of a
+/// dynamic-shape array parameter whose length is passed separately (see
+/// `docs/runtime.md` §11.2 / `docs/architecture.md` §5). Emits to C as
+/// `double* name`; element access is `name[i]`.
+#[pliron_type(name = "matlab.ptr", generate_get = true, verifier = "succ")]
+#[derive(Hash, PartialEq, Eq, Debug, Clone)]
+pub struct PtrType;
+
+impl pliron::printable::Printable for PtrType {
+    fn fmt(
+        &self,
+        _ctx: &Context,
+        _state: &pliron::printable::State,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result {
+        write!(f, "ptr")
+    }
+}
+
+impl pliron::parsable::Parsable for PtrType {
+    type Arg = ();
+    type Parsed = pliron::r#type::TypedHandle<Self>;
+
+    fn parse<'a>(
+        state_stream: &mut pliron::parsable::StateStream<'a>,
+        _arg: Self::Arg,
+    ) -> pliron::parsable::ParseResult<'a, Self::Parsed> {
+        use pliron::combine::Parser;
+        let ctx = &*state_stream.state.ctx;
+        pliron::combine::value(PtrType::get(ctx))
+            .parse_stream(state_stream)
+            .into()
+    }
+}
+
 impl pliron::printable::Printable for ArrayType {
     fn fmt(
         &self,

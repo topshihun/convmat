@@ -643,11 +643,19 @@ impl Classifier for WhitelistClassifier {
 
         // Shape analysis must fully resolve every local; anything dynamic
         // (`LocalTy::Dynamic` or a dynamic-shape array) crosses the static
-        // boundary and is deferred to the runtime.
+        // boundary and is deferred to the runtime. Dynamic-shape array
+        // *parameters* and *outputs* are the exceptions: they get a dedicated
+        // ABI (pointer + length), so they are allowed through here and handled
+        // (or rejected) by `hir_to_mlir`. A dynamic-shape intermediate is still
+        // deferred (it would need a runtime allocation inside the body).
+        let fixed_inputs: HashSet<BindingId> = function.abi.fixed_inputs.iter().copied().collect();
+        let fixed_outputs: HashSet<BindingId> =
+            function.abi.fixed_outputs.iter().copied().collect();
         for (local, ty) in infer_locals(function) {
+            let abi_bound = fixed_inputs.contains(&local) || fixed_outputs.contains(&local);
             let is_dynamic = match ty {
                 LocalTy::Dynamic => true,
-                LocalTy::Array { shape } => shape.is_dynamic(),
+                LocalTy::Array { shape } => shape.is_dynamic() && !abi_bound,
                 // Struct fields must be fully static; a dynamic field defers the
                 // whole struct.
                 LocalTy::Struct { fields } => fields
@@ -721,11 +729,14 @@ fn for_each_stmt<'a>(stmts: &'a [HirStmt], visit: &mut dyn FnMut(&'a HirStmt)) {
 
 /// Infer the static type of every local in `function`.
 ///
-/// Parameters default to [`LocalTy::Scalar`] (the MVP has no
-/// `runmat-static-analysis`, so array-typed parameters are out of scope and are
-/// treated as scalars). Array shapes are only known for tensor literals;
-/// elementwise built-ins preserve their argument's shape; reductions produce a
-/// scalar. Anything else resolves to [`LocalTy::Dynamic`].
+/// Parameters default to [`LocalTy::Scalar`], then are promoted by use-site
+/// inference: a parameter read/written as a struct becomes
+/// [`LocalTy::Struct`]; a parameter used in an array context (`A(i)`, `sum(A)`,
+/// `reshape(A, …)`, …) becomes [`LocalTy::Array`] with a [`Shape::Dynamic`]
+/// shape (and so is deferred to the runtime tier). Array shapes are otherwise
+/// only known for tensor literals; elementwise built-ins preserve their
+/// argument's shape; reductions produce a scalar. Anything else resolves to
+/// [`LocalTy::Dynamic`].
 pub fn infer_locals(function: &HirFunction) -> HashMap<BindingId, LocalTy> {
     let variadics = Variadics::compute(function);
     let mut tys = HashMap::new();
@@ -738,6 +749,11 @@ pub fn infer_locals(function: &HirFunction) -> HashMap<BindingId, LocalTy> {
     // so `function y = f(s); y = s.a + s.b; end` compiles without an explicit
     // type annotation (mirroring MATLAB Coder's use-site struct inference).
     infer_struct_params(function, &mut tys);
+
+    // Promote untyped parameters to dynamic-shape arrays based on their array
+    // usage (`A(i)`, `sum(A)`, …). These defer to the runtime tier rather than
+    // being silently treated as scalars (see docs/runtime.md §8 step 1).
+    infer_array_params(function, &mut tys);
 
     infer_block(&function.body.statements, &variadics, &mut tys);
 
@@ -771,6 +787,196 @@ fn infer_struct_params(function: &HirFunction, tys: &mut HashMap<BindingId, Loca
             continue;
         }
         tys.insert(id, LocalTy::Struct { fields: field_list });
+    }
+}
+
+/// Infer array-typed fixed-input parameters from their array usage, so
+/// `function y = f(A); y = sum(A); end` (or `A(i)`, `reshape(A, …)`) is
+/// classified as a dynamic-shape array and deferred to the runtime tier instead
+/// of being silently treated as a scalar.
+fn infer_array_params(function: &HirFunction, tys: &mut HashMap<BindingId, LocalTy>) {
+    let params: HashSet<BindingId> = function
+        .abi
+        .fixed_inputs
+        .iter()
+        .copied()
+        .filter(|id| matches!(tys.get(id), Some(LocalTy::Scalar)))
+        .collect();
+    if params.is_empty() {
+        return;
+    }
+
+    let mut array_used: HashSet<BindingId> = HashSet::new();
+    scan_array_stmt(&function.body.statements, &params, &mut array_used);
+
+    for id in array_used {
+        tys.insert(
+            id,
+            LocalTy::Array {
+                shape: Shape::Dynamic,
+            },
+        );
+    }
+}
+
+/// Whether `name` called with `nargs` arguments treats its first argument as an
+/// array (a shape-unambiguous array usage). `min`/`max` are array reductions
+/// only in their single-argument form; the two-argument form is elementwise.
+fn array_arg_builtin(name: &str, nargs: usize) -> bool {
+    match name {
+        "sum" | "prod" | "reshape" | "size" | "numel" | "length" => true,
+        "min" | "max" => nargs == 1,
+        _ => false,
+    }
+}
+
+/// Record `expr` (a binding under inference) as array-used.
+fn mark_array_param(expr: &HirExpr, params: &HashSet<BindingId>, used: &mut HashSet<BindingId>) {
+    if let HirExprKind::Binding(id) = expr.kind {
+        if params.contains(&id) {
+            used.insert(id);
+        }
+    }
+}
+
+/// Scan statements for array usages of parameters under inference.
+fn scan_array_stmt(stmts: &[HirStmt], params: &HashSet<BindingId>, used: &mut HashSet<BindingId>) {
+    for stmt in stmts {
+        match &stmt.kind {
+            HirStmtKind::ExprStmt(expr, _) => scan_array_expr(expr, params, used),
+            HirStmtKind::Assign(place, value, _) => {
+                scan_array_place(place, params, used);
+                scan_array_expr(value, params, used);
+            }
+            HirStmtKind::If {
+                cond,
+                then_body,
+                elseif_blocks,
+                else_body,
+            } => {
+                scan_array_expr(cond, params, used);
+                scan_array_stmt(&then_body.statements, params, used);
+                for (cond, block) in elseif_blocks {
+                    scan_array_expr(cond, params, used);
+                    scan_array_stmt(&block.statements, params, used);
+                }
+                if let Some(block) = else_body {
+                    scan_array_stmt(&block.statements, params, used);
+                }
+            }
+            HirStmtKind::While { cond, body } => {
+                scan_array_expr(cond, params, used);
+                scan_array_stmt(&body.statements, params, used);
+            }
+            HirStmtKind::For { range, body, .. } => {
+                scan_array_expr(range, params, used);
+                scan_array_stmt(&body.statements, params, used);
+            }
+            HirStmtKind::Switch {
+                expr,
+                cases,
+                otherwise,
+                ..
+            } => {
+                scan_array_expr(expr, params, used);
+                for (case, block) in cases {
+                    scan_array_expr(case, params, used);
+                    scan_array_stmt(&block.statements, params, used);
+                }
+                if let Some(block) = otherwise {
+                    scan_array_stmt(&block.statements, params, used);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Scan an assignment target for array writes (`A(i) = …`) on parameters under
+/// inference.
+fn scan_array_place(place: &HirPlace, params: &HashSet<BindingId>, used: &mut HashSet<BindingId>) {
+    match place {
+        HirPlace::Index(base, indexing) | HirPlace::IndexCell(base, indexing) => {
+            if indexing.kind == IndexKind::Paren {
+                mark_array_param(base, params, used);
+            }
+            scan_array_expr(base, params, used);
+            for component in &indexing.components {
+                if let IndexComponent::Expr(e) = component {
+                    scan_array_expr(e, params, used);
+                }
+            }
+        }
+        HirPlace::Member(base, _) => scan_array_expr(base, params, used),
+        HirPlace::MemberDynamic(base, expr) => {
+            scan_array_expr(base, params, used);
+            scan_array_expr(expr, params, used);
+        }
+        HirPlace::Binding(_) => {}
+    }
+}
+
+/// Scan an expression for array usages of parameters under inference.
+fn scan_array_expr(expr: &HirExpr, params: &HashSet<BindingId>, used: &mut HashSet<BindingId>) {
+    match &expr.kind {
+        HirExprKind::Index(base, indexing) => {
+            if indexing.kind == IndexKind::Paren {
+                mark_array_param(base, params, used);
+            }
+            scan_array_expr(base, params, used);
+            for component in &indexing.components {
+                if let IndexComponent::Expr(e) = component {
+                    scan_array_expr(e, params, used);
+                }
+            }
+        }
+        HirExprKind::Unary(_, operand) => scan_array_expr(operand, params, used),
+        HirExprKind::Binary(lhs, _, rhs) => {
+            scan_array_expr(lhs, params, used);
+            scan_array_expr(rhs, params, used);
+        }
+        HirExprKind::Call(call) => {
+            if let Some(name) = call_name(&call.callee) {
+                if array_arg_builtin(&name, call.args.len()) {
+                    if let Some(first) = call.args.first() {
+                        mark_array_param(first, params, used);
+                    }
+                }
+            }
+            for arg in &call.args {
+                scan_array_expr(arg, params, used);
+            }
+        }
+        HirExprKind::Range(start, step, end) => {
+            scan_array_expr(start, params, used);
+            if let Some(step) = step {
+                scan_array_expr(step, params, used);
+            }
+            scan_array_expr(end, params, used);
+        }
+        HirExprKind::Tensor(rows) | HirExprKind::Cell(rows) => {
+            for row in rows {
+                for element in row {
+                    scan_array_expr(element, params, used);
+                }
+            }
+        }
+        HirExprKind::Member(base, _) => scan_array_expr(base, params, used),
+        HirExprKind::MemberDynamic(base, expr) => {
+            scan_array_expr(base, params, used);
+            scan_array_expr(expr, params, used);
+        }
+        HirExprKind::StructLiteral(pairs) => {
+            for (_, value) in pairs {
+                scan_array_expr(value, params, used);
+            }
+        }
+        HirExprKind::ObjectLiteral { fields: pairs, .. } => {
+            for (_, value) in pairs {
+                scan_array_expr(value, params, used);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1125,8 +1331,9 @@ fn call_ty(call: &HirCall, tys: &HashMap<BindingId, LocalTy>) -> LocalTy {
         .collect();
 
     match builtin {
-        // Elementwise unary: preserves the argument's shape.
-        Builtin::Unary(_) => args.first().cloned().unwrap_or(LocalTy::Dynamic),
+        // Elementwise unary: preserves the argument's shape; `sort` also
+        // preserves shape (a sorted copy).
+        Builtin::Unary(_) | Builtin::Sort => args.first().cloned().unwrap_or(LocalTy::Dynamic),
         // Reductions: one array argument reduces to a scalar; a second numeric
         // argument selects the dimension to reduce along (array result).
         Builtin::MinMax(_) | Builtin::Reduce(_) => match args.as_slice() {
@@ -1232,12 +1439,22 @@ fn index_ty(base: LocalTy, indexing: &IndexingSemantics) -> LocalTy {
     if has_colon {
         // `A(:)` flattens to a column vector; other slices are deferred.
         if indexing.components.len() == 1 && component_is_colon(&indexing.components[0]) {
-            LocalTy::Array {
-                shape: Shape::matrix(shape.numel(), 1),
+            if shape.is_dynamic() {
+                LocalTy::Array {
+                    shape: Shape::Dynamic,
+                }
+            } else {
+                LocalTy::Array {
+                    shape: Shape::matrix(shape.numel(), 1),
+                }
             }
         } else {
             LocalTy::Dynamic
         }
+    } else if shape.is_dynamic() {
+        // A scalar subscript into a dynamic-shape array yields a scalar element
+        // (the parameter is treated as a vector; see `hir_to_mlir`).
+        LocalTy::Scalar
     } else {
         // A scalar subscript read requires every component to be a constant or
         // `end`. Anything else (variable subscript or logical indexing) is

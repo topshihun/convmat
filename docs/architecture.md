@@ -109,8 +109,17 @@ MATLAB 是动态语言，无法（也不应）要求所有代码都静态可编�
   **不作为返回值**，而是作为**额外的输出指针入参**；缓冲空间由**调用方**分配——
   被调方只写不分配，调用方在调用前预留好空间。这相当于 C ABI 里的 sret 手法，把
   「谁分配、谁释放」的所有权固定在调用方一侧，避免数组返回值的所有权歧义。
-- 该约定在 `hir_to_mlir` 产出的 `builtin.func` 签名里表达（数组输出 → 输出指针入参），
-  `lowering` 阶段解析 ABI，`emit_c` 阶段落实成 C 签名。
+- **动态形状数组形参**（大小运行期才定）走「数据指针 + 长度」两个入参：形参 `A` →
+  `double* v1, double v2`（数据 + 元素个数），如 `double f(double* v1, double v2)`。
+  形参视为向量（列主序）；降级器把 `A` 的 IR 值记为 `matlab.ptr`（发射成 `double*`），
+  长度单独记录，供 `sum(A)`/`numel(A)`/`A(i)` 等使用（见 §10.5 P7、`docs/runtime.md`）。
+- **动态形状数组输出**（大小运行期才定）走两个输出指针入参：`double* y_out`（调用方缓冲）
+  + `double* y_n`（被调方写入实际元素个数）。延续「缓冲由调用方分配」的所有权约定，
+  只是长度由被调方回填（调用方需保证缓冲足够大）。如 `void f(double* v1, double v2,
+  double* v3, double* v4)` 中 `v3` 是 `y_out`、`v4` 是 `y_n`。
+- 该约定在 `hir_to_mlir` 产出的 `builtin.func` 签名里表达（静态数组输出 → 输出指针入参；
+  动态数组形参 → 指针 + 长度；动态数组输出 → 输出缓冲 + 长度回填指针），`lowering`
+  阶段解析 ABI，`emit_c` 阶段落实成 C 签名。
 
 **运行时组件**：生成的代码链接一个运行时库（runmat runtime 或一个薄薄的 convmat
 runtime shim），负责内存管理、动态类型盒、内置函数、以及 §4 里边界外的兜底语义。
@@ -235,8 +244,9 @@ flowchart TD
   （`logical` 以 `matlab.bool` 表示，比较/逻辑产生 `bool`，最终映射到 C++ `bool`）。
   `Struct` 的字段目前仅标量（数组/嵌套 struct 字段未做，见 §10.5）。
 - 形状来源：静态分析只有字面量 + 形状传播（转置/乘/按维归约）；形参默认标量，
-  数组形参需 `runmat-static-analysis`（见 §10.5）。struct 形参的字段布局从「字段访问
-  使用点」（`s.a`、`s.a = ...`）推断，与 MATLAB Coder 的使用点结构推断一致。
+  数组形参由「数组使用点」（`A(i)`、`sum(A)`、`reshape(A,…)`、…）推断为
+  `Array{shape: Dynamic}`，并降为「指针 + 长度」ABI（见 §5、§10.5 P7）；struct 形参的
+  字段布局从「字段访问使用点」（`s.a`、`s.a = ...`）推断，与 MATLAB Coder 的使用点结构推断一致。
 
 ### 10.2 运算符
 
@@ -277,6 +287,7 @@ flowchart TD
   行/列向量）。
 - **形状内省**：`numel length size(A,dim) size(A)`。
 - **构造器/重塑**：`zeros(m,n) ones(m,n) eye(n) reshape(A,m,n)`（维度须为常量）。
+- **排序**：`sort(v)`（仅向量，升序，封装 `convmat_sort` 运行时 helper；矩阵列排序未做）。
 - 未支持/有副作用/形状未知的内建 → 运行时兔底（`Error::NotLowerable`）。
 
 ### 10.4 管线（优化延后）
@@ -298,18 +309,22 @@ lower(HIR → matlab 方言)
 | P1 形状模型 | ✅ 完成 | `Shape`/`LocalTy`、列主序、行/列/N-D 元数据 |
 | P2 逐元素/广播/转置/逻辑 | ✅ 完成 | 同形数组 + 标量广播 + 2-D 转置（封装 `convmat_transpose`） |
 | P3 矩阵乘/幂 | ✅ 完成 | `*` 封装 `convmat_matmul`；`^`/`.^` 已支持（矩阵幂封装 `convmat_mpower`） |
-| P4 内建 | 🟡 部分 | 归约(含按维)+形状内省+`zeros/ones/eye/reshape` 已做；`permute/repmat/cat/horzcat/vertcat` 未做 |
-| P5 索引/冒号/`end` | 🟡 部分 | 常量下标 `A(i,j)`、线性 `A(i)`、`end`、`A(:)` 已做；`A(i,:)`/`A(:,j)`/冒号区间/变量下标/逻辑下标未做 |
+| P4 内建 | 🟡 部分 | 归约(含按维)+形状内省+`zeros/ones/eye/reshape`+`sort`(向量) 已做；`permute/repmat/cat/horzcat/vertcat`、`sort`(矩阵列排序)、`find/mean/fft` 未做 |
+| P5 索引/冒号/`end` | 🟡 部分 | 静态数组：常量下标 `A(i,j)`、线性 `A(i)`、`end`、`A(:)`；动态数组形参：运行时下标 `A(i)`、`end`。仍缺 `A(i,:)`/`A(:,j)`/冒号区间/变量下标的静态形式/逻辑下标 |
 | 控制流 | ✅ 完成 | `if`/`elseif`/`else`、`while`、`for`（升/降序，编译为方向感知的 C `for`）、`switch`、`break`/`continue`；`try`/`catch` 未做 |
 | 存储类 | 🟡 部分 | 局部栈变量；`persistent`/`global` 编译为 C `static`（单函数封闭世界）；多返回值调用 `[a,b]=f()` 未做 |
 | struct 类型 | 🟡 部分 | `struct('a',1,...)` 构造、`s.a` 读/写、struct 按值传参/返回（含多出参 tuple）、struct 形参字段使用点推断；数组/嵌套 struct 字段、struct 数组未做 |
 | cell 类型 | ⛔ 未做 | cell 字面量 `{...}`、`c{i}` 花括号索引、`cell(...)` 构造均 defer（需运行时 cell ABI，见 §12）；`varargin`/`varargout` 的 cell 语义已通过封闭世界特化覆盖 |
 | 内存调度 | ✅ 完成 | 静态数组按 `numel` 调度：小数组入栈、超过 `STACK_ELEMS_LIMIT`（默认 4096 元素）的大数组堆分配并在返回前 `delete[]`；动态形状堆分配未做（见 P7） |
 | P6 优化 | ⛔ 未做 | 优化整体延后（无 canonicalize/CSE/linalg） |
-| P7 动态形状 | ⛔ 未做 | 需 `runmat-static-analysis`（见下方依赖困难）；参数展开 `{:}`/逻辑下标等需运行时形状 |
+| P7 动态形状 | 🟡 部分 | 动态形状数组形参与输出均已实现：形参「指针 + 长度」ABI、输出「缓冲 + 长度回填」ABI（`matlab.ptr` 类型）。支持 `sum/prod/min/max(A)`、`numel/length(A)`、运行时下标 `A(i)`、`end`、运行时区间循环 `for i = 1:numel(A)`，以及动态数组输出 `y = A(:)`、`y = -A(:)`、`y = k * A`（标量广播）、`y = A(:) ± B(:)`、`y = A(:) .* B(:)`（两个等长动态数组逐元素，`convmat_*` helper）；动态数组*中间值*、其他逐元素运算、参数展开 `{:}`/逻辑下标、cell/string 等待做 |
 
-> 数组形参目前被当作标量；`sum(param)` 等会被解释为标量恒等。这是无静态分析下的
-> 已知限制，P7 接入静态分析后解决（动态形状走形状描述 ABI）。
+> 数组形参不再被当作标量：`sum(A)`、`A(i)`、`reshape(A,…)` 等会把它推断为动态形状
+> 数组，并降为「指针 + 长度」ABI（支持归约/形状内省/运行时下标/`end`）。动态数组可以
+> 作为输出（`y = A(:)`、`y = k * A`、`y = A(:) ± B(:)`）；`A(:)` 在动态数组上是恒等
+> （直接复用数据指针）。但绑定到普通中间局部的动态数组仍 defer（`NotLowerable`：体内
+> 需要运行时分配）；无运行时越界检查。剩余无法从函数体判定数组/标量二义的形参（如
+> `A + B`、`y = A`）仍当标量处理，需入口点类型标注或静态分析。
 
 **P7 依赖困难（已实测 `cargo add runmat-static-analysis`）**：
 

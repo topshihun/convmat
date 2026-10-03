@@ -9,7 +9,8 @@
 //! The MVP has no dynamic-tier shim yet, so the fallback is currently a hard
 //! error ([`defer_to_runtime`]). The consolidated design of that dynamic tier is
 //! in `docs/runtime.md`; this module already carries its C header
-//! ([`DYNAMIC_RUNTIME_H`]) and the ABI/function symbol constants.
+//! ([`DYNAMIC_RUNTIME_H`]), the value-model kernel implementation
+//! ([`DYNAMIC_RUNTIME_C`]), and the ABI/function symbol constants.
 //!
 //! This module also owns the "封装" (wrapped) operator helpers: the small C
 //! library of `convmat_*` functions that implement operations which change
@@ -26,6 +27,17 @@ use crate::error::{Error, Result};
 pub const TRANSPOSE: &str = "convmat_transpose";
 pub const MATMUL: &str = "convmat_matmul";
 pub const MPOWER: &str = "convmat_mpower";
+pub const SORT: &str = "convmat_sort";
+pub const SUM: &str = "convmat_sum";
+pub const PROD: &str = "convmat_prod";
+pub const MIN: &str = "convmat_min";
+pub const MAX: &str = "convmat_max";
+pub const COPY: &str = "convmat_copy";
+pub const SCALE: &str = "convmat_scale";
+pub const ADD: &str = "convmat_add";
+pub const SUB: &str = "convmat_sub";
+pub const EWMUL: &str = "convmat_ewmul";
+pub const NEG: &str = "convmat_neg";
 
 // --- Dynamic tier (see docs/runtime.md) -------------------------------------
 //
@@ -42,8 +54,9 @@ pub const RUNTIME_FN: &str = "convmat_runtime_fn";
 
 /// The C header (types + prototypes) for the dynamic value model. Emitted as a
 /// `VerbatimOp` once, before any function that bridges into the dynamic tier.
-/// The `convmat_*` implementation bodies follow the same inline-emission path as
-/// [`helper_source`] when the dynamic tier lands (see `docs/runtime.md` §8).
+/// The `convmat_*` implementation bodies are in [`DYNAMIC_RUNTIME_C`]; both are
+/// emitted together (header then impl) when the dynamic tier is used (see
+/// `docs/runtime.md` §8).
 pub const DYNAMIC_RUNTIME_H: &str = "\
 // ---- convmat runtime: dynamic tier value model (docs/runtime.md) ----\n\
 // Emitted once, at file scope, before functions that bridge into the dynamic\n\
@@ -89,7 +102,7 @@ typedef struct convmat_value {\n\
         struct {\n\
             convmat_dims shape;\n\
             int64_t nfields;\n\
-            const char **field_names;\n\
+            char **field_names;\n\
             convmat_value **fields;\n\
         } strct;\n\
         struct {\n\
@@ -130,6 +143,266 @@ typedef struct convmat_error {\n\
 void convmat_error_throw(const char *msg);\n\
 ";
 
+/// The C implementation of the dynamic value-model kernel: lifecycle, deep
+/// copy, and the array/cell/struct helpers (docs/runtime.md §2–§4). Storage is
+/// `double` (convmat's single numeric type) for `CONVMAT_DOUBLE`/`CONVMAT_LOGICAL`;
+/// other `convmat_dtype` variants are reserved. Emitted together with
+/// [`DYNAMIC_RUNTIME_H`] when a function bridges into the dynamic tier.
+pub const DYNAMIC_RUNTIME_C: &str = r#"// ---- convmat runtime: value-model kernel (docs/runtime.md) ----
+// Lifecycle, deep copy, and the array/cell/struct helpers. The static tier
+// (matlab dialect) stays in plain `double[N]` / `struct`; only values that
+// cross into the dynamic tier are boxed here. Storage is `double` (convmat's
+// single numeric type) for CONVMAT_DOUBLE/CONVMAT_LOGICAL; other dtypes are
+// reserved.
+
+static bool convmat_streq(const char *a, const char *b) {
+    while (*a != 0 && *b != 0 && *a == *b) { ++a; ++b; }
+    return *a == *b;
+}
+
+static int64_t *convmat_dims_clone(int64_t ndims, const int64_t *dims) {
+    if (ndims <= 0 || dims == nullptr) return nullptr;
+    int64_t *out = new int64_t[ndims];
+    for (int64_t i = 0; i < ndims; i++) out[i] = dims[i];
+    return out;
+}
+
+static int64_t convmat_dims_numel(int64_t ndims, const int64_t *dims) {
+    int64_t n = 1;
+    for (int64_t i = 0; i < ndims; i++) n *= dims[i];
+    return n;
+}
+
+convmat_value *convmat_value_new(convmat_kind kind, convmat_dtype dtype) {
+    convmat_value *v = new convmat_value();
+    v->refcount = 1;
+    v->kind = kind;
+    v->dtype = dtype;
+    switch (kind) {
+        case CONVMAT_SCALAR: v->u.scalar.d = 0.0; break;
+        case CONVMAT_ARRAY:
+            v->u.array.shape.ndims = 0;
+            v->u.array.shape.dims = nullptr;
+            v->u.array.data = nullptr;
+            v->u.array.capacity = 0;
+            v->u.array.owns_data = 0;
+            break;
+        case CONVMAT_CELL:
+            v->u.cell.shape.ndims = 0;
+            v->u.cell.shape.dims = nullptr;
+            v->u.cell.elems = nullptr;
+            break;
+        case CONVMAT_STRUCT:
+            v->u.strct.shape.ndims = 0;
+            v->u.strct.shape.dims = nullptr;
+            v->u.strct.nfields = 0;
+            v->u.strct.field_names = nullptr;
+            v->u.strct.fields = nullptr;
+            break;
+        case CONVMAT_FUNCTION: v->u.func.handle_id = -1; break;
+        case CONVMAT_EMPTY: break;
+    }
+    return v;
+}
+
+convmat_value *convmat_value_retain(convmat_value *v) {
+    if (v != nullptr) v->refcount++;
+    return v;
+}
+
+void convmat_value_release(convmat_value *v) {
+    if (v == nullptr) return;
+    v->refcount--;
+    if (v->refcount > 0) return;
+    switch (v->kind) {
+        case CONVMAT_ARRAY:
+            delete[] v->u.array.shape.dims;
+            if (v->u.array.owns_data) delete[] static_cast<double *>(v->u.array.data);
+            break;
+        case CONVMAT_CELL: {
+            int64_t n = convmat_dims_numel(v->u.cell.shape.ndims, v->u.cell.shape.dims);
+            for (int64_t i = 0; i < n; i++) convmat_value_release(v->u.cell.elems[i]);
+            delete[] v->u.cell.elems;
+            delete[] v->u.cell.shape.dims;
+            break;
+        }
+        case CONVMAT_STRUCT: {
+            int64_t n = convmat_dims_numel(v->u.strct.shape.ndims, v->u.strct.shape.dims);
+            int64_t total = n * v->u.strct.nfields;
+            for (int64_t i = 0; i < total; i++) convmat_value_release(v->u.strct.fields[i]);
+            delete[] v->u.strct.fields;
+            for (int64_t f = 0; f < v->u.strct.nfields; f++) delete[] v->u.strct.field_names[f];
+            delete[] v->u.strct.field_names;
+            delete[] v->u.strct.shape.dims;
+            break;
+        }
+        default: break;
+    }
+    delete v;
+}
+
+int64_t convmat_numel(const convmat_value *v) {
+    switch (v->kind) {
+        case CONVMAT_ARRAY: return convmat_dims_numel(v->u.array.shape.ndims, v->u.array.shape.dims);
+        case CONVMAT_CELL: return convmat_dims_numel(v->u.cell.shape.ndims, v->u.cell.shape.dims);
+        case CONVMAT_STRUCT: return convmat_dims_numel(v->u.strct.shape.ndims, v->u.strct.shape.dims);
+        default: return 1;
+    }
+}
+
+int64_t convmat_linear_index(const convmat_value *v, const int64_t *subs) {
+    int64_t ndims = 0;
+    const int64_t *dims = nullptr;
+    switch (v->kind) {
+        case CONVMAT_ARRAY: ndims = v->u.array.shape.ndims; dims = v->u.array.shape.dims; break;
+        case CONVMAT_CELL: ndims = v->u.cell.shape.ndims; dims = v->u.cell.shape.dims; break;
+        case CONVMAT_STRUCT: ndims = v->u.strct.shape.ndims; dims = v->u.strct.shape.dims; break;
+        default: return 0;
+    }
+    int64_t offset = 0;
+    int64_t stride = 1;
+    for (int64_t i = 0; i < ndims; i++) {
+        offset += subs[i] * stride;
+        stride *= dims[i];
+    }
+    return offset;
+}
+
+convmat_value *convmat_array_create(convmat_dtype dtype, int64_t ndims, const int64_t *dims) {
+    convmat_value *v = convmat_value_new(CONVMAT_ARRAY, dtype);
+    v->u.array.shape.ndims = ndims;
+    v->u.array.shape.dims = convmat_dims_clone(ndims, dims);
+    int64_t n = convmat_dims_numel(ndims, dims);
+    v->u.array.data = new double[n]();
+    v->u.array.capacity = n;
+    v->u.array.owns_data = 1;
+    return v;
+}
+
+void *convmat_array_data(convmat_value *v) {
+    return v->u.array.data;
+}
+
+void convmat_array_resize(convmat_value *v, int64_t ndims, const int64_t *dims) {
+    int64_t newn = convmat_dims_numel(ndims, dims);
+    if (newn > v->u.array.capacity) {
+        double *oldbuf = static_cast<double *>(v->u.array.data);
+        double *newbuf = new double[newn]();
+        if (oldbuf != nullptr) {
+            int64_t copy_n = v->u.array.capacity < newn ? v->u.array.capacity : newn;
+            for (int64_t i = 0; i < copy_n; i++) newbuf[i] = oldbuf[i];
+            if (v->u.array.owns_data) delete[] oldbuf;
+        }
+        v->u.array.data = newbuf;
+        v->u.array.capacity = newn;
+        v->u.array.owns_data = 1;
+    }
+    delete[] v->u.array.shape.dims;
+    v->u.array.shape.ndims = ndims;
+    v->u.array.shape.dims = convmat_dims_clone(ndims, dims);
+}
+
+convmat_value *convmat_cell_create(int64_t ndims, const int64_t *dims) {
+    convmat_value *v = convmat_value_new(CONVMAT_CELL, CONVMAT_DOUBLE);
+    v->u.cell.shape.ndims = ndims;
+    v->u.cell.shape.dims = convmat_dims_clone(ndims, dims);
+    int64_t n = convmat_dims_numel(ndims, dims);
+    v->u.cell.elems = new convmat_value *[n];
+    for (int64_t i = 0; i < n; i++) v->u.cell.elems[i] = nullptr;
+    return v;
+}
+
+convmat_value *convmat_cell_get(const convmat_value *c, int64_t lin) {
+    return convmat_value_retain(c->u.cell.elems[lin]);
+}
+
+void convmat_cell_set(convmat_value *c, int64_t lin, convmat_value *v) {
+    convmat_value *old = c->u.cell.elems[lin];
+    c->u.cell.elems[lin] = convmat_value_retain(v);
+    convmat_value_release(old);
+}
+
+convmat_value *convmat_struct_create(int64_t nfields, const char *const *names,
+                                     int64_t ndims, const int64_t *dims) {
+    convmat_value *v = convmat_value_new(CONVMAT_STRUCT, CONVMAT_DOUBLE);
+    v->u.strct.shape.ndims = ndims;
+    v->u.strct.shape.dims = convmat_dims_clone(ndims, dims);
+    v->u.strct.nfields = nfields;
+    v->u.strct.field_names = new char *[nfields];
+    for (int64_t f = 0; f < nfields; f++) {
+        const char *src = names[f];
+        int64_t len = 0;
+        while (src[len] != 0) len++;
+        char *dst = new char[len + 1];
+        for (int64_t i = 0; i <= len; i++) dst[i] = src[i];
+        v->u.strct.field_names[f] = dst;
+    }
+    int64_t n = convmat_dims_numel(ndims, dims);
+    int64_t total = n * nfields;
+    v->u.strct.fields = new convmat_value *[total];
+    for (int64_t i = 0; i < total; i++) v->u.strct.fields[i] = nullptr;
+    return v;
+}
+
+int64_t convmat_struct_field_index(const convmat_value *s, const char *name) {
+    for (int64_t f = 0; f < s->u.strct.nfields; f++) {
+        if (convmat_streq(s->u.strct.field_names[f], name)) return f;
+    }
+    return -1;
+}
+
+convmat_value *convmat_struct_get(const convmat_value *s, int64_t field, int64_t lin) {
+    int64_t n = convmat_numel(s);
+    return convmat_value_retain(s->u.strct.fields[field * n + lin]);
+}
+
+void convmat_struct_set(convmat_value *s, int64_t field, int64_t lin, convmat_value *v) {
+    int64_t n = convmat_numel(s);
+    convmat_value *old = s->u.strct.fields[field * n + lin];
+    s->u.strct.fields[field * n + lin] = convmat_value_retain(v);
+    convmat_value_release(old);
+}
+
+convmat_value *convmat_value_copy(const convmat_value *src) {
+    if (src == nullptr) return nullptr;
+    switch (src->kind) {
+        case CONVMAT_EMPTY:
+            return convmat_value_new(CONVMAT_EMPTY, src->dtype);
+        case CONVMAT_SCALAR: {
+            convmat_value *v = convmat_value_new(CONVMAT_SCALAR, src->dtype);
+            v->u.scalar.d = src->u.scalar.d;
+            return v;
+        }
+        case CONVMAT_ARRAY: {
+            convmat_value *v = convmat_array_create(src->dtype, src->u.array.shape.ndims, src->u.array.shape.dims);
+            int64_t n = convmat_numel(src);
+            double *dst = static_cast<double *>(v->u.array.data);
+            const double *sdata = static_cast<const double *>(src->u.array.data);
+            for (int64_t i = 0; i < n; i++) dst[i] = sdata[i];
+            return v;
+        }
+        case CONVMAT_CELL: {
+            convmat_value *v = convmat_cell_create(src->u.cell.shape.ndims, src->u.cell.shape.dims);
+            int64_t n = convmat_numel(src);
+            for (int64_t i = 0; i < n; i++) v->u.cell.elems[i] = convmat_value_copy(src->u.cell.elems[i]);
+            return v;
+        }
+        case CONVMAT_STRUCT: {
+            convmat_value *v = convmat_struct_create(src->u.strct.nfields, src->u.strct.field_names, src->u.strct.shape.ndims, src->u.strct.shape.dims);
+            int64_t n = convmat_numel(src);
+            for (int64_t i = 0; i < n * src->u.strct.nfields; i++) v->u.strct.fields[i] = convmat_value_copy(src->u.strct.fields[i]);
+            return v;
+        }
+        case CONVMAT_FUNCTION: {
+            convmat_value *v = convmat_value_new(CONVMAT_FUNCTION, src->dtype);
+            v->u.func.handle_id = src->u.func.handle_id;
+            return v;
+        }
+    }
+    return nullptr;
+}
+"#;
+
 /// The C source of a wrapped-operator helper by name, or `None` for an unknown
 /// name. Dims are passed as `double` (convmat's single numeric type) and cast to
 /// `int` internally; they are small integers.
@@ -138,6 +411,17 @@ pub fn helper_source(name: &str) -> Option<&'static str> {
         TRANSPOSE => TRANSPOSE_C,
         MATMUL => MATMUL_C,
         MPOWER => MPOWER_C,
+        SORT => SORT_C,
+        SUM => SUM_C,
+        PROD => PROD_C,
+        MIN => MIN_C,
+        MAX => MAX_C,
+        COPY => COPY_C,
+        SCALE => SCALE_C,
+        ADD => ADD_C,
+        SUB => SUB_C,
+        EWMUL => EWMUL_C,
+        NEG => NEG_C,
         _ => return None,
     })
 }
@@ -215,6 +499,108 @@ void convmat_mpower(double* dst, const double* a, double m, double k) {
     delete[] base;
     delete[] tmp;
 }
+";
+
+const SORT_C: &str = "\
+// ---- convmat_sort: dst = src sorted ascending (flattened, vector) ----\n\
+void convmat_sort(double* dst, const double* src, double n) {\n\
+    int m = (int)n;\n\
+    for (int i = 0; i < m; i++) dst[i] = src[i];\n\
+    for (int i = 1; i < m; i++) {\n\
+        double key = dst[i];\n\
+        int j = i - 1;\n\
+        while (j >= 0 && dst[j] > key) { dst[j + 1] = dst[j]; j--; }\n\
+        dst[j + 1] = key;\n\
+    }\n\
+}\n\
+";
+
+const SUM_C: &str = "\
+// ---- convmat_sum: sum(src[0..n)) ----\n\
+double convmat_sum(const double* src, double n) {\n\
+    int m = (int)n;\n\
+    double acc = 0.0;\n\
+    for (int i = 0; i < m; i++) acc += src[i];\n\
+    return acc;\n\
+}\n\
+";
+
+const PROD_C: &str = "\
+// ---- convmat_prod: prod(src[0..n)) ----\n\
+double convmat_prod(const double* src, double n) {\n\
+    int m = (int)n;\n\
+    double acc = 1.0;\n\
+    for (int i = 0; i < m; i++) acc *= src[i];\n\
+    return acc;\n\
+}\n\
+";
+
+const MIN_C: &str = "\
+// ---- convmat_min: min(src[0..n)) ----\n\
+double convmat_min(const double* src, double n) {\n\
+    int m = (int)n;\n\
+    double acc = m > 0 ? src[0] : 0.0;\n\
+    for (int i = 1; i < m; i++) if (src[i] < acc) acc = src[i];\n\
+    return acc;\n\
+}\n\
+";
+
+const MAX_C: &str = "\
+// ---- convmat_max: max(src[0..n)) ----\n\
+double convmat_max(const double* src, double n) {\n\
+    int m = (int)n;\n\
+    double acc = m > 0 ? src[0] : 0.0;\n\
+    for (int i = 1; i < m; i++) if (src[i] > acc) acc = src[i];\n\
+    return acc;\n\
+}\n\
+";
+
+const COPY_C: &str = "\
+// ---- convmat_copy: dst[0..n) = src[0..n) ----\n\
+void convmat_copy(double* dst, const double* src, double n) {\n\
+    int m = (int)n;\n\
+    for (int i = 0; i < m; i++) dst[i] = src[i];\n\
+}\n\
+";
+
+const SCALE_C: &str = "\
+// ---- convmat_scale: dst[0..n) = src[0..n) * k (scalar broadcast) ----\n\
+void convmat_scale(double* dst, const double* src, double n, double k) {\n\
+    int m = (int)n;\n\
+    for (int i = 0; i < m; i++) dst[i] = src[i] * k;\n\
+}\n\
+";
+
+const ADD_C: &str = "\
+// ---- convmat_add: dst[0..n) = a[0..n) + b[0..n) (elementwise) ----\n\
+void convmat_add(double* dst, const double* a, const double* b, double n) {\n\
+    int m = (int)n;\n\
+    for (int i = 0; i < m; i++) dst[i] = a[i] + b[i];\n\
+}\n\
+";
+
+const SUB_C: &str = "\
+// ---- convmat_sub: dst[0..n) = a[0..n) - b[0..n) (elementwise) ----\n\
+void convmat_sub(double* dst, const double* a, const double* b, double n) {\n\
+    int m = (int)n;\n\
+    for (int i = 0; i < m; i++) dst[i] = a[i] - b[i];\n\
+}\n\
+";
+
+const EWMUL_C: &str = "\
+// ---- convmat_ewmul: dst[0..n) = a[0..n) .* b[0..n) (elementwise) ----\n\
+void convmat_ewmul(double* dst, const double* a, const double* b, double n) {\n\
+    int m = (int)n;\n\
+    for (int i = 0; i < m; i++) dst[i] = a[i] * b[i];\n\
+}\n\
+";
+
+const NEG_C: &str = "\
+// ---- convmat_neg: dst[0..n) = -src[0..n) ----\n\
+void convmat_neg(double* dst, const double* src, double n) {\n\
+    int m = (int)n;\n\
+    for (int i = 0; i < m; i++) dst[i] = -src[i];\n\
+}\n\
 ";
 
 /// Lower a function that failed static triage into a runtime call.

@@ -316,8 +316,10 @@ fn append(context: &Context, block: Ptr<BasicBlock>, op: &dyn Op) {
         .append_op(context, op);
 }
 
-/// Collect the runtime helper names referenced by `matlab.call_void` ops
-/// anywhere in the module (including nested `if`/`while`/`for` regions).
+/// Collect the runtime helper names referenced anywhere in the module (including
+/// nested `if`/`while`/`for` regions): every `matlab.call_void` callee, plus any
+/// value-returning `matlab.call` whose callee is a `convmat_*` helper (libm calls
+/// like `sin` are skipped).
 fn collect_used_helpers(context: &Context, module: &ModuleOp) -> BTreeSet<String> {
     let mut used = BTreeSet::new();
     if let Some(block) = module.get_region(context).deref(context).get_entry_block() {
@@ -331,6 +333,11 @@ fn collect_used_helpers(context: &Context, module: &ModuleOp) -> BTreeSet<String
 fn collect_helpers_from_op(context: &Context, op: Ptr<Operation>, used: &mut BTreeSet<String>) {
     if let Some(call) = Operation::get_op::<matlab::CallVoidOp>(op, context) {
         used.insert(call.callee(context));
+    } else if let Some(call) = Operation::get_op::<matlab::CallOp>(op, context) {
+        let callee = call.callee(context);
+        if callee.starts_with("convmat_") {
+            used.insert(callee);
+        }
     }
     for region in op.deref(context).regions() {
         if let Some(block) = region.deref(context).get_entry_block() {

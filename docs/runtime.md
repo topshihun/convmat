@@ -81,7 +81,7 @@ typedef struct convmat_value {
         struct {
             convmat_dims shape;         // struct 数组形状（常见 1x1）
             int64_t nfields;
-            const char **field_names;   // UTF-8，nfields 项
+            const char **field_names;   // UTF-8，nfields 项（内核实现里为拥有的 `char **`）
             convmat_value **fields;     // 字段主序：fields[f * numel + i]
         } strct;
         struct {
@@ -141,6 +141,11 @@ int64_t        convmat_linear_index(const convmat_value *v, const int64_t *subs)
 共享的根基；静态 tier 不共享（栈/输出指针，所有权固定），所以**只有跨入动态 tier 的
 值才带 refcount**。
 
+> 现状：以上内核已实现（`src/runtime/mod.rs` 的 `DYNAMIC_RUNTIME_H` + `DYNAMIC_RUNTIME_C`），
+> 由 `tests/runtime.rs` 直接编译运行 C 源码验证（生命周期/深拷贝/数组/cell/struct/重分配），
+> 但尚未接入 `.m` 降级（见 §8 step 3）。数组存储暂只 `double`（`CONVMAT_DOUBLE`/`CONVMAT_LOGICAL`），
+> 其余 `convmat_dtype` 预留。
+
 ## 5. 运行时 ABI（动态函数调用）
 
 动态 tier 的函数统一走「运行时 ABI」，覆盖开放世界的 `varargin`/`varargout`、多值调用
@@ -194,12 +199,24 @@ void convmat_error_throw(const char *msg);   // longjmp 到最近 armed 的 catc
 
 ## 8. 分阶段落地（依赖 P7）
 
-1. **先判值分级**：扩展 `infer_locals`（自写轻量类型/形状推断，见 §10.5 建议），
-   标出 `Dynamic` 值 → 只有这些才走运行时库。
-2. **运行时库内核**：落地 §2–§4（`convmat_value` + 生命周期 + 数组/cell/struct helper），
-   作为内联 C（沿用 `helper_source` 的 `VerbatimOp` 发射机制，见 `src/runtime/mod.rs`）。
+1. **先判值分级**（✅ 已做）：扩展 `infer_locals` 加了 `infer_array_params`——
+   形参按「数组使用点」推断为 `Array{shape: Dynamic}`；`infer_struct_params` 同源。
+   剩余二义形参（`A + B`）仍需入口点类型标注。
+2. **运行时库内核**（✅ 已做）：落地 §2–§4（`convmat_value` + 生命周期 + 深拷贝 + 数组/cell/struct
+   helper），作为内联 C（`src/runtime/mod.rs` 的 `DYNAMIC_RUNTIME_H` + `DYNAMIC_RUNTIME_C`），
+   由 `tests/runtime.rs` 直接编译运行 C 源码验证。
 3. **seam**：把 `defer_to_runtime` 从报错改成 §6 的桥接 + 动态 ABI 调用。
-4. **逐特性接入**：按 §1 优先级（先 A 动态形状，再 B cell/struct/string，再 D
-   try/catch，最后 C 动态分派），每接一个补一组「最小 `.m` → IR → C」+ `run_*` 测试。
-5. **运行时内建**：`sort`/`find`/`mean`/`fft` 等在动态 tier 实现（§6），逐步从
-   `docs/unsupported.md` §7 移除。
+4. **逐特性接入**（🟡 A 动态形状已大幅推进）：动态形状数组形参已接「指针 + 长度」ABI
+   （`double* data, double n`），支持 `sum/prod/min/max(A)`（`convmat_*` 归约 helper）、
+   `numel/length(A)`、运行时下标 `A(i)`、`end`、`for i = 1:numel(A)` 运行时区间循环；
+   动态数组*输出*也已接入「缓冲 + 长度回填」ABI（`y = A(:)`→`convmat_copy`、
+   `y = -A(:)`→`convmat_neg`、`y = k * A`→`convmat_scale`、`y = A(:) ± B(:)`→`convmat_add/sub`、
+   `y = A(:) .* B(:)`→`convmat_ewmul`）。由 `tests/fixtures/array_*.m` + `run_*` 测试覆盖。
+   动态数组*中间值*、其他逐元素运算、cell/string、`try/catch`、动态分派待做。
+5. **运行时内建**（🟡 开始）：`sort(v)`（向量升序）已作为封装 helper `convmat_sort` 落地
+   （沿用 `helper_source` 机制，非 `convmat_value` 盒）；`find`/`mean`/`fft` 等待做。
+
+> 说明：当前动态形状数组形参未经过 `convmat_value` 盒，而是走更轻的「`double*` + `double n`」
+> ABI（`matlab.ptr` 类型）——因为归约/形状内省/常量下标都能直接用裸指针表达，无需盒模型。
+> `convmat_value` 盒与 §3 seam 是给**异构/动态类型**（cell、字符串、`s.(name)`、动态数组
+> *输出*）预留的。

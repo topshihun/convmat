@@ -38,6 +38,9 @@ pub enum Builtin {
     Eye,
     /// `reshape(A, dims...)`: relayout `A` to the given static dims.
     Reshape,
+    /// `sort(A)`: sort a vector ascending (a wrapped `convmat_sort` runtime
+    /// helper; only vectors are supported in the MVP).
+    Sort,
 }
 
 /// Which of `min`/`max` a [`Builtin::MinMax`] refers to.
@@ -66,6 +69,7 @@ impl Builtin {
             | Builtin::Fill(_)
             | Builtin::Eye => n == 1 || n == 2,
             Builtin::Reshape => n == 3,
+            Builtin::Sort => n == 1,
         }
     }
 }
@@ -109,6 +113,7 @@ pub fn lookup(name: &str) -> Option<Builtin> {
         "ones" => Builtin::Fill(1.0),
         "eye" => Builtin::Eye,
         "reshape" => Builtin::Reshape,
+        "sort" => Builtin::Sort,
         _ => return None,
     })
 }
@@ -126,7 +131,8 @@ pub fn libm_symbol(builtin: Builtin) -> Option<&'static str> {
         | Builtin::Size
         | Builtin::Fill(_)
         | Builtin::Eye
-        | Builtin::Reshape => None,
+        | Builtin::Reshape
+        | Builtin::Sort => None,
         Builtin::MinMax(MinMax::Min) => Some("fmin"),
         Builtin::MinMax(MinMax::Max) => Some("fmax"),
     }

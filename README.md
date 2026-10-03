@@ -24,7 +24,16 @@ End-to-end codegen works for a growing subset of MATLAB:
   instead of unrolled loops; see `docs/architecture.md` §10.2.1.
 - **Pure numeric built-ins** (`sin`/`cos`/`sqrt`/`abs`/`floor`/…,
   `sum`/`prod`/`min`/`max` with an optional dimension, `numel`/`length`/`size`,
-  `zeros`/`ones`/`eye`, `reshape`) lowered to `libm` calls.
+  `zeros`/`ones`/`eye`, `reshape`, `sort`) lowered to `libm` calls.
+- **Structs** (scalar fields): `struct('a', 1, …)` construction, `s.a` read/write,
+  and struct pass-by-value parameters / returns. Struct parameter layouts are
+  inferred from field use (`s.a`), matching MATLAB Coder's use-site inference.
+- **Dynamic-shape array parameters** as `(double* data, double n)`: reduce
+  (`sum`/`prod`/`min`/`max`), `numel`/`length`, runtime indexing `A(i)` / `end`, and
+  runtime-bound loops (`for i = 1:numel(A)`) over a parameter whose size is only
+  known at run time. **Dynamic-shape array outputs** use an out-buffer plus an
+  out-length cell the callee fills (`y = A(:)`, `y = -A(:)`, `y = k * A`,
+  `y = A(:) + B(:)`, `y = A(:) .* B(:)`); see `docs/architecture.md` §5, §10.5 P7.
 - **Indexing**: constant subscript `A(i,j)`, linear `A(i)`, `end`, and `A(:)`.
 - **Variadic arguments (closed-world specialization)**: `nargin`/`nargout` fold to
   compile-time constants; `varargin{k}` (constant `k`) resolves to the `k`-th extra

@@ -42,8 +42,9 @@ use pliron::{
 use crate::builtins::{self, Builtin, MinMax, ReduceOp};
 use crate::dialects::matlab::{
     AllocaOp, ArrayType, BinOp, BinOpKind, BreakOp, CallOp, CallVoidOp, CmpKind, CmpOp,
-    ConditionOp, ConstantOp, ContinueOp, DeleteOp, ForOp, IfOp, LoadOp, RangeForOp, ReturnOp,
-    SelectOp, StoreOp, StructCopyOp, StructGetOp, StructSetOp, StructType, WhileOp, YieldOp,
+    ConditionOp, ConstantOp, ContinueOp, DeleteOp, ForOp, IfOp, LoadOp, PtrType, RangeForOp,
+    ReturnOp, SelectOp, StoreOp, StructCopyOp, StructGetOp, StructSetOp, StructType, WhileOp,
+    YieldOp,
 };
 use crate::error::{Error, Result};
 use crate::triage::{
@@ -130,16 +131,20 @@ fn lower_function(
         .collect();
 
     // Split named outputs by ABI: scalars and structs are returned by value;
-    // arrays become out-pointer parameters supplied (and allocated) by the
-    // caller. `varargout` elements are specialized as extra scalar outputs.
+    // static-shape arrays become out-pointer parameters; dynamic-shape arrays
+    // become an out-pointer buffer *plus* an out-length cell (the callee writes
+    // the actual element count there). `varargout` elements are specialized as
+    // extra scalar outputs.
     let mut return_outputs: Vec<(BindingId, TypeHandle)> = Vec::new();
     let mut array_outputs: Vec<BindingId> = Vec::new();
+    let mut dynamic_outputs: Vec<BindingId> = Vec::new();
     for output in &named_outputs {
         match tys.get(output).cloned().unwrap_or(LocalTy::Scalar) {
             LocalTy::Scalar => return_outputs.push((*output, f64_ty)),
             LocalTy::Struct { fields } => {
                 return_outputs.push((*output, struct_type(context, &fields)?));
             }
+            LocalTy::Array { shape } if shape.is_dynamic() => dynamic_outputs.push(*output),
             LocalTy::Array { .. } => array_outputs.push(*output),
             LocalTy::Dynamic => {
                 return Err(Error::NotLowerable("dynamic output shape".to_string()))
@@ -147,31 +152,45 @@ fn lower_function(
         }
     }
 
-    let total_inputs = named_params.len() + variadics.varargin_count;
-
-    // Entry block argument types: named scalar/struct params first, then the
-    // extra `varargin` scalar args, then array out-params.
+    // Entry block argument layout: named params (scalar: 1 arg; struct: 1 arg;
+    // dynamic array: `double* data` + `double n`), then `varargin` scalars, then
+    // array out-params. Track each named param's first argument slot so the body
+    // can wire its data pointer and length.
     let scalar_cell_ty: TypeHandle = ArrayType::get(context, vec![1]).into();
     let mut entry_arg_types: Vec<TypeHandle> = Vec::new();
+    let mut named_param_args: HashMap<BindingId, usize> = HashMap::new();
+    let mut array_params: Vec<BindingId> = Vec::new();
     for param in &named_params {
-        let ty = match tys.get(param).cloned().unwrap_or(LocalTy::Scalar) {
-            LocalTy::Scalar => f64_ty,
-            LocalTy::Struct { fields } => struct_type(context, &fields)?,
+        named_param_args.insert(*param, entry_arg_types.len());
+        match tys.get(param).cloned().unwrap_or(LocalTy::Scalar) {
+            LocalTy::Scalar => entry_arg_types.push(f64_ty),
+            LocalTy::Struct { fields } => entry_arg_types.push(struct_type(context, &fields)?),
+            LocalTy::Array { shape } if shape.is_dynamic() => {
+                entry_arg_types.push(PtrType::get(context).into());
+                entry_arg_types.push(f64_ty);
+                array_params.push(*param);
+            }
             LocalTy::Array { .. } => {
                 return Err(Error::NotLowerable(
-                    "array parameters are not supported yet".to_string(),
+                    "static-shape array parameters are not supported".to_string(),
                 ))
             }
             LocalTy::Dynamic => return Err(Error::NotLowerable("dynamic parameter".to_string())),
-        };
-        entry_arg_types.push(ty);
+        }
     }
+    let named_param_arg_count = entry_arg_types.len();
     entry_arg_types.extend(vec![f64_ty; variadics.varargin_count]);
     for output in &array_outputs {
         let LocalTy::Array { shape } = tys[output] else {
             unreachable!("array output must have an array type");
         };
         entry_arg_types.push(ArrayType::get(context, vec![static_numel(shape)? as i64]).into());
+    }
+    // Dynamic array outputs: an out-buffer (`double*`) and an out-length
+    // (`double*`) the callee writes the actual element count into.
+    for _ in &dynamic_outputs {
+        entry_arg_types.push(PtrType::get(context).into());
+        entry_arg_types.push(PtrType::get(context).into());
     }
     // Result types: value outputs (scalar/struct) first, then the extra scalar
     // `varargout` cells.
@@ -183,10 +202,12 @@ fn lower_function(
     let func = FuncOp::new(context, name_id, fn_ty);
     let entry = func.get_entry_block(context);
 
-    // Allocate a stack cell per binding. Array outputs are caller-provided and
-    // are wired to their incoming buffers below; the `varargin`/`varargout` cell
-    // bindings are specialized away (no cell is materialized).
+    // Allocate a stack cell per binding. Array outputs and array parameters are
+    // caller-provided and are wired to their incoming arguments below; the
+    // `varargin`/`varargout` cell bindings are specialized away.
     let mut skip_ids: HashSet<BindingId> = array_outputs.iter().copied().collect();
+    skip_ids.extend(dynamic_outputs.iter().copied());
+    skip_ids.extend(array_params.iter().copied());
     if let Some(local) = variadics.varargin_local {
         skip_ids.insert(local);
     }
@@ -194,6 +215,8 @@ fn lower_function(
         skip_ids.insert(local);
     }
     let mut locals: HashMap<BindingId, Value> = HashMap::new();
+    let mut array_lens: HashMap<BindingId, Value> = HashMap::new();
+    let mut array_out_lens: HashMap<BindingId, Value> = HashMap::new();
     let mut heap_cells: Vec<Value> = Vec::new();
     for binding in &function.locals {
         if skip_ids.contains(binding) {
@@ -231,23 +254,33 @@ fn lower_function(
         locals.insert(*binding, value);
     }
 
-    // Store incoming named parameters into their cells. Scalar params are
-    // stored element-wise into a length-1 cell; struct params are copied by
-    // value (`StructCopyOp`), since they are not array cells.
-    for (index, param) in named_params.iter().enumerate() {
-        let argument = entry.deref(context).get_argument(index);
-        let target = locals
-            .get(param)
-            .copied()
-            .ok_or_else(|| Error::Backend(format!("no cell for parameter {param:?}")))?;
+    // Wire incoming named parameters into their cells. Scalar params are stored
+    // element-wise into a length-1 cell; struct params are copied by value
+    // (`StructCopyOp`); dynamic-array params are caller-provided pointers wired
+    // directly (data pointer + length).
+    for (param, &arg_index) in &named_param_args {
+        let argument = entry.deref(context).get_argument(arg_index);
         match tys.get(param).cloned().unwrap_or(LocalTy::Scalar) {
-            LocalTy::Struct { .. } => {
-                let copy = StructCopyOp::new(context, target, argument);
-                append(context, entry, &copy);
+            LocalTy::Array { shape } if shape.is_dynamic() => {
+                let len = entry.deref(context).get_argument(arg_index + 1);
+                locals.insert(*param, argument);
+                array_lens.insert(*param, len);
             }
             _ => {
-                let zero = emit_constant(context, entry, 0.0)?;
-                emit_store(context, entry, target, zero, argument);
+                let target = locals
+                    .get(param)
+                    .copied()
+                    .ok_or_else(|| Error::Backend(format!("no cell for parameter {param:?}")))?;
+                match tys.get(param).cloned().unwrap_or(LocalTy::Scalar) {
+                    LocalTy::Struct { .. } => {
+                        let copy = StructCopyOp::new(context, target, argument);
+                        append(context, entry, &copy);
+                    }
+                    _ => {
+                        let zero = emit_constant(context, entry, 0.0)?;
+                        emit_store(context, entry, target, zero, argument);
+                    }
+                }
             }
         }
     }
@@ -255,7 +288,7 @@ fn lower_function(
     // `varargin{k}` resolves directly to the (k-1)-th extra scalar argument.
     let mut varargin_args = Vec::with_capacity(variadics.varargin_count);
     for k in 0..variadics.varargin_count {
-        varargin_args.push(entry.deref(context).get_argument(named_params.len() + k));
+        varargin_args.push(entry.deref(context).get_argument(named_param_arg_count + k));
     }
 
     // `nargin`/`nargout` fold to compile-time constants (fixed arity + variadic).
@@ -279,8 +312,21 @@ fn lower_function(
 
     // Wire array outputs to their incoming caller-provided buffers.
     for (offset, output) in array_outputs.iter().enumerate() {
-        let argument = entry.deref(context).get_argument(total_inputs + offset);
+        let argument = entry
+            .deref(context)
+            .get_argument(named_param_arg_count + variadics.varargin_count + offset);
         locals.insert(*output, argument);
+    }
+
+    // Wire dynamic array outputs to their out-buffer + out-length arguments.
+    let dynamic_base = named_param_arg_count + variadics.varargin_count + array_outputs.len();
+    for (offset, output) in dynamic_outputs.iter().enumerate() {
+        let buffer = entry.deref(context).get_argument(dynamic_base + 2 * offset);
+        let len = entry
+            .deref(context)
+            .get_argument(dynamic_base + 2 * offset + 1);
+        locals.insert(*output, buffer);
+        array_out_lens.insert(*output, len);
     }
 
     let lowerer = FuncLowerer {
@@ -292,6 +338,8 @@ fn lower_function(
         varargin_args,
         varargout_local: variadics.varargout_local,
         varargout_cells,
+        array_lens,
+        array_out_lens,
         return_outputs,
     };
     lowerer.lower_block(context, entry, &function.body)?;
@@ -381,6 +429,10 @@ struct FuncLowerer {
     varargout_local: Option<BindingId>,
     /// The scalar cell for each `varargout{k}` (0-based).
     varargout_cells: Vec<Value>,
+    /// The runtime length (`double n`) of each dynamic-shape array parameter.
+    array_lens: HashMap<BindingId, Value>,
+    /// The out-length cell (`double*`) of each dynamic-shape array output.
+    array_out_lens: HashMap<BindingId, Value>,
     /// Value outputs (scalar or struct), in ABI order, with their return type.
     return_outputs: Vec<(BindingId, TypeHandle)>,
 }
@@ -481,6 +533,17 @@ impl FuncLowerer {
                         let value = self.lower_expr(context, block, value)?;
                         let zero = emit_constant(context, block, 0.0)?;
                         emit_store(context, block, cell, zero, value);
+                    }
+                    LocalTy::Array { shape } if shape.is_dynamic() => {
+                        // Dynamic array output: fill the caller's buffer, then
+                        // report the actual element count to the out-length cell
+                        // (which may be absent for an intermediate, unused value).
+                        self.lower_array_expr_into(context, block, value, cell)?;
+                        if let Some(out_len) = self.array_out_lens.get(target).copied() {
+                            let len = self.dynamic_array_len(value)?;
+                            let zero = emit_constant(context, block, 0.0)?;
+                            emit_store(context, block, out_len, zero, len);
+                        }
                     }
                     LocalTy::Array { .. } => {
                         self.lower_array_expr_into(context, block, value, cell)?;
@@ -691,12 +754,56 @@ impl FuncLowerer {
         }
         let src = self.array_source(context, block, base)?;
         let shape = self.array_shape(base)?;
-        let offset = self.static_linear_offset(indexing, shape)?;
-        let index = emit_constant(context, block, offset as f64)?;
+        let index = if shape.is_dynamic() {
+            self.dynamic_linear_offset(context, block, indexing, base)?
+        } else {
+            let offset = self.static_linear_offset(indexing, shape)?;
+            emit_constant(context, block, offset as f64)?
+        };
         let load = LoadOp::new(context, src, index);
         let result = load.get_result(context);
         append(context, block, &load);
         Ok(result)
+    }
+
+    /// Runtime 0-based linear offset for a scalar index into a dynamic-shape
+    /// array parameter (treated as a vector). Supports a single component: a
+    /// runtime index expression `i` (`i - 1`) or `end`±k (`n + k - 1`).
+    fn dynamic_linear_offset(
+        &self,
+        context: &mut Context,
+        block: Ptr<BasicBlock>,
+        indexing: &IndexingSemantics,
+        base: &HirExpr,
+    ) -> Result<Value> {
+        if indexing.components.len() != 1 {
+            return Err(Error::NotLowerable(
+                "multi-dimensional indexing of a dynamic array is not supported".to_string(),
+            ));
+        }
+        let component = &indexing.components[0];
+        if component_is_colon(component) {
+            return Err(Error::NotLowerable(
+                "colon indexing of a dynamic array is not supported".to_string(),
+            ));
+        }
+        // `end` [+/- k] -> 0-based offset `n + k - 1`.
+        if let Some(offset) = component_end_offset(component) {
+            let n = self.array_len_value(context, block, base)?;
+            let adj = emit_constant(context, block, offset as f64)?;
+            let sum = self.append_binop(context, block, BinOpKind::Add, n, adj)?;
+            let one = emit_constant(context, block, 1.0)?;
+            return self.append_binop(context, block, BinOpKind::Sub, sum, one);
+        }
+        // A 1-based scalar index `i` -> 0-based offset `i - 1`.
+        if let IndexComponent::Expr(expr) = component {
+            let i = self.lower_expr(context, block, expr)?;
+            let one = emit_constant(context, block, 1.0)?;
+            return self.append_binop(context, block, BinOpKind::Sub, i, one);
+        }
+        Err(Error::NotLowerable(
+            "logical indexing of a dynamic array is not supported".to_string(),
+        ))
     }
 
     /// Compile-time column-major linear offset of a scalar index expression.
@@ -831,6 +938,9 @@ impl FuncLowerer {
                 self.reduce_arg(context, block, args[0], Reducer::from_reduce(op))
             }
             Builtin::Numel => match self.operand_type(args[0]) {
+                LocalTy::Array { shape } if shape.is_dynamic() => {
+                    self.array_len_value(context, block, args[0])
+                }
                 LocalTy::Array { shape } => emit_constant(context, block, shape.numel() as f64),
                 LocalTy::Scalar => emit_constant(context, block, 1.0),
                 LocalTy::Struct { .. } | LocalTy::Dynamic => {
@@ -839,6 +949,11 @@ impl FuncLowerer {
             },
             Builtin::Length => {
                 let max = match self.operand_type(args[0]) {
+                    // A dynamic array parameter is treated as a vector: its
+                    // length is its runtime element count.
+                    LocalTy::Array { shape } if shape.is_dynamic() => {
+                        return self.array_len_value(context, block, args[0]);
+                    }
                     LocalTy::Array { shape } => shape.dims().iter().copied().max().unwrap_or(1),
                     LocalTy::Scalar => 1,
                     LocalTy::Struct { .. } | LocalTy::Dynamic => {
@@ -850,6 +965,11 @@ impl FuncLowerer {
             Builtin::Size => {
                 let dim = self.dim_arg(call)?.unwrap_or(1);
                 let size = match self.operand_type(args[0]) {
+                    // `size` of a dynamic-shape array parameter is ambiguous
+                    // (row vs column orientation is unknown).
+                    LocalTy::Array { shape } if shape.is_dynamic() => {
+                        return Err(Error::NotLowerable("dynamic size".to_string()))
+                    }
                     LocalTy::Array { shape } if dim >= 1 && dim <= shape.rank() => {
                         shape.dims()[dim - 1]
                     }
@@ -857,11 +977,11 @@ impl FuncLowerer {
                 };
                 emit_constant(context, block, size as f64)
             }
-            // Constructors and reshape always produce arrays; they are handled
+            // Constructors and reshape/sort always produce arrays; they are handled
             // by the array path and never reach the scalar path.
-            Builtin::Fill(_) | Builtin::Eye | Builtin::Reshape => Err(Error::NotLowerable(
-                "constructor reached scalar path".to_string(),
-            )),
+            Builtin::Fill(_) | Builtin::Eye | Builtin::Reshape | Builtin::Sort => Err(
+                Error::NotLowerable("constructor reached scalar path".to_string()),
+            ),
         }
     }
 
@@ -882,7 +1002,8 @@ impl FuncLowerer {
         }
     }
 
-    /// Lower a reduction over a scalar (identity) or an array (loop).
+    /// Lower a reduction over a scalar (identity), a static array (compile-time
+    /// loop), or a dynamic-shape array parameter (a `convmat_*` runtime helper).
     fn reduce_arg(
         &self,
         context: &mut Context,
@@ -892,6 +1013,18 @@ impl FuncLowerer {
     ) -> Result<Value> {
         match self.operand_type(operand) {
             LocalTy::Scalar => self.lower_expr(context, block, operand),
+            LocalTy::Array { shape } if shape.is_dynamic() => {
+                let src = self.array_source(context, block, operand)?;
+                let n = self.array_len_value(context, block, operand)?;
+                let callee = match reducer {
+                    Reducer::Add => crate::runtime::SUM,
+                    Reducer::Mul => crate::runtime::PROD,
+                    Reducer::Min => crate::runtime::MIN,
+                    Reducer::Max => crate::runtime::MAX,
+                };
+                // `convmat_*` reductions return the scalar directly.
+                self.emit_libm_call(context, block, callee, &[src, n])
+            }
             LocalTy::Array { shape } => {
                 let src = self.array_source(context, block, operand)?;
                 self.reduce(context, block, reducer, src, shape.numel())
@@ -986,6 +1119,9 @@ impl FuncLowerer {
                             ));
                         };
                         let shape = match self.operand_type(arg) {
+                            LocalTy::Array { shape } if shape.is_dynamic() => {
+                                return Err(Error::NotLowerable("dynamic size".to_string()))
+                            }
                             LocalTy::Array { shape } => shape,
                             LocalTy::Scalar => Shape::matrix(1, 1),
                             LocalTy::Struct { .. } | LocalTy::Dynamic => {
@@ -1042,6 +1178,36 @@ impl FuncLowerer {
                         }
                         Ok(())
                     }
+                    Builtin::Sort => {
+                        // Sort a vector ascending into `dest` (a wrapped runtime
+                        // helper). Matrix (rank-2 with both dims > 1) column sort
+                        // is not supported yet.
+                        let [arg] = call.args.as_slice() else {
+                            return Err(Error::NotLowerable(
+                                "sort expects a single array argument".to_string(),
+                            ));
+                        };
+                        let src = self.array_source(context, block, arg)?;
+                        let shape = self.array_shape(arg)?;
+                        if shape.is_dynamic() {
+                            return Err(Error::NotLowerable(
+                                "sort of a dynamic array is not supported".to_string(),
+                            ));
+                        }
+                        if shape.rank() != 2 || (shape.dims()[0] != 1 && shape.dims()[1] != 1) {
+                            return Err(Error::NotLowerable(
+                                "sort is only supported for vectors".to_string(),
+                            ));
+                        }
+                        let n = emit_constant(context, block, shape.numel() as f64)?;
+                        self.emit_extern_call(
+                            context,
+                            block,
+                            crate::runtime::SORT,
+                            &[dest, src, n],
+                        );
+                        Ok(())
+                    }
                     _ => Err(Error::NotLowerable(format!(
                         "array result from `{name}` is not supported"
                     ))),
@@ -1060,6 +1226,12 @@ impl FuncLowerer {
                 };
                 let _ = indexing;
                 let src = self.array_source(context, block, base)?;
+                if self.array_shape(base)?.is_dynamic() {
+                    // Dynamic source: copy elementwise via a runtime helper.
+                    let n = self.array_len_value(context, block, base)?;
+                    self.emit_extern_call(context, block, crate::runtime::COPY, &[dest, src, n]);
+                    return Ok(());
+                }
                 let n = self.array_len(base)?;
                 for offset in 0..n {
                     let idx = emit_constant(context, block, offset as f64)?;
@@ -1089,12 +1261,22 @@ impl FuncLowerer {
                 .get(id)
                 .copied()
                 .ok_or_else(|| Error::Backend(format!("binding {id:?} has no cell"))),
+            // `A(:)` on a dynamic (vector) array is the identity: the same data
+            // pointer (linear order is unchanged), so it needs no temporary.
+            HirExprKind::Index(base, _) if matches!(self.operand_type(base), LocalTy::Array { shape } if shape.is_dynamic()) => {
+                self.array_source(context, block, base)
+            }
             _ => {
                 let LocalTy::Array { shape } = self.operand_type(expr) else {
                     return Err(Error::NotLowerable(
                         "array source must be an array".to_string(),
                     ));
                 };
+                if shape.is_dynamic() {
+                    return Err(Error::NotLowerable(
+                        "dynamic array expression (not a parameter) is not supported".to_string(),
+                    ));
+                }
                 let temp = self.alloca_array(context, block, shape)?;
                 self.lower_array_expr_into(context, block, expr, temp)?;
                 Ok(temp)
@@ -1102,11 +1284,58 @@ impl FuncLowerer {
         }
     }
 
-    /// The flattened element count of an array-typed expression.
+    /// The flattened element count of an array-typed expression. Dynamic-shape
+    /// arrays have no compile-time count and are rejected here (use
+    /// [`Self::array_len_value`] for a runtime length).
     fn array_len(&self, expr: &HirExpr) -> Result<usize> {
         match self.operand_type(expr) {
+            LocalTy::Array { shape } if shape.is_dynamic() => Err(Error::NotLowerable(
+                "compile-time array length required here".to_string(),
+            )),
             LocalTy::Array { shape } => Ok(shape.numel()),
             _ => Err(Error::NotLowerable("expected an array operand".to_string())),
+        }
+    }
+
+    /// The element count of an array-typed expression as an IR value: a
+    /// compile-time constant for static shapes, or a runtime length for a
+    /// dynamic-shape expression (see [`Self::dynamic_array_len`]).
+    fn array_len_value(
+        &self,
+        context: &mut Context,
+        block: Ptr<BasicBlock>,
+        expr: &HirExpr,
+    ) -> Result<Value> {
+        match self.operand_type(expr) {
+            LocalTy::Array { shape } if shape.is_dynamic() => self.dynamic_array_len(expr),
+            LocalTy::Array { shape } => emit_constant(context, block, shape.numel() as f64),
+            _ => Err(Error::NotLowerable("expected an array operand".to_string())),
+        }
+    }
+
+    /// The runtime element count of a dynamic-shape array expression, by
+    /// walking to the array operand that determines its length. Elementwise
+    /// operators (`scalar op A`, `-A`) and `A(:)` preserve the operand's length.
+    fn dynamic_array_len(&self, expr: &HirExpr) -> Result<Value> {
+        match &expr.kind {
+            HirExprKind::Binding(id) => self
+                .array_lens
+                .get(id)
+                .copied()
+                .ok_or_else(|| Error::Backend(format!("no length for array {id:?}"))),
+            HirExprKind::Index(base, _) | HirExprKind::Unary(_, base) => {
+                self.dynamic_array_len(base)
+            }
+            HirExprKind::Binary(lhs, _, rhs) => {
+                if matches!(self.operand_type(lhs), LocalTy::Array { .. }) {
+                    self.dynamic_array_len(lhs)
+                } else {
+                    self.dynamic_array_len(rhs)
+                }
+            }
+            _ => Err(Error::NotLowerable(
+                "dynamic array length of this expression is not supported".to_string(),
+            )),
         }
     }
 
@@ -1644,6 +1873,11 @@ impl FuncLowerer {
             OperatorKind::Transpose | OperatorKind::ConjugateTranspose => {
                 let src = self.array_source(context, block, operand)?;
                 let shape = self.array_shape(operand)?;
+                if shape.is_dynamic() {
+                    return Err(Error::NotLowerable(
+                        "transpose of a dynamic array is not supported".to_string(),
+                    ));
+                }
                 if shape.rank() != 2 {
                     return Err(Error::NotLowerable(
                         "only 2-D transpose is supported".to_string(),
@@ -1653,6 +1887,17 @@ impl FuncLowerer {
             }
             OperatorKind::UnaryMinus | OperatorKind::UnaryPlus | OperatorKind::Not => {
                 let src = self.array_source(context, block, operand)?;
+                if matches!(self.operand_type(operand), LocalTy::Array { shape } if shape.is_dynamic())
+                {
+                    let n = self.array_len_value(context, block, operand)?;
+                    let callee = match op {
+                        OperatorKind::UnaryMinus => crate::runtime::NEG,
+                        // `+A` is the identity; a copy into the out-buffer suffices.
+                        _ => crate::runtime::COPY,
+                    };
+                    self.emit_extern_call(context, block, callee, &[dest, src, n]);
+                    return Ok(());
+                }
                 let n = self.array_len(operand)?;
                 self.map_unary_op(context, block, op, src, dest, n)
             }
@@ -1673,6 +1918,49 @@ impl FuncLowerer {
         // Matrix power is not elementwise: route it to its own helper.
         if *op == OperatorKind::MatrixPower {
             return self.lower_matrix_power(context, block, lhs, rhs, dest);
+        }
+        // Dynamic-shape operands: scalar broadcast via `convmat_scale`, or two
+        // equal-length dynamic arrays via `convmat_add`/`sub`/`ewmul`.
+        let dyn_lhs =
+            matches!(self.operand_type(lhs), LocalTy::Array { shape } if shape.is_dynamic());
+        let dyn_rhs =
+            matches!(self.operand_type(rhs), LocalTy::Array { shape } if shape.is_dynamic());
+        if dyn_lhs || dyn_rhs {
+            if dyn_lhs && dyn_rhs {
+                // Two dynamic arrays, elementwise, same length.
+                let callee = match op {
+                    OperatorKind::Add => crate::runtime::ADD,
+                    OperatorKind::Subtract => crate::runtime::SUB,
+                    OperatorKind::ElementwiseMultiply => crate::runtime::EWMUL,
+                    _ => {
+                        return Err(Error::NotLowerable(
+                            "unsupported elementwise operator for dynamic arrays".to_string(),
+                        ))
+                    }
+                };
+                let a = self.array_source(context, block, lhs)?;
+                let b = self.array_source(context, block, rhs)?;
+                let n = self.array_len_value(context, block, lhs)?;
+                self.emit_extern_call(context, block, callee, &[dest, a, b, n]);
+                return Ok(());
+            }
+            // One dynamic array + one scalar: broadcast via `convmat_scale` (`*`).
+            if *op != OperatorKind::ElementwiseMultiply && *op != OperatorKind::MatrixMultiply {
+                return Err(Error::NotLowerable(
+                    "only `.*`/`*` scalar broadcast is supported for dynamic arrays".to_string(),
+                ));
+            }
+            let (array, scalar) = if dyn_rhs { (rhs, lhs) } else { (lhs, rhs) };
+            if !matches!(self.operand_type(scalar), LocalTy::Scalar) {
+                return Err(Error::NotLowerable(
+                    "only scalar broadcast is supported for dynamic arrays".to_string(),
+                ));
+            }
+            let src = self.array_source(context, block, array)?;
+            let n = self.array_len_value(context, block, array)?;
+            let k = self.lower_expr(context, block, scalar)?;
+            self.emit_extern_call(context, block, crate::runtime::SCALE, &[dest, src, n, k]);
+            return Ok(());
         }
         match (self.operand_type(lhs), self.operand_type(rhs)) {
             (LocalTy::Scalar, LocalTy::Array { shape }) => {

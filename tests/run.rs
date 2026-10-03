@@ -659,6 +659,140 @@ fn run_rowvec() {
     );
 }
 
+#[test]
+fn run_sort_vec() {
+    // `sort([3, 1, 2])` sorts a vector ascending via the `convmat_sort` helper.
+    run_exact(
+        "sort_vec",
+        "void sort_vec(double*);",
+        "double o[3]; sort_vec(o);\n    printf(\"%g %g %g\\n\", o[0], o[1], o[2]);",
+        "1 2 3",
+    );
+}
+
+#[test]
+fn run_array_param_sum() {
+    // A dynamic-shape array parameter lowers to `(double* data, double n)`; the
+    // reduction goes through the `convmat_sum` runtime helper.
+    run_exact(
+        "array_sum",
+        "double array_sum(double*, double);",
+        "double a[3] = {1.0, 2.0, 3.0};\n    printf(\"%g\\n\", array_sum(a, 3));",
+        "6",
+    );
+}
+
+#[test]
+fn run_array_param_numel() {
+    // `numel`/`length` of a dynamic-shape array parameter is its runtime length.
+    run_exact(
+        "array_numel",
+        "double array_numel(double*, double);",
+        "double a[4] = {0.0, 0.0, 0.0, 0.0};\n    printf(\"%g\\n\", array_numel(a, 4));",
+        "4",
+    );
+}
+
+#[test]
+fn run_array_param_index() {
+    // A constant-index read on a dynamic array parameter is `data[i-1]`.
+    run_exact(
+        "array_param_index",
+        "double array_param_index(double*, double);",
+        "double a[3] = {7.0, 8.0, 9.0};\n    printf(\"%g\\n\", array_param_index(a, 3));",
+        "7",
+    );
+}
+
+#[test]
+fn run_array_get() {
+    // A runtime index `i` into a dynamic array parameter is `data[i-1]`.
+    run_exact(
+        "array_get",
+        "double array_get(double*, double, double);",
+        "double a[3] = {7.0, 8.0, 9.0};\n    printf(\"%g\\n\", array_get(a, 3, 2));",
+        "8",
+    );
+}
+
+#[test]
+fn run_array_last() {
+    // `A(end)` on a dynamic array parameter is `data[n-1]`.
+    run_exact(
+        "array_last",
+        "double array_last(double*, double);",
+        "double a[3] = {7.0, 8.0, 9.0};\n    printf(\"%g\\n\", array_last(a, 3));",
+        "9",
+    );
+}
+
+#[test]
+fn run_array_loop_sum() {
+    // A `for i = 1:numel(A)` loop with a runtime bound, indexing `A(i)`.
+    run_exact(
+        "array_loop_sum",
+        "double array_loop_sum(double*, double);",
+        "double a[3] = {7.0, 8.0, 9.0};\n    printf(\"%g\\n\", array_loop_sum(a, 3));",
+        "24",
+    );
+}
+
+#[test]
+fn run_array_copy() {
+    // A dynamic array output: the caller passes an out-buffer and an out-length
+    // cell; the callee fills the buffer and reports the actual length.
+    run_exact(
+        "array_copy",
+        "void array_copy(double*, double, double*, double*);",
+        "double a[3] = {1.0, 2.0, 3.0};\n    double y[3];\n    double yn;\n    array_copy(a, 3, y, &yn);\n    printf(\"%g %g %g %g\\n\", y[0], y[1], y[2], yn);",
+        "1 2 3 3",
+    );
+}
+
+#[test]
+fn run_array_scale() {
+    // Scalar broadcast into a dynamic array output (`y = 2 * A`).
+    run_exact(
+        "array_scale",
+        "void array_scale(double*, double, double*, double*);",
+        "double a[3] = {1.0, 2.0, 3.0};\n    double y[3];\n    double yn;\n    array_scale(a, 3, y, &yn);\n    printf(\"%g %g %g %g\\n\", y[0], y[1], y[2], yn);",
+        "2 4 6 3",
+    );
+}
+
+#[test]
+fn run_array_add() {
+    // Two equal-length dynamic arrays, elementwise (`y = A(:) + B(:)`).
+    run_exact(
+        "array_add",
+        "void array_add(double*, double, double*, double, double*, double*);",
+        "double a[3] = {1.0, 2.0, 3.0};\n    double b[3] = {10.0, 20.0, 30.0};\n    double y[3];\n    double yn;\n    array_add(a, 3, b, 3, y, &yn);\n    printf(\"%g %g %g %g\\n\", y[0], y[1], y[2], yn);",
+        "11 22 33 3",
+    );
+}
+
+#[test]
+fn run_array_mul() {
+    // Two equal-length dynamic arrays, elementwise multiply (`y = A(:) .* B(:)`).
+    run_exact(
+        "array_mul",
+        "void array_mul(double*, double, double*, double, double*, double*);",
+        "double a[3] = {1.0, 2.0, 3.0};\n    double b[3] = {10.0, 20.0, 30.0};\n    double y[3];\n    double yn;\n    array_mul(a, 3, b, 3, y, &yn);\n    printf(\"%g %g %g %g\\n\", y[0], y[1], y[2], yn);",
+        "10 40 90 3",
+    );
+}
+
+#[test]
+fn run_array_neg() {
+    // Unary negate into a dynamic array output (`y = -A(:)`).
+    run_exact(
+        "array_neg",
+        "void array_neg(double*, double, double*, double*);",
+        "double a[3] = {1.0, -2.0, 3.0};\n    double y[3];\n    double yn;\n    array_neg(a, 3, y, &yn);\n    printf(\"%g %g %g %g\\n\", y[0], y[1], y[2], yn);",
+        "-1 2 -3 3",
+    );
+}
+
 // --- Matrix elementwise operators / broadcast / transpose ---------------------
 
 #[test]

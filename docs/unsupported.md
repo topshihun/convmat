@@ -62,8 +62,10 @@
 |------|----------|----------|
 | `permute` / `repmat` / `cat` / `horzcat` / `vertcat` | 内建未收录 | `builtins::lookup`、架构 §10.5（P4） |
 | N-D 数组（rank > 2 的转置/广播等） | 大多未覆盖 | `MAX_RANK`/`lower_array_unary` |
-| 动态形状数组 | 报错 `dynamic shape arrays need runtime heap allocation (not implemented)` | `mir_to_mlir::static_numel`、§10.5（P7） |
-| 数组形参 | 被当作标量（`sum(param)` 视为恒等） | `triage::infer_locals`、§10.5 已知限制 |
+| 动态形状数组 | 数组形参/输出已支持（见下行）；任意动态形状中间值报错 `unresolved shape` / `dynamic array expression` | `triage::classify`、`hir_to_mlir::array_source`、§10.5（P7） |
+| 数组形参 | 已支持「指针 + 长度」ABI（`double* v1, double v2`）：归约（`sum/prod/min/max`）、`numel/length`、运行时下标 `A(i)`、`end`、运行时区间 `for` 循环；数组/标量二义用法（`A+B`）仍当标量；无越界检查 | `triage::infer_array_params`、`hir_to_mlir::lower_function`、§10.5 P7 |
+| 动态数组输出 | 已支持「缓冲 + 长度回填」ABI：`y = A(:)`、`y = -A(:)`、`y = k * A`（标量广播）、`y = A(:) ± B(:)`、`y = A(:) .* B(:)`（等长双数组）；其他输出表达式未支持 | `hir_to_mlir::lower_array_unary`/`lower_array_binary`、§5、§10.5 P7 |
+| 动态数组中间值 | 报错 `unresolved shape`（需体内运行时分配，未实现） | `triage::classify`、§10.5 P7 |
 | 数组增长 / 追加（`x(end+1) = ...`） | 需运行时堆分配，未实现 | §11.3 |
 
 ## 7. 内建函数（未收录，defer 到运行时）
@@ -71,7 +73,7 @@
 `builtins::lookup` 只收录纯数值逐元素/归约/形状内省/构造器子集，其余全部
 `unsupported builtin`（defer）。代表性未支持项：
 
-- **排序 / 查找**：`sort`、`find`、`unique`、`ismember`
+- **排序 / 查找**：`find`、`unique`、`ismember`（`sort` 已支持向量升序，见 `docs/architecture.md` §10.3；矩阵列排序未做）
 - **统计**：`mean`、`var`、`std`、`median`、`cumsum`、`cumprod`、`diff`、`all`、`any`
 - **线性代数**：`dot`、`cross`、`norm`、`det`、`inv`、`eig`、`svd`、`chol`、`lu`、`qr`、`pinv`
 - **信号 / 插值**：`fft`、`ifft`、`conv`、`filter`、`polyval`、`polyfit`、`interp1`、`interp2`
