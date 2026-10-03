@@ -20,6 +20,7 @@ pub mod error;
 pub mod frontend;
 pub mod hir_to_mlir;
 pub mod lowering;
+pub mod passes;
 pub mod pipeline;
 pub mod runtime;
 pub mod triage;

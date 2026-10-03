@@ -29,7 +29,7 @@
 | 数组/矩阵值模型 | `Shape::Static`（列主序 `matlab.array`）与 `Shape::Dynamic`（形状描述符） |
 | 内建函数降级 | 纯数值内建 → C `libm` 的 `matlab.call` 或内联 pattern；有副作用/形状未知的 → 运行时兔底 |
 | 是否自定义方言 | **定义两个 pliron 方言**：`matlab`（语义）与 `emitc`（C 级），之间用 pliron pass 降级 |
-| 优化 | 暂不做（不接 canonicalize/CSE/linalg）；优先「生成正确的 C」，后续按需补 |
+| 优化 | 按方言分层的独立 pass（`src/passes/{matlab,emitc}.rs`，基于 pliron `Pass` 框架）：`matlab` 语义优化 + `emitc` C 层清理；canonicalize/CSE/linalg/向量化仍延后 |
 
 ## 3. 决策一：从 HIR 降级（而非 AST 或 MIR）
 
@@ -184,7 +184,9 @@ flowchart TD
 | 0 前端 | `src/frontend::parse_hir` | `.m` 源文本 | `runmat_parser::parse` → `runmat_hir::lower` | `HirAssembly`（lexer→parser→HIR，名字已解析、操作符已脱糖） |
 | 1 边界 | `src/triage::classify` | `HirAssembly` 的每个 `HirFunction` | 自研白名单 + `infer_locals`（形状推断，区分 `Static`/`Dynamic`） | `Static`（可生成）或 `Deferred`（降运行时，MVP 报错） |
 | 2 降级 | `src/hir_to_mlir::lower_to_module` | 可生成代码的 `HirFunction` | pliron + `matlab` 方言 + `builtins` 表（`matlab.call @libm`） | `matlab` 方言 module（含数组/矩阵/内建/控制流） |
+| 2.5 优化 | `src/passes::run_matlab_passes` | `matlab` 方言 module | pliron `Pass` 框架（`NestedOpsPass`/`OpPass`） | `matlab` 方言 module（折叠/传播/死分支已做） |
 | 3 降级 | `src/lowering::lower_module` | `matlab` 方言 module（builtin 容器） | 自研 pass（pliron 框架） | builtin module：`builtin.func`（body 为 `emitc.*` op）+ 顶层指令；ABI 已解析、数组已命名 |
+| 3.25 优化 | `src/passes::run_emitc_passes` | builtin module（`emitc.*` body） | pliron `Pass` 框架 | builtin module（死单元/死值已清） |
 | 4 发射 | `src/emit_c::emit` | builtin module（`builtin.func` + `emitc.*`） | 自写 pretty-printer | C 源码文本（最终产物） |
 | 5 运行时兔底（分支） | `src/runtime::defer_to_runtime` | 被 `Deferred` 的函数（从阶段 1 分支） | 运行时 shim（MVP 尚未实现，当前报错） | 运行时调用（预留） |
 
@@ -213,6 +215,7 @@ flowchart TD
 | 2 边界 | `src/triage/` | 静态 vs 动态分类，产出「可生成代码计划」+ 形状推断（`Shape`/`LocalTy`） | 自研（核心） |
 | 2.5 方言 | `src/dialects/matlab.rs` | `matlab` 方言（语义）：数组类型 + 标量/数组/控制流 op | 自研（核心） |
 | 3 降级 | `src/hir_to_mlir/` | HIR → `matlab` 方言；动态部分 → 运行时调用；内存分配策略 | 自研（核心） |
+| 3.2 优化 | `src/passes/` | 按方言分层的独立优化 pass：`matlab.rs`（语义：折叠/传播/死分支/死值）、`emitc.rs`（C 层：死单元/死值）；基于 pliron `Pass` 框架 | 自研（可选） |
 | 3.5 内建表 | `src/builtins.rs` | 内建函数名 → 降级配方（`libm` 符号/归约/内联） | 自研（薄表） |
 | 4 降级 | `src/lowering.rs` | `matlab` → `emitc` 方言（ABI 解析、数组命名、op 重写） | 自研（核心） |
 | 4.5 方言 | `src/dialects/emitc.rs` | `emitc` 方言（C 级）：声明/赋值/三元/调用/控制流 body op + 顶层指令（`include`/`define`/`undef`/`verbatim`）；容器复用 builtin `module`/`func` | 自研（核心） |
@@ -291,17 +294,30 @@ flowchart TD
 - **排序**：`sort(v)`（仅向量，升序，封装 `convmat_sort` 运行时 helper；矩阵列排序未做）。
 - 未支持/有副作用/形状未知的内建 → 运行时兔底（`Error::NotLowerable`）。
 
-### 10.4 管线（优化延后）
+### 10.4 管线（按方言分层的优化）
 
 ```text
 lower(HIR → matlab 方言)
+  → run_matlab_passes(matlab 语义优化)   [src/passes/matlab.rs]
   → lowering(matlab → emitc 方言)
+  → run_emitc_passes(emitc C 层清理)      [src/passes/emitc.rs]
   → emit_c(emitc → C)
 ```
 
-**不做**：canonicalize / CSE / linalg 融合 / 向量化。生成代码是「正确但未优化」的 C
-（每个 SSA 值一个临时变量、scalar cell 展开为裸 `double`）。后续优化可在
-`matlab`/`emitc` 之间加 pliron pass。
+优化**不是单一整体**，而是按方言分层的**独立 pass**（`src/passes/`），基于 pliron 的
+`Pass`/`Passes`/`NestedOpsPass`/`OpPass` 框架，每个 pass 在每个 `builtin.func` 上跑：
+
+- **`matlab` 语义层**（`hir_to_mlir` 之后）：常量折叠、标量 cell 常量传播（store→load）、
+  常条件 `if` 的死分支消除、纯值 op 死代码消除。每个 pass 独立且幂等；`run_matlab_passes`
+  把序列重复到不动点，因此「折叠暴露新死分支」由下一轮处理，而不是把多个优化揉进一个 pass。
+- **`emitc` C 层**（`lowering` 之后）：死单元（只写未读的局部 `emitc.declare` 及其
+  `assign`/`delete`）与纯值死代码。这些只能在 C 层做（例如被折叠掉的变量留下的声明）。
+
+**正确性约束**（有回归测试）：`ConstantPropagationPass` 不得把 cell 值折叠进**循环**
+region——循环体写过的 cell 在后续迭代值不同；只有 `if` region（至多执行一次）才继承
+外层 cell 常量。
+
+**仍不做**：canonicalize / CSE / linalg 融合 / 向量化。
 
 ### 10.5 路线状态
 
@@ -318,7 +334,7 @@ lower(HIR → matlab 方言)
 | cell 类型 | ⛔ 未做 | cell 字面量 `{...}`、`c{i}` 花括号索引、`cell(...)` 构造均 defer（需运行时 cell ABI，见 §12）；`varargin`/`varargout` 的 cell 语义已通过封闭世界特化覆盖 |
 | 匿名函数句柄 | 🟡 部分 | 同函数、非逃逸、标量参数/捕获的匿名函数 `f = @(x) …` 编译期特化（捕获作为额外形参，创建时快照，见 §13）；数组参数/捕获、逃逸句柄、命名/内建句柄、立即调用、`arrayfun` 未做 |
 | 内存调度 | ✅ 完成 | 静态数组按 `numel` 调度：小数组入栈、超过 `STACK_ELEMS_LIMIT`（默认 4096 元素）的大数组堆分配并在返回前 `delete[]`；动态形状堆分配未做（见 P7） |
-| P6 优化 | ⛔ 未做 | 优化整体延后（无 canonicalize/CSE/linalg） |
+| P6 优化 | 🟡 部分 | 按方言分层的独立 pass（`src/passes/matlab.rs`：常量折叠、cell 常量传播、死分支消除、死值消除；`src/passes/emitc.rs`：死单元、死值清理），基于 pliron `Pass` 框架迭代到不动点；循环条件不误折叠。CSE/canonicalize/linalg/向量化仍延后 |
 | P7 动态形状 | 🟡 部分 | 动态形状数组形参与输出均已实现：形参「指针 + 长度」ABI、输出「缓冲 + 长度回填」ABI（`matlab.ptr` 类型）。支持 `sum/prod/min/max(A)`、`numel/length(A)`、运行时下标 `A(i)`、`end`、运行时区间循环 `for i = 1:numel(A)`，以及动态数组输出 `y = A(:)`、`y = -A(:)`、`y = k * A`（标量广播）、`y = A(:) ± B(:)`、`y = A(:) .* B(:)`（两个等长动态数组逐元素，`convmat_*` helper）；动态数组*中间值*、其他逐元素运算、参数展开 `{:}`/逻辑下标、cell/string 等待做 |
 
 > 数组形参不再被当作标量：`sum(A)`、`A(i)`、`reshape(A,…)` 等会把它推断为动态形状

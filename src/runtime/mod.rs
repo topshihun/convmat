@@ -617,3 +617,75 @@ void convmat_neg(double* dst, const double* src, double n) {\n\
 pub fn defer_to_runtime(reason: &str) -> Result<()> {
     Err(Error::NotLowerable(reason.to_string()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The wrapped-operator helper registry. Kept next to `helper_source` so the
+    /// supported runtime surface is explicit and machine-checked (see
+    /// `docs/runtime.md` §9).
+    const WRAPPED_HELPERS: &[&str] = &[
+        TRANSPOSE, MATMUL, MPOWER, SORT, SUM, PROD, MIN, MAX, COPY, SCALE, ADD, SUB, EWMUL, NEG,
+    ];
+
+    /// The dynamic-tier kernel symbols that `DYNAMIC_RUNTIME_H` declares and
+    /// `DYNAMIC_RUNTIME_C` must implement (see `docs/runtime.md` §9.2).
+    const DYNAMIC_KERNEL_SYMBOLS: &[&str] = &[
+        "convmat_value_new",
+        "convmat_value_retain",
+        "convmat_value_release",
+        "convmat_value_copy",
+        "convmat_array_create",
+        "convmat_array_data",
+        "convmat_array_resize",
+        "convmat_cell_create",
+        "convmat_cell_get",
+        "convmat_cell_set",
+        "convmat_struct_create",
+        "convmat_struct_field_index",
+        "convmat_struct_get",
+        "convmat_struct_set",
+        "convmat_numel",
+        "convmat_linear_index",
+    ];
+
+    #[test]
+    fn every_registered_helper_has_source() {
+        for name in WRAPPED_HELPERS {
+            assert!(helper_source(name).is_some(), "no C source for `{name}`");
+        }
+    }
+
+    #[test]
+    fn helper_sources_define_their_registered_symbol() {
+        // A copy/paste error (source under the wrong key) fails here instead of
+        // producing an undefined symbol at C link time.
+        for name in WRAPPED_HELPERS {
+            let source = helper_source(name).unwrap();
+            assert!(
+                source.contains(name),
+                "`{name}` source does not define `{name}`"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_helper_has_no_source() {
+        assert!(helper_source("convmat_nope").is_none());
+    }
+
+    #[test]
+    fn dynamic_kernel_implements_its_declared_symbols() {
+        for symbol in DYNAMIC_KERNEL_SYMBOLS {
+            assert!(
+                DYNAMIC_RUNTIME_H.contains(symbol),
+                "header is missing `{symbol}`"
+            );
+            assert!(
+                DYNAMIC_RUNTIME_C.contains(symbol),
+                "kernel is missing an implementation for `{symbol}`"
+            );
+        }
+    }
+}

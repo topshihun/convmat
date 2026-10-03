@@ -1333,3 +1333,39 @@ fn run_anon_dead() {
         "7",
     );
 }
+
+// --- Optimization pass (src/passes): optimized code still runs correctly ------
+
+#[test]
+fn run_const_fold() {
+    // `a = 2*3; b = a + 4; y = b*2` is folded at compile time to 20.
+    run_exact(
+        "const_fold",
+        "double const_fold();",
+        "printf(\"%g\\n\", const_fold());",
+        "20",
+    );
+}
+
+#[test]
+fn run_dead_branch() {
+    // The `a > 2` branch is folded and the else-branch removed; result is 1.
+    run_exact(
+        "dead_branch",
+        "double dead_branch();",
+        "printf(\"%g\\n\", dead_branch());",
+        "1",
+    );
+}
+
+#[test]
+fn run_while_dynamic() {
+    // Regression: the loop condition changes each iteration (`a: 2 -> 1`), so
+    // the loop must run exactly once, not be folded into an infinite loop.
+    run_exact(
+        "while_dynamic",
+        "double while_dynamic();",
+        "printf(\"%g\\n\", while_dynamic());",
+        "1",
+    );
+}

@@ -242,10 +242,11 @@ fn codegen_three_outputs() {
 
 #[test]
 fn codegen_literal_formats() {
-    // Decimal, scientific notation, and negative literals all fold to doubles.
+    // Decimal, scientific notation, and negative literals all fold at compile
+    // time into one double (`1.5 + 0.25 + 1e3 + 2.5e-2 + -3.75 = 998.025`).
     let c = compile_fixture("litmix");
     assert!(c.contains("double litmix("), "got:\n{c}");
-    assert!(c.contains('-'), "got:\n{c}");
+    assert!(c.contains("998.025"), "got:\n{c}");
 }
 
 #[test]
@@ -648,4 +649,78 @@ fn codegen_varargout_specialized() {
         c.contains("std::tuple<double, double> h(double v1)"),
         "got:\n{c}"
     );
+}
+
+// --- Optimization pass (src/passes) ------------------------------------------
+
+#[test]
+fn codegen_constant_folding() {
+    // `a = 2*3; b = a + 4; y = b*2` folds through the scalar cells to `y = 20`,
+    // so no multiplication survives in the output.
+    let c = compile_fixture("const_fold");
+    assert!(c.contains("double const_fold("), "got:\n{c}");
+    assert!(c.contains("20.0"), "got:\n{c}");
+    assert!(
+        !c.contains('*'),
+        "expected every multiplication to be folded, got:\n{c}"
+    );
+}
+
+#[test]
+fn codegen_dead_branch_eliminated() {
+    // `a = 3; if a > 2 ... else ... end` folds the condition to true, so only
+    // the then-branch survives (no `if` in the output).
+    let c = compile_fixture("dead_branch");
+    assert!(c.contains("double dead_branch("), "got:\n{c}");
+    assert!(
+        !c.contains("if ("),
+        "expected the dead branch to be eliminated, got:\n{c}"
+    );
+    assert!(c.contains("1.0"), "got:\n{c}");
+}
+
+#[test]
+fn codegen_nargin_guard_eliminated() {
+    // `nargin` folds to the fixed arity, so `if nargin < 1` becomes constant and
+    // its dead branch is removed.
+    let c = compile_fixture("nargin_guard");
+    assert!(c.contains("double g(double v1)"), "got:\n{c}");
+    assert!(
+        !c.contains("if ("),
+        "expected the nargin guard to be eliminated, got:\n{c}"
+    );
+}
+
+#[test]
+fn codegen_loop_condition_not_folded() {
+    // Regression guard: a loop condition must not be folded against the pre-loop
+    // value of a cell it mutates (that would turn `while a > 1` into `while 1`).
+    let c = compile_fixture("while_dynamic");
+    assert!(c.contains("double while_dynamic("), "got:\n{c}");
+    assert!(c.contains("while ("), "got:\n{c}");
+    // The comparison must survive: folding it against `a = 2` would replace
+    // `a > 1` with a constant and turn the loop into an infinite one.
+    assert!(c.contains('>'), "got:\n{c}");
+}
+
+// --- emitc passes: C-level cleanups (src/passes/emitc.rs) --------------------
+
+#[test]
+fn codegen_emitc_dead_cell_eliminated() {
+    // The `nargin`/`nargout` cells are written but never read. The `matlab`
+    // passes keep them (a store is not a dead *value*), so this output is only
+    // this clean thanks to the `emitc` dead-cell pass (followed by dead-value
+    // removal of the now-unused literal). The constant `1.0` disappears.
+    let c = compile_fixture("nargin_guard");
+    assert!(c.contains("double g(double v1)"), "got:\n{c}");
+    assert!(!c.contains("1.0"), "got:\n{c}");
+}
+
+#[test]
+fn codegen_emitc_dead_value_after_folds() {
+    // After the `matlab` passes fold `a`/`b` away, their cells are write-only;
+    // the `emitc` passes drop the cells too, leaving a single constant return.
+    let c = compile_fixture("const_fold");
+    assert!(c.contains("double v1 = 20.0"), "got:\n{c}");
+    assert!(!c.contains("double a0"), "got:\n{c}");
 }

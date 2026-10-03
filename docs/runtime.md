@@ -220,3 +220,58 @@ void convmat_error_throw(const char *msg);   // longjmp 到最近 armed 的 catc
 > ABI（`matlab.ptr` 类型）——因为归约/形状内省/常量下标都能直接用裸指针表达，无需盒模型。
 > `convmat_value` 盒与 §3 seam 是给**异构/动态类型**（cell、字符串、`s.(name)`、动态数组
 > *输出*）预留的。
+
+## 9. 运行时库支持面（规范）
+
+> 本节是运行时库的**权威支持清单**：`src/runtime/mod.rs` 暴露的每个符号、其状态、
+> 以及「哪些 `.m` 构造会用到它」。新增/移除 helper 必须同步此表；
+> `src/runtime/mod.rs` 的单元测试会校验「注册表 ↔ C 源码」一致（§9.1）与
+> 「头文件声明 ↔ 内核实现」一致（§9.2）。
+
+### 9.1 静态 tier 封装 helper（已实现，按需内联进生成的 C）
+
+由 `helper_source` 注册、`lowering` 只在被引用时发射（§8 step 5）。参数一律 `double`
+（convmat 单一数值类型），维度/下标为小整数。
+
+| helper | 语义 | 触发（`.m` 构造） |
+|--------|------|-------------------|
+| `convmat_transpose` | 2-D 转置 | `A.'` / `A'` |
+| `convmat_matmul` | 矩阵乘 `m×k · k×n` | `A * B`（矩阵） |
+| `convmat_mpower` | 方阵整数幂 `A^k`（`k≥0`） | `A ^ k` |
+| `convmat_sort` | 向量升序排序 | `sort(v)`（仅向量） |
+| `convmat_sum` / `prod` / `min` / `max` | 动态形状数组归约 | `sum/prod/min/max(A)`（动态形参） |
+| `convmat_copy` / `neg` / `scale` | 动态数组输出：恒等 / 取负 / 标量广播乘 | `y = A(:)`、`y = -A(:)`、`y = k * A` |
+| `convmat_add` / `sub` / `ewmul` | 动态数组逐元素二元 | `y = A(:) ± B(:)`、`y = A(:) .* B(:)` |
+
+**不在本类**（编译期直接内联展开，无需 helper）：标量算术/比较/逻辑、静态数组逐元素
+与标量广播、`libm` 一元/二元内建（`sin`/`pow`/…）、常量下标读写、`zeros/ones/eye/reshape`。
+
+### 9.2 动态 tier 值模型内核（已实现 C，**尚未接入 `.m` 降级**）
+
+`DYNAMIC_RUNTIME_H`（类型 + 原型）+ `DYNAMIC_RUNTIME_C`（实现），由 `tests/runtime.rs`
+直接编译运行验证。**当前没有任何 `.m` 构造会发射它**——接线是 §8 step 3（seam）
+之后的逐特性工作。
+
+| 组 | 符号 | 状态 |
+|----|------|------|
+| 生命周期 | `convmat_value_new` / `retain` / `release` / `copy` | ✅ 实现 |
+| 数组 | `convmat_array_create` / `data` / `resize` | ✅ 实现 |
+| cell | `convmat_cell_create` / `get` / `set` | ✅ 实现 |
+| struct | `convmat_struct_create` / `field_index` / `get` / `set` | ✅ 实现 |
+| 形状/索引 | `convmat_numel` / `linear_index` | ✅ 实现 |
+| 动态 ABI | `convmat_runtime_fn`（typedef） | ⛔ 仅声明 |
+| 错误传播 | `convmat_error_throw` | ⛔ 仅声明（`try/catch` 预留，需 `<setjmp.h>`） |
+
+支持的 `convmat_dtype`：`CONVMAT_DOUBLE` / `CONVMAT_LOGICAL`（存储均为 `double`）；
+`CONVMAT_INT32` / `CONVMAT_CHAR` 预留（无实现）。
+
+### 9.3 明确不属于运行时库（由静态分析解决）
+
+封闭世界的 `varargin`/`varargout` 特化（§12.2）、常量下标 `A(i,j)`、静态形状字面量数组。
+分界即 §4「形状可控 + 封闭世界」。
+
+### 9.4 兜底 seam 的状态
+
+`defer_to_runtime` 是静态↔动态边界的唯一入口（§6）。**当前仍直接报错**：triage 判为
+`Deferred` 的函数不会被降级成运行时调用。因此「运行时库支持」目前 =
+§9.1（封装 helper，已接线）+ §9.2（值模型内核，未接线）；开放的动态兜底语义尚未启用。

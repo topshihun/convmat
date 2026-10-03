@@ -45,6 +45,12 @@ End-to-end codegen works for a growing subset of MATLAB:
   compile time to a helper whose captured variables are passed as extra
   arguments, snapshotted at creation (MATLAB capture-by-value semantics); see
   `docs/architecture.md` §13.
+- **Layered, dialect-based optimizations** (`src/passes`, on pliron's pass framework):
+  `matlab`-dialect semantic passes (constant folding, scalar-cell constant
+  propagation, dead-branch elimination, dead-value elimination) run after
+  `hir_to_mlir`; `emitc`-dialect C-level passes (dead write-only cells, dead values)
+  run after `lowering`. Each pass is independent; the pipeline repeats to a fixpoint.
+  Loop conditions are never folded against their pre-loop value.
 
 ```sh
 cargo run -- tests/fixtures/add.m

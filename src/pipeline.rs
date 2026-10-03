@@ -22,7 +22,12 @@ pub fn compile(source: &SourceFile, backend: BackendKind) -> Result<String> {
 
     let mut context = Context::new();
     let module = crate::hir_to_mlir::lower_to_module(&mut context, &hir)?;
+    // Semantic optimizations on the `matlab` dialect (constant folding, cell
+    // constant propagation, dead-branch elimination, dead-value elimination).
+    crate::passes::run_matlab_passes(&mut context, &module)?;
     let lowered = crate::lowering::lower_module(&mut context, &module)?;
+    // C-level cleanups on the `emitc` dialect (dead write-only cells, dead values).
+    crate::passes::run_emitc_passes(&mut context, &lowered)?;
     let c = crate::emit_c::emit(&context, &lowered)?;
 
     match backend {
