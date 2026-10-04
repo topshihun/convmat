@@ -72,11 +72,12 @@ MATLAB 是动态语言，无法（也不应）要求所有代码都静态可编�
    C 函数）。`varargin`/`varargout` 只有在封闭世界内、且所有调用点已知时才能静态化
    （按调用点特化，见 §12）；开放世界则降为动态。
 4. **不含不支持的构造**：如 `eval`/`evalin`、字符串形式的 `feval`、`assignin`、动态
-   字段/元胞索引、cell 字面量（`{...}`）、`classdef` 动态分派、`try`/`catch`、多返回值调用
-   （`[a,b]=f()`）、参数展开（`{:}`）、逻辑下标（`A(mask)`）等。`break`/`continue`、
-   `persistent`、已知类型的 `global`（编译为 C `static`）、标量字段的 `struct`
-   （构造/字段读写/按值传参与返回）、以及**非逃逸的匿名函数句柄**（同作用域、标量
-   参数/捕获，见 §13）已支持。
+   字段/元胞索引、cell 字面量 `{...}`（非标量元素）、`classdef` 动态分派、多返回值调用
+   （`[a,b]=f()`）、参数展开（`{:}`）等。`break`/`continue`、`persistent`、已知类型的
+   `global`（编译为 C `static`）、标量字段的 `struct`（构造/字段读写/嵌套字段/按值传参与
+   返回）、`int32` 标量、逻辑下标 `A(mask)` 读/写、标量元素 cell 字面量与 `c{i}` 读、
+   复数（`i`/`3+4i` 与复数算术、`abs`、`fft`，盒式，见 §10.5）、`try`/`catch`（`setjmp`，
+   见 §10.5），以及**非逃逸的匿名函数句柄**（同作用域、标量参数/捕获，见 §13）已支持。
 
 **边界两侧的处理**：
 
@@ -248,9 +249,12 @@ flowchart TD
   tier（见 §11，P7 未实现）。
 - **存储**：扁平 `matlab.array`（`numel = ∏dims`），线性顺序为 **MATLAB 列主序**。
   `runmat` 的 `Aggregate.elements` 是行主序，降级时在字面量边界做转置。
-- **类型格**：`LocalTy::{Scalar, Array{shape}, Struct{fields}, Dynamic}`；元素类型暂只 `f64`
-  （`logical` 以 `matlab.bool` 表示，比较/逻辑产生 `bool`，最终映射到 C++ `bool`）。
-  `Struct` 的字段目前仅标量（数组/嵌套 struct 字段未做，见 §10.5）。
+- **类型格**：`LocalTy::{Scalar, Int32, Array{shape}, Struct{fields}, Cell, Complex, Dynamic}`；元素类型暂只 `f64`
+  （标量 `int32` 以 `f64` 存储、运算回绕到 32 位；`logical` 以 `matlab.bool` 表示，
+  比较/逻辑产生 `bool`，最终映射到 C++ `bool`）。`Cell`/`Complex` 是盒式 `convmat_value*`
+  （`matlab.box`；复数为 `CONVMAT_COMPLEX` 交错 `[re,im]` 数据）。
+  `Struct` 的字段目前仅标量；嵌套字段路径 `s.a.b` 静态展平为单个 C 字段（`a__b`），
+  数组字段 / struct 数组未做，见 §10.5。
 - 形状来源：静态分析只有字面量 + 形状传播（转置/乘/按维归约）；形参默认标量，
   数组形参由「数组使用点」（`A(i)`、`sum(A)`、`reshape(A,…)`、…）推断为
   `Array{shape: Dynamic}`，并降为「指针 + 长度」ABI（见 §5、§10.5 P7）；struct 形参的
@@ -341,16 +345,16 @@ region——循环体写过的 cell 在后续迭代值不同；只有 `if` regio
 | P1 形状模型 | ✅ 完成 | `Shape`/`LocalTy`、列主序、行/列/N-D 元数据 |
 | P2 逐元素/广播/转置/逻辑 | ✅ 完成 | 同形数组 + 标量广播 + 2-D 转置（封装 `convmat_transpose`） |
 | P3 矩阵乘/幂 | ✅ 完成 | `*` 封装 `convmat_matmul`；`^`/`.^` 已支持（矩阵幂封装 `convmat_mpower`） |
-| P4 内建 | 🟡 部分 | 归约(含按维)+形状内省+`zeros/ones/eye/reshape`+`sort`(向量及矩阵列排序)+`mean/std/median/var/cumsum/diff/isnan/isinf/isempty/logical`+`linspace/repmat/permute`(静态)+`Inf/NaN`+`inv/det/norm/solve/rand`(静态方阵/向量) 已做；`find/fft`、`cat/horzcat/vertcat` 未做 |
-| P5 索引/冒号/`end` | 🟡 部分 | 静态数组：常量下标 `A(i,j)`、线性 `A(i)`、`end`、`A(:)`、切片 `A(i,:)`/`A(:,j)`、常量区间/步长 `A(a:b:c)`（含 `end` 边界）、N-D 下标 `A(i,j,k)`；动态数组形参：运行时下标 `A(i)`、`end`。仍缺变量/非静态下标与逻辑下标 |
-| 控制流 | ✅ 完成 | `if`/`elseif`/`else`、`while`、`for`（升/降序，编译为方向感知的 C `for`）、`switch`、`break`/`continue`；`try`/`catch` 未做 |
+| P4 内建 | 🟡 部分 | 归约(含按维)+形状内省+`zeros/ones/eye/reshape`+`sort`(向量及矩阵列排序)+`mean/std/median/var/cumsum/diff/isnan/isinf/isempty/logical`+`linspace/repmat/permute`(静态)+`Inf/NaN`+`inv/det/norm/solve/rand`(静态方阵/向量)+`strcmp`(字面量)+`int32`+复数 `abs`/`fft`/`eig`(1x1/2x2) 已做；`find`、`cat/horzcat/vertcat` 未做 |
+| P5 索引/冒号/`end` | 🟡 部分 | 静态数组：常量下标 `A(i,j)`、线性 `A(i)`、`end`、`A(:)`、切片 `A(i,:)`/`A(:,j)`、常量区间/步长 `A(a:b:c)`（含 `end` 边界）、N-D 下标 `A(i,j,k)`、逻辑下标 `A(mask)` 读（运行时长度输出，`convmat_mask_gather`）与写（`A(mask)=v`，`convmat_mask_assign`）；动态数组形参：运行时下标 `A(i)`、`end`。仍缺变量/非静态下标 |
+| 控制流 | ✅ 完成 | `if`/`elseif`/`else`、`while`、`for`（升/降序，编译为方向感知的 C `for`）、`switch`、`break`/`continue`、`try`/`catch`（`matlab.try` → `emitc` 的 `setjmp` 守卫 + `if`/`else`） |
 | 存储类 | 🟡 部分 | 局部栈变量；`persistent`/`global` 编译为 C `static`（单函数封闭世界），`persistent` 变量额外带 `_not_empty` 静态标志（`isempty` 首次为真，`kalmanfilter` 依赖此语义）；多返回值调用 `[a,b]=f()` 未做 |
-| struct 类型 | 🟡 部分 | `struct('a',1,...)` 构造、`s.a` 读/写、struct 按值传参/返回（含多出参 tuple）、struct 形参字段使用点推断；数组/嵌套 struct 字段、struct 数组未做 |
-| cell 类型 | ⛔ 未做 | cell 字面量 `{...}`、`c{i}` 花括号索引、`cell(...)` 构造均 defer（需运行时 cell ABI，见 §12）；`varargin`/`varargout` 的 cell 语义已通过封闭世界特化覆盖 |
+| struct 类型 | 🟡 部分 | `struct('a',1,...)` 构造、`s.a` 读/写、struct 按值传参/返回（含多出参 tuple）、struct 形参/局部字段使用点推断、嵌套字段路径 `s.a.b`（静态展平为扁平 C 字段）；数组字段、struct 数组未做 |
+| cell 类型 | 🟡 部分 | 标量元素 cell 字面量 `{...}` 与 `c{i}`（常量下标）读已支持，经 `convmat_value` box（`matlab.box` 类型 + `cell_new`/`cell_set`/`cell_get` → `emitc` C 调用，块作用域 `convmat_value_release`）；非标量元素、`cell(...)` 构造、`c{i}` 写、cell 形参/返回值仍 defer（见 §12） |
 | 匿名函数句柄 | 🟡 部分 | 同函数、非逃逸、标量参数/捕获的匿名函数 `f = @(x) …` 编译期特化（捕获作为额外形参，创建时快照，见 §13）；数组参数/捕获、逃逸句柄、命名/内建句柄、立即调用、`arrayfun` 未做 |
 | 内存调度 | ✅ 完成 | 静态数组按 `numel` 调度：小数组入栈、超过 `STACK_ELEMS_LIMIT`（默认 4096 元素）的大数组堆分配并在返回前 `delete[]`；动态形状堆分配未做（见 P7） |
 | P6 优化 | 🟡 部分 | 按方言分层的独立 pass（`src/passes/matlab.rs`：常量折叠、cell 常量传播、死分支消除、死值消除；`src/passes/emitc.rs`：死单元、死值清理），基于 pliron `Pass` 框架迭代到不动点；循环条件不误折叠。CSE/canonicalize/linalg/向量化仍延后 |
-| P7 动态形状 | 🟡 部分 | 动态形状数组形参与输出均已实现：形参默认「指针 + 长度」ABI、查询 `size` 的形参走「指针 + 行 + 列」形状描述符 ABI、输出「缓冲 + 长度回填」ABI（`matlab.ptr` 类型）。支持 `size(A)`/`size(A,d)`（描述符形参）、`sum/prod/min/max(A)`、`numel/length(A)`（描述符下 `length=max(rows,cols)`）、运行时下标 `A(i)`、`end`、运行时区间循环 `for i = 1:numel(A)`，以及动态数组输出 `y = A(:)`、`y = -A(:)`、`y = k * A`（标量广播）、`y = A(:) ± B(:)`、`y = A(:) .* B(:)`（两个等长动态数组逐元素，`convmat_*` helper）；动态数组*中间值*已实现为块作用域（赋值处 `matlab.heap_alloc`，所在块末尾 `delete[]`；含控制流内，如循环体每轮分配/释放）；参数展开 `{:}`/逻辑下标、cell/string 等待做 |
+| P7 动态形状 | 🟡 部分 | 动态形状数组形参与输出均已实现：形参默认「指针 + 长度」ABI、查询 `size` 的形参走「指针 + 行 + 列」形状描述符 ABI、输出「缓冲 + 长度回填」ABI（`matlab.ptr` 类型）。支持 `size(A)`/`size(A,d)`（描述符形参）、`sum/prod/min/max(A)`、`numel/length(A)`（描述符下 `length=max(rows,cols)`）、运行时下标 `A(i)`、`end`、运行时区间循环 `for i = 1:numel(A)`，以及动态数组输出 `y = A(:)`、`y = -A(:)`、`y = k * A`（标量广播）、`y = A(:) ± B(:)`、`y = A(:) .* B(:)`（两个等长动态数组逐元素，`convmat_*` helper）；动态数组*中间值*已实现为块作用域（赋值处 `matlab.heap_alloc`，所在块末尾 `delete[]`；含控制流内，如循环体每轮分配/释放）；参数展开 `{:}`、cell/string 等待做 |
 | P8 函数调用 | 🟡 部分 | 封闭世界同文件函数调用已支持（标量 ABI：全标量入参 + 单标量输出，含递归；C 发射器为所有函数发前向声明）；多返回值调用 `[a,b]=f()`、数组/结构体实参、跨文件调用未做 |
 
 > 数组形参不再被当作标量：`sum(A)`、`A(i)`、`reshape(A,…)` 等会把它推断为动态形状

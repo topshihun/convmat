@@ -38,10 +38,14 @@
    方言 op 只覆盖当前可生成代码子集需要的语义，不追求语法完整。
 4. 不要臆造 `runmat`/`pliron` 的 API，落地前查对应 crate 文档（两者目前都是 pre-1.0，
    API 可能变化）。
-5. 与 runmat/HIR 相关的类型只出现在 `src/frontend/` 与 `src/hir_to_mlir/`（以及
+5. 三方库（`runmat`/`pliron` 等）的资料**优先从网络上查**：官方文档、crate 文档、
+   仓库在线源码与 issue。**禁止直接翻阅本地依赖源码**（`~/.cargo/registry`、
+   `target/`、`vendor/` 下的 crate 源码等）。只有网络上确实找不到资料时，才允许到
+   本地依赖源码中查证，并在回复中说明「因网络无资料才查本地源码」。
+6. 与 runmat/HIR 相关的类型只出现在 `src/frontend/` 与 `src/hir_to_mlir/`（以及
    `src/triage/`，它是边界层，需直接读 HIR 做分类/形状推断），
    其余模块不得直接引用 runmat 类型。
-6. pliron 的 attribute 名（`dict_key`）必须**全局唯一**（跨所有方言）；新属性名用
+7. pliron 的 attribute 名（`dict_key`）必须**全局唯一**（跨所有方言）；新属性名用
    `<方言>_<op>_<字段>` 命名，避免与既有 op 冲突。
 
 ## 代码风格

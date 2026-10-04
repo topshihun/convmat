@@ -71,6 +71,39 @@ impl pliron::parsable::Parsable for PtrType {
     }
 }
 
+/// A boxed dynamic value (a MATLAB value whose type/shape is only known at run
+/// time). At the C level this is a `convmat_value*` (see `docs/runtime.md`).
+#[pliron_type(name = "matlab.box", generate_get = true, verifier = "succ")]
+#[derive(Hash, PartialEq, Eq, Debug, Clone)]
+pub struct BoxType;
+
+impl pliron::printable::Printable for BoxType {
+    fn fmt(
+        &self,
+        _ctx: &Context,
+        _state: &pliron::printable::State,
+        f: &mut core::fmt::Formatter<'_>,
+    ) -> core::fmt::Result {
+        write!(f, "box")
+    }
+}
+
+impl pliron::parsable::Parsable for BoxType {
+    type Arg = ();
+    type Parsed = pliron::r#type::TypedHandle<Self>;
+
+    fn parse<'a>(
+        state_stream: &mut pliron::parsable::StateStream<'a>,
+        _arg: Self::Arg,
+    ) -> pliron::parsable::ParseResult<'a, Self::Parsed> {
+        use pliron::combine::Parser;
+        let ctx = &*state_stream.state.ctx;
+        pliron::combine::value(BoxType::get(ctx))
+            .parse_stream(state_stream)
+            .into()
+    }
+}
+
 impl pliron::printable::Printable for ArrayType {
     fn fmt(
         &self,
@@ -642,6 +675,137 @@ impl IfOp {
 
     pub fn else_region(&self, ctx: &Context) -> Ptr<Region> {
         self.get_operation().deref(ctx).get_region(1)
+    }
+}
+
+/// A `try`/`catch` statement: the `try` region runs first; if the body raises
+/// (through the runtime error channel) control transfers to the `catch` region.
+/// At the C level this is ordinary control flow — a `setjmp` guard plus an
+/// `if`/`else` — so it lowers to `emitc`'s existing ops, not a `emitc.try`.
+#[pliron_op(
+    name = "matlab.try",
+    format,
+    interfaces = [NOpdsInterface<0>, NResultsInterface<0>, NRegionsInterface<2>],
+    verifier = "succ",
+)]
+pub struct TryOp;
+
+impl TryOp {
+    pub fn new(ctx: &mut Context) -> Self {
+        let op = Operation::new(ctx, Self::get_concrete_op_info(), vec![], vec![], vec![], 2);
+        TryOp { op }
+    }
+
+    pub fn try_region(&self, ctx: &Context) -> Ptr<Region> {
+        self.get_operation().deref(ctx).get_region(0)
+    }
+
+    pub fn catch_region(&self, ctx: &Context) -> Ptr<Region> {
+        self.get_operation().deref(ctx).get_region(1)
+    }
+}
+
+/// Create a boxed cell with `n` scalar elements (`{...}`). The result is a box.
+#[pliron_op(
+    name = "matlab.cell_new",
+    format,
+    interfaces = [OneOpdInterface, OneResultInterface],
+    verifier = "succ",
+)]
+pub struct CellNewOp;
+
+impl CellNewOp {
+    pub fn new(ctx: &mut Context, count: Value) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![BoxType::get(ctx).into()],
+            vec![count],
+            vec![],
+            0,
+        );
+        CellNewOp { op }
+    }
+}
+
+/// Set element `index` (0-based scalar) of a boxed cell to a scalar `value`.
+#[pliron_op(
+    name = "matlab.cell_set",
+    format,
+    interfaces = [NOpdsInterface<3>, NResultsInterface<0>],
+    verifier = "succ",
+)]
+pub struct CellSetOp;
+
+impl CellSetOp {
+    pub fn new(ctx: &mut Context, cell: Value, index: Value, value: Value) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![],
+            vec![cell, index, value],
+            vec![],
+            0,
+        );
+        CellSetOp { op }
+    }
+}
+
+/// Read element `index` (0-based scalar) of a boxed cell as a scalar (`c{i}`).
+#[pliron_op(
+    name = "matlab.cell_get",
+    format,
+    interfaces = [NOpdsInterface<2>, OneResultInterface],
+    verifier = "succ",
+)]
+pub struct CellGetOp;
+
+impl CellGetOp {
+    pub fn new(ctx: &mut Context, cell: Value, index: Value) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![FP64Type::get(ctx).into()],
+            vec![cell, index],
+            vec![],
+            0,
+        );
+        CellGetOp { op }
+    }
+}
+
+/// A call to an external function returning a boxed dynamic value (a complex
+/// constructor or complex arithmetic helper).
+#[pliron_op(
+    name = "matlab.box_call",
+    format,
+    interfaces = [OneResultInterface],
+    attributes = (box_call_callee: StringAttr),
+    verifier = "succ",
+)]
+pub struct BoxCallOp;
+
+impl BoxCallOp {
+    pub fn new(ctx: &mut Context, callee: &str, args: Vec<Value>) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![BoxType::get(ctx).into()],
+            args,
+            vec![],
+            0,
+        );
+        let op = BoxCallOp { op };
+        op.set_attr_box_call_callee(ctx, StringAttr::new(callee.to_string()));
+        op
+    }
+
+    pub fn callee(&self, ctx: &Context) -> String {
+        String::from(
+            self.get_attr_box_call_callee(ctx)
+                .expect("box_call callee")
+                .clone(),
+        )
     }
 }
 

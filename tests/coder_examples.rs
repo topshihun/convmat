@@ -29,6 +29,8 @@ const SUPPORTED: &[&str] = &[
     "array_col_slice",
     "array_concat",
     "array_linspace",
+    "array_logical_index",
+    "array_mask_assign",
     "array_nd",
     "array_param_normalize",
     "array_permute",
@@ -45,16 +47,25 @@ const SUPPORTED: &[&str] = &[
     "builtin_median",
     "builtin_predicates",
     "builtin_std",
+    "cell_basic",
     "fib",
     "func_helper",
     "func_recursion",
     "kalmanfilter",
     "linalg_det",
+    "linalg_eig",
     "linalg_inv",
     "linalg_norm",
     "linalg_solve",
     "mandelbrot_count",
+    "struct_nested",
+    "sys_fft",
     "sys_random",
+    "sys_trycatch",
+    "text_compare",
+    "text_switch",
+    "type_complex",
+    "type_integer",
     "type_logical",
     "value_special",
 ];
@@ -537,6 +548,111 @@ fn coder_examples_supported_run() {
         "double kalmanfilter(double);",
         "printf(\"%.17g\\n\", kalmanfilter(1.0));",
         &[x],
+    );
+
+    // The nested field `s.a.b` round-trips a scalar (`s.a.b = 1`).
+    run_exact(
+        "struct_nested",
+        "double struct_nested(void);",
+        "printf(\"%g\\n\", struct_nested());",
+        "1",
+    );
+
+    // `strcmp('abc', 'abc')` is true (constant-folded char comparison).
+    run_exact(
+        "text_compare",
+        "double text_compare(void);",
+        "printf(\"%g\\n\", text_compare());",
+        "1",
+    );
+
+    // Switching on a char code point: 'a' (97) -> 1, 'z' (122) -> otherwise 0.
+    run_exact(
+        "text_switch",
+        "double text_switch(double);",
+        "printf(\"%g\\n\", text_switch(97.0));\n    \
+         printf(\"%g\\n\", text_switch(122.0));",
+        "1\n0",
+    );
+
+    // `int32(3) + int32(4) == 7` (int32 wraparound arithmetic).
+    run_exact(
+        "type_integer",
+        "double type_integer(void);",
+        "printf(\"%g\\n\", type_integer());",
+        "7",
+    );
+
+    // `A(A > 0)` on `[1 -2 3 -4]` gathers `[1 3]` (dynamic-length output ABI).
+    run_exact(
+        "array_logical_index",
+        "void array_logical_index(double*, double*);",
+        "double y[4];\n    double n;\n    \
+         array_logical_index(y, &n);\n    \
+         printf(\"%g %g %g\\n\", n, y[0], y[1]);",
+        "2 1 3",
+    );
+
+    // `A(A < 0) = 0` on `[1 -2 3 -4]` gives `[1 0 3 0]`.
+    run_exact(
+        "array_mask_assign",
+        "void array_mask_assign(double v1[4]);",
+        "double y[4];\n    array_mask_assign(y);\n    \
+         printf(\"%g %g %g %g\\n\", y[0], y[1], y[2], y[3]);",
+        "1 0 3 0",
+    );
+
+    // `sys_trycatch(2)` = `1 / 2`; the try body runs (no error is raised).
+    run_exact(
+        "sys_trycatch",
+        "double sys_trycatch(double);",
+        "printf(\"%g\\n\", sys_trycatch(2.0));",
+        "0.5",
+    );
+
+    // `c = {1, 2, 3}; y = c{1}` reads the first scalar element of a boxed cell.
+    run_exact(
+        "cell_basic",
+        "double cell_basic(void);",
+        "printf(\"%g\\n\", cell_basic());",
+        "1",
+    );
+
+    // `abs(3 + 4i)` is the magnitude 5.
+    run_exact(
+        "type_complex",
+        "double type_complex(void);",
+        "printf(\"%g\\n\", type_complex());",
+        "5",
+    );
+
+    // `fft([1 2 3 4])` is a boxed complex array with real parts 10, -2, -2, -2.
+    run_exact(
+        "sys_fft",
+        "struct convmat_value;\n\
+         double convmat_complex_component(const convmat_value*, double, double);\n\
+         void convmat_value_release(convmat_value*);\n\
+         convmat_value* sys_fft(void);",
+        "convmat_value* z = sys_fft();\n    \
+         printf(\"%g %g %g %g\\n\", convmat_complex_component(z, 0.0, 0.0),\n    \
+         convmat_complex_component(z, 1.0, 0.0), convmat_complex_component(z, 2.0, 0.0),\n    \
+         convmat_complex_component(z, 3.0, 0.0));\n    \
+         convmat_value_release(z);",
+        "10 -2 -2 -2",
+    );
+
+    // `eig([2 0; 0 3])` is a boxed complex vector with real parts 2, 3.
+    run_exact(
+        "linalg_eig",
+        "struct convmat_value;\n\
+         double convmat_complex_component(const convmat_value*, double, double);\n\
+         void convmat_value_release(convmat_value*);\n\
+         convmat_value* linalg_eig(void);",
+        "convmat_value* z = linalg_eig();\n    \
+         printf(\"%g %g\\n\", convmat_complex_component(z, 0.0, 0.0),\n    \
+         convmat_complex_component(z, 1.0, 0.0));\n    \
+         convmat_value_release(z);",
+        "2 3",
     );
 }
 

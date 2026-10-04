@@ -1,6 +1,6 @@
 //! Negative tests: sources that cross the codegen boundary must be rejected
 //! with a clear `NotLowerable` error (the MVP has no runtime fallback). These
-//! guard the deferral paths in `triage` and `mir_to_mlir` against silent
+//! guard the deferral paths in `triage` and `hir_to_mlir` against silent
 //! miscompilation.
 
 use convmat::backend::BackendKind;
@@ -44,19 +44,13 @@ fn matrix_power_non_square_rejected() {
 
 #[test]
 fn unsupported_builtin_rejected() {
-    assert_not_lowerable("unsupported_builtin", "unsupported builtin `fft`");
+    assert_not_lowerable("unsupported_builtin", "unsupported builtin `svd`");
 }
 
 #[test]
 fn varargin_variable_index_rejected() {
     // A non-constant `varargin{n}` index cannot be specialized.
     assert_not_lowerable("varargin_var", "unresolved shape");
-}
-
-#[test]
-fn try_catch_rejected() {
-    // C has no native exception handling; `try`/`catch` is deferred.
-    assert_not_lowerable("try_catch", "try/catch");
 }
 
 #[test]
@@ -70,19 +64,6 @@ fn multi_assign_rejected() {
 fn arg_expansion_rejected() {
     // `varargin{:}` argument expansion needs a runtime cell ABI.
     assert_not_lowerable("arg_expansion", "expansion");
-}
-
-#[test]
-fn logical_index_rejected() {
-    // Logical indexing produces a runtime-sized result and is deferred.
-    assert_not_lowerable("logical_index", "unresolved shape");
-}
-
-#[test]
-fn cell_literal_rejected() {
-    // Cell arrays are deferred: a heterogeneous cell cannot map to a fixed C
-    // type without a runtime cell ABI (see docs/architecture.md §10.5).
-    assert_not_lowerable("cell_literal", "cell array literals are not supported yet");
 }
 
 #[test]

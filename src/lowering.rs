@@ -47,9 +47,16 @@ pub fn lower_module(context: &mut Context, module: &ModuleOp) -> Result<ModuleOp
     // helpers, and are skipped.
     let defined = defined_func_names(context, module);
     for name in collect_used_helpers(context, module, &defined) {
-        let source = crate::runtime::helper_source(&name)
-            .ok_or_else(|| Error::Backend(format!("unknown runtime helper `{name}`")))?;
-        let verbatim = emitc::VerbatimOp::new(context, source);
+        let source: String = if name == crate::runtime::CELL_SUPPORT {
+            crate::runtime::cell_support_source()
+        } else if name == crate::runtime::COMPLEX_SUPPORT {
+            crate::runtime::complex_support_source()
+        } else {
+            crate::runtime::helper_source(&name)
+                .ok_or_else(|| Error::Backend(format!("unknown runtime helper `{name}`")))?
+                .to_string()
+        };
+        let verbatim = emitc::VerbatimOp::new(context, &source);
         emitc_module.append_operation(context, verbatim.get_operation(), 0);
     }
 
@@ -161,6 +168,28 @@ impl Lowerer {
             );
             self.map_result(context, op, &e, 0);
             append(context, dst, &e);
+        } else if let Some(_c) = Operation::get_op::<matlab::CellNewOp>(op, context) {
+            let e = emitc::CallBoxOp::new(
+                context,
+                crate::runtime::CELL_NEW,
+                vec![self.opd(context, op, 0)],
+            );
+            self.map_result(context, op, &e, 0);
+            append(context, dst, &e);
+        } else if let Some(_c) = Operation::get_op::<matlab::BoxCallOp>(op, context) {
+            let args: Vec<Value> = (0..m).map(|i| self.opd(context, op, i)).collect();
+            let e = emitc::CallBoxOp::new(context, &_c.callee(context), args);
+            self.map_result(context, op, &e, 0);
+            append(context, dst, &e);
+        } else if let Some(_c) = Operation::get_op::<matlab::CellSetOp>(op, context) {
+            let args: Vec<Value> = (0..m).map(|i| self.opd(context, op, i)).collect();
+            let e = emitc::CallVoidOp::new(context, crate::runtime::CELL_SET_SCALAR, args);
+            append(context, dst, &e);
+        } else if let Some(_c) = Operation::get_op::<matlab::CellGetOp>(op, context) {
+            let args: Vec<Value> = (0..m).map(|i| self.opd(context, op, i)).collect();
+            let e = emitc::CallOp::new(context, crate::runtime::CELL_GET_SCALAR, args);
+            self.map_result(context, op, &e, 0);
+            append(context, dst, &e);
         } else if let Some(c) = Operation::get_op::<matlab::CallOp>(op, context) {
             let args: Vec<Value> = (0..m).map(|i| self.opd(context, op, i)).collect();
             let e = emitc::CallOp::new(context, &c.callee(context), args);
@@ -226,6 +255,26 @@ impl Lowerer {
             append(context, dst, &e);
             self.lower_region(context, c.then_region(context), e.then_region(context))?;
             self.lower_region(context, c.else_region(context), e.else_region(context))?;
+        } else if let Some(c) = Operation::get_op::<matlab::TryOp>(op, context) {
+            // C has no exceptions: model `try`/`catch` as a `setjmp` guard plus an
+            // ordinary `if`/`else`. `convmat_error_enter`/`leave` bracket the
+            // handler stack, `convmat_error_check` (a macro) runs the inline
+            // `setjmp`, and a raised error longjmps back into the `else` branch.
+            let enter = emitc::CallOp::new(context, crate::runtime::ERROR_ENTER, vec![]);
+            let env = enter.get_operation().deref(context).get_result(0);
+            append(context, dst, &enter);
+
+            let check = emitc::CallOp::new(context, crate::runtime::ERROR_CHECK, vec![env]);
+            let ok = check.get_operation().deref(context).get_result(0);
+            append(context, dst, &check);
+
+            let e = emitc::IfOp::new(context, ok);
+            append(context, dst, &e);
+            self.lower_region(context, c.try_region(context), e.then_region(context))?;
+            self.lower_region(context, c.catch_region(context), e.else_region(context))?;
+
+            let leave = emitc::CallVoidOp::new(context, crate::runtime::ERROR_LEAVE, vec![env]);
+            append(context, dst, &leave);
         } else if let Some(c) = Operation::get_op::<matlab::WhileOp>(op, context) {
             let e = emitc::WhileOp::new(context);
             append(context, dst, &e);
@@ -362,14 +411,38 @@ fn collect_helpers_from_op(
     defined: &BTreeSet<String>,
     used: &mut BTreeSet<String>,
 ) {
+    if Operation::get_op::<matlab::TryOp>(op, context).is_some() {
+        // A `try`/`catch` lowers to the setjmp-based error support; reference one
+        // of its symbols so the (guarded) runtime blob is emitted.
+        used.insert(crate::runtime::ERROR_CHECK.to_string());
+    }
+    if let Some(call) = Operation::get_op::<matlab::BoxCallOp>(op, context) {
+        if crate::runtime::is_complex_helper(&call.callee(context)) {
+            used.insert(crate::runtime::COMPLEX_SUPPORT.to_string());
+        }
+    }
+    if Operation::get_op::<matlab::CellNewOp>(op, context).is_some()
+        || Operation::get_op::<matlab::CellSetOp>(op, context).is_some()
+        || Operation::get_op::<matlab::CellGetOp>(op, context).is_some()
+    {
+        // Cell arrays need the boxed value-model kernel plus the scalar wrappers.
+        used.insert(crate::runtime::CELL_SUPPORT.to_string());
+    }
     if let Some(call) = Operation::get_op::<matlab::CallVoidOp>(op, context) {
         let callee = call.callee(context);
         if !defined.contains(&callee) {
-            used.insert(callee);
+            if callee == crate::runtime::VALUE_RELEASE {
+                // `convmat_value_release` comes from the cell support blob.
+                used.insert(crate::runtime::CELL_SUPPORT.to_string());
+            } else {
+                used.insert(callee);
+            }
         }
     } else if let Some(call) = Operation::get_op::<matlab::CallOp>(op, context) {
         let callee = call.callee(context);
-        if callee.starts_with("convmat_") && !defined.contains(&callee) {
+        if crate::runtime::is_complex_helper(&callee) {
+            used.insert(crate::runtime::COMPLEX_SUPPORT.to_string());
+        } else if callee.starts_with("convmat_") && !defined.contains(&callee) {
             used.insert(callee);
         }
     }

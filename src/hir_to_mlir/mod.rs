@@ -42,17 +42,17 @@ use pliron::{
 
 use crate::builtins::{self, Builtin, MinMax, ReduceOp};
 use crate::dialects::matlab::{
-    AllocaOp, ArrayType, BinOp, BinOpKind, BreakOp, CallOp, CallVoidOp, CmpKind, CmpOp,
-    ConditionOp, ConstantOp, ContinueOp, DeleteOp, ForOp, HeapAllocOp, IfOp, LoadOp, PtrType,
-    RangeForOp, ReturnOp, SelectOp, StoreOp, StructCopyOp, StructGetOp, StructSetOp, StructType,
-    WhileOp, YieldOp,
+    AllocaOp, ArrayType, BinOp, BinOpKind, BoxCallOp, BoxType, BreakOp, CallOp, CallVoidOp,
+    CellGetOp, CellNewOp, CellSetOp, CmpKind, CmpOp, ConditionOp, ConstantOp, ContinueOp, DeleteOp,
+    ForOp, HeapAllocOp, IfOp, LoadOp, PtrType, RangeForOp, ReturnOp, SelectOp, StoreOp,
+    StructCopyOp, StructGetOp, StructSetOp, StructType, TryOp, WhileOp, YieldOp,
 };
 use crate::error::{Error, Result};
 use crate::triage::{
-    analyze_handles, brace_index, broadcast_shape, call_name, component_end_offset,
-    component_is_colon, concat_operand_shape, constant_int_list, dispatch, expr_ty, infer_locals,
-    shape_descriptor_params, static_index_selection, unquote_str, varargout_index, FunctionPlan,
-    LocalTy, Shape, Variadics,
+    analyze_handles, brace_index, broadcast_shape, call_name, char_codes, component_end_offset,
+    component_is_colon, concat_operand_shape, constant_int_list, dispatch, expr_ty,
+    flat_field_name, infer_locals, member_path, place_member_path, shape_descriptor_params,
+    static_index_selection, unquote_str, varargout_index, FunctionPlan, LocalTy, Shape, Variadics,
 };
 
 use runmat_hir::{
@@ -117,13 +117,14 @@ pub fn lower_to_module_with_plans(
             && function.abi.fixed_outputs.len() == 1
             && matches!(
                 plan.values.get(&function.abi.fixed_outputs[0]),
-                None | Some(LocalTy::Scalar)
+                None | Some(LocalTy::Scalar) | Some(LocalTy::Int32)
             )
-            && function
-                .abi
-                .fixed_inputs
-                .iter()
-                .all(|id| matches!(plan.values.get(id), None | Some(LocalTy::Scalar)));
+            && function.abi.fixed_inputs.iter().all(|id| {
+                matches!(
+                    plan.values.get(id),
+                    None | Some(LocalTy::Scalar) | Some(LocalTy::Int32)
+                )
+            });
         callees.insert(
             function.id,
             CalleeInfo {
@@ -179,7 +180,7 @@ fn anon_returns_scalar(hir: &HirAssembly, id: FunctionId) -> bool {
     }
     matches!(
         infer_locals(function).get(&function.outputs[0]),
-        None | Some(LocalTy::Scalar)
+        None | Some(LocalTy::Scalar) | Some(LocalTy::Int32)
     )
 }
 
@@ -259,12 +260,15 @@ fn lower_function(
     let mut dynamic_outputs: Vec<BindingId> = Vec::new();
     for output in &named_outputs {
         match tys.get(output).cloned().unwrap_or(LocalTy::Scalar) {
-            LocalTy::Scalar => return_outputs.push((*output, f64_ty)),
+            LocalTy::Scalar | LocalTy::Int32 => return_outputs.push((*output, f64_ty)),
             LocalTy::Struct { fields } => {
                 return_outputs.push((*output, struct_type(context, &fields)?));
             }
             LocalTy::Array { shape } if shape.is_dynamic() => dynamic_outputs.push(*output),
             LocalTy::Array { .. } => array_outputs.push(*output),
+            LocalTy::Cell => return Err(Error::NotLowerable("cell output".to_string())),
+            // A complex output is returned as a boxed `convmat_value*`.
+            LocalTy::Complex => return_outputs.push((*output, BoxType::get(context).into())),
             LocalTy::Dynamic => {
                 return Err(Error::NotLowerable("dynamic output shape".to_string()))
             }
@@ -288,7 +292,7 @@ fn lower_function(
     for param in &named_params {
         named_param_args.insert(*param, entry_arg_types.len());
         match tys.get(param).cloned().unwrap_or(LocalTy::Scalar) {
-            LocalTy::Scalar => entry_arg_types.push(f64_ty),
+            LocalTy::Scalar | LocalTy::Int32 => entry_arg_types.push(f64_ty),
             LocalTy::Struct { fields } => entry_arg_types.push(struct_type(context, &fields)?),
             LocalTy::Array { shape } if shape.is_dynamic() => {
                 entry_arg_types.push(PtrType::get(context).into());
@@ -303,6 +307,8 @@ fn lower_function(
                     "static-shape array parameters are not supported".to_string(),
                 ))
             }
+            LocalTy::Cell => return Err(Error::NotLowerable("cell parameter".to_string())),
+            LocalTy::Complex => return Err(Error::NotLowerable("complex parameter".to_string())),
             LocalTy::Dynamic => return Err(Error::NotLowerable("dynamic parameter".to_string())),
         }
     }
@@ -356,7 +362,7 @@ fn lower_function(
             continue;
         }
         let (array_ty, shape) = match tys.get(binding).cloned().unwrap_or(LocalTy::Scalar) {
-            LocalTy::Scalar => (scalar_cell_ty, None),
+            LocalTy::Scalar | LocalTy::Int32 => (scalar_cell_ty, None),
             // A dynamic-shape array parameter/output is wired to its incoming
             // argument and is in `skip_ids`; a dynamic-shape array *intermediate*
             // is allocated at run time at its assignment (see `lower_stmt`), so it
@@ -367,6 +373,9 @@ fn lower_function(
                 Some(shape),
             ),
             LocalTy::Struct { fields } => (struct_type(context, &fields)?, None),
+            // A cell or complex value is a boxed `convmat_value*` SSA value, not
+            // an alloca cell; it is materialized at its assignment.
+            LocalTy::Cell | LocalTy::Complex => continue,
             LocalTy::Dynamic => return Err(Error::NotLowerable("dynamic local shape".to_string())),
         };
 
@@ -539,6 +548,14 @@ fn lower_function(
         handle_targets.insert(binding, function_id);
     }
 
+    // Boxed (complex) outputs are returned by value; their boxes must survive
+    // block cleanup.
+    let box_outputs: HashSet<BindingId> = return_outputs
+        .iter()
+        .filter(|(_, ty)| ty.deref(context).is::<BoxType>())
+        .map(|(id, _)| *id)
+        .collect();
+
     let lowerer = FuncLowerer {
         f64_ty,
         locals,
@@ -546,6 +563,9 @@ fn lower_function(
         heap_cells,
         dyn_values: RefCell::new(HashMap::new()),
         dyn_heap: RefCell::new(Vec::new()),
+        box_values: RefCell::new(HashMap::new()),
+        box_heap: RefCell::new(Vec::new()),
+        box_outputs,
         callees: callees.clone(),
         varargin_local: variadics.varargin_local,
         varargin_args,
@@ -643,6 +663,14 @@ struct FuncLowerer {
     dyn_values: RefCell<HashMap<BindingId, (Value, Value)>>,
     /// Dynamic-shape heap buffers to free on return (allocation order).
     dyn_heap: RefCell<Vec<Value>>,
+    /// Boxed local values (`convmat_value*`): cells and complex values, keyed by
+    /// binding.
+    box_values: RefCell<HashMap<BindingId, Value>>,
+    /// Boxed locals (binding + value) to release, for block-scoped cleanup.
+    box_heap: RefCell<Vec<(BindingId, Value)>>,
+    /// Boxed function outputs: their boxes must survive block cleanup and are
+    /// returned (ownership transferred to the caller) rather than released.
+    box_outputs: HashSet<BindingId>,
     /// Resolved same-file callees for closed-world user-function calls.
     callees: HashMap<FunctionId, CalleeInfo>,
     /// The binding backing `varargin` (if any), specialized away.
@@ -726,6 +754,8 @@ impl FuncLowerer {
     ) -> Result<()> {
         let dyn_before = self.dyn_heap.borrow().len();
         let values_snapshot = self.dyn_values.borrow().clone();
+        let box_before = self.box_heap.borrow().len();
+        let box_values_snapshot = self.box_values.borrow().clone();
         for stmt in &hir_block.statements {
             self.lower_stmt(context, block, stmt)?;
         }
@@ -735,7 +765,23 @@ impl FuncLowerer {
             let op = DeleteOp::new(context, *ptr);
             append(context, block, &op);
         }
+        // Release this block's boxed locals (reverse allocation order), but keep
+        // boxed outputs (their boxes are returned to the caller).
+        let boxes: Vec<(BindingId, Value)> = self.box_heap.borrow_mut().split_off(box_before);
+        for (binding, boxed) in boxes.iter().rev() {
+            if !self.box_outputs.contains(binding) {
+                let op = CallVoidOp::new(context, crate::runtime::VALUE_RELEASE, vec![*boxed]);
+                append(context, block, &op);
+            }
+        }
         *self.dyn_values.borrow_mut() = values_snapshot;
+        let mut restored = box_values_snapshot;
+        for (binding, boxed) in &boxes {
+            if self.box_outputs.contains(binding) {
+                restored.insert(*binding, *boxed);
+            }
+        }
+        *self.box_values.borrow_mut() = restored;
         Ok(())
     }
 
@@ -763,13 +809,42 @@ impl FuncLowerer {
                     emit_store(context, block, cell, zero, value);
                     return Ok(());
                 }
-                // `s.field = expr` writes a struct field.
-                if let HirPlace::Member(base, name) = place {
-                    let cell = self.struct_cell(base)?;
+                // `s.field = expr` writes a struct field. A member chain
+                // (`s.a.b`) is flattened to a single field name.
+                if let HirPlace::Member(..) = place {
+                    let (root, path) = place_member_path(place).ok_or_else(|| {
+                        Error::NotLowerable("struct field base must be a binding".to_string())
+                    })?;
+                    let cell = self.local_cell(root)?;
                     let value = self.lower_expr(context, block, value)?;
-                    let op = StructSetOp::new(context, cell, &name.0, value);
+                    let field = flat_field_name(&path);
+                    let op = StructSetOp::new(context, cell, &field, value);
                     append(context, block, &op);
                     return Ok(());
+                }
+                // `A(mask) = v`: a masked in-place write (`convmat_mask_assign`).
+                if let HirPlace::Index(base, indexing) = place {
+                    if let Some(mask) = self.mask_component(base, indexing) {
+                        let HirExprKind::Binding(target) = &base.kind else {
+                            return Err(Error::NotLowerable(
+                                "masked assignment base must be a binding".to_string(),
+                            ));
+                        };
+                        let cell = self.local_cell(*target)?;
+                        let n = self.array_len_value(context, block, base)?;
+                        let mask_src = self.array_source(context, block, mask)?;
+                        let v = self.lower_expr(context, block, value)?;
+                        self.emit_extern_call(
+                            context,
+                            block,
+                            crate::runtime::MASK_ASSIGN,
+                            &[cell, n, mask_src, v],
+                        );
+                        return Ok(());
+                    }
+                    return Err(Error::NotLowerable(
+                        "only logical-mask assignment targets are supported".to_string(),
+                    ));
                 }
                 let HirPlace::Binding(target) = place else {
                     return Err(Error::NotLowerable(format!(
@@ -785,7 +860,7 @@ impl FuncLowerer {
                 }
                 let ty = self.tys.get(target).cloned().unwrap_or(LocalTy::Scalar);
                 match ty {
-                    LocalTy::Scalar => {
+                    LocalTy::Scalar | LocalTy::Int32 => {
                         let cell = self.local_cell(*target)?;
                         let value = self.lower_expr(context, block, value)?;
                         let zero = emit_constant(context, block, 0.0)?;
@@ -798,14 +873,14 @@ impl FuncLowerer {
                             // count to the out-length cell.
                             self.lower_array_expr_into(context, block, value, cell)?;
                             if let Some(out_len) = self.array_out_lens.get(target).copied() {
-                                let len = self.dynamic_array_len(value)?;
+                                let len = self.dynamic_array_len(context, block, value)?;
                                 let zero = emit_constant(context, block, 0.0)?;
                                 emit_store(context, block, out_len, zero, len);
                             }
                         } else {
                             // Dynamic-shape array intermediate: allocate a
                             // runtime-length heap buffer and fill it.
-                            let len = self.dynamic_array_len(value)?;
+                            let len = self.dynamic_array_len(context, block, value)?;
                             let alloc = HeapAllocOp::new(context, len);
                             let ptr = alloc.get_result(context);
                             append(context, block, &alloc);
@@ -821,6 +896,32 @@ impl FuncLowerer {
                     LocalTy::Struct { .. } => {
                         let cell = self.local_cell(*target)?;
                         self.lower_struct_expr_into(context, block, value, cell)?;
+                    }
+                    LocalTy::Cell => {
+                        let HirExprKind::Cell(rows) = &value.kind else {
+                            return Err(Error::NotLowerable(
+                                "cell assignment must come from a cell literal".to_string(),
+                            ));
+                        };
+                        let elems: Vec<&HirExpr> = rows.iter().flatten().collect();
+                        let count = emit_constant(context, block, elems.len() as f64)?;
+                        let op = CellNewOp::new(context, count);
+                        let cell = op.get_result(context);
+                        append(context, block, &op);
+                        for (i, elem) in elems.iter().enumerate() {
+                            let v = self.lower_expr(context, block, elem)?;
+                            let index = emit_constant(context, block, i as f64)?;
+                            let set = CellSetOp::new(context, cell, index, v);
+                            append(context, block, &set);
+                        }
+                        self.box_values.borrow_mut().insert(*target, cell);
+                        self.box_heap.borrow_mut().push((*target, cell));
+                    }
+                    LocalTy::Complex => {
+                        // A complex expression lowers to a boxed `convmat_value*`.
+                        let boxed = self.lower_expr(context, block, value)?;
+                        self.box_values.borrow_mut().insert(*target, boxed);
+                        self.box_heap.borrow_mut().push((*target, boxed));
                     }
                     LocalTy::Dynamic => {
                         return Err(Error::NotLowerable("dynamic assignment target".to_string()));
@@ -860,6 +961,11 @@ impl FuncLowerer {
             // `global`/`persistent` declarations are already materialized as
             // `static` cells during allocation; the statement itself is a no-op.
             HirStmtKind::Global(_) | HirStmtKind::Persistent(_) => Ok(()),
+            HirStmtKind::TryCatch {
+                try_body,
+                catch_body,
+                ..
+            } => self.lower_try(context, block, try_body, catch_body),
             HirStmtKind::Return => {
                 self.emit_heap_frees(context, block);
                 self.emit_return_values(context, block)
@@ -885,6 +991,10 @@ impl FuncLowerer {
         block: Ptr<BasicBlock>,
         expr: &HirExpr,
     ) -> Result<Value> {
+        // A complex-typed expression lowers to a boxed `convmat_value*`.
+        if matches!(self.operand_type(expr), LocalTy::Complex) {
+            return self.lower_complex_expr(context, block, expr);
+        }
         match &expr.kind {
             HirExprKind::Binding(id) => {
                 let cell = self
@@ -905,11 +1015,37 @@ impl FuncLowerer {
                 "NaN" => emit_constant(context, block, f64::NAN),
                 other => Err(Error::NotLowerable(format!("constant `{other}`"))),
             },
+            // A char-literal in a scalar context is its single code point (a
+            // `switch` on a char, `'a' == c`). Multi-char literals are 1xN arrays
+            // and must go through the array path.
+            HirExprKind::String(lit) => match char_codes(&lit.0).as_slice() {
+                [code] => emit_constant(context, block, *code),
+                [] => emit_constant(context, block, 0.0),
+                _ => Err(Error::NotLowerable(
+                    "multi-character string literal used as a scalar".to_string(),
+                )),
+            },
             HirExprKind::Unary(op, operand) => {
                 let value = self.lower_expr(context, block, operand)?;
                 self.apply_unary(context, block, op, value)
             }
             HirExprKind::Binary(lhs, op, rhs) => {
+                // Integer arithmetic wraps to 32 bits (`int32 + int32`); integer
+                // comparisons/logical go through the normal `f64` path (exact for
+                // `int32`-range values).
+                if matches!(
+                    op,
+                    OperatorKind::Add
+                        | OperatorKind::Subtract
+                        | OperatorKind::MatrixMultiply
+                        | OperatorKind::ElementwiseMultiply
+                        | OperatorKind::Mrdivide
+                        | OperatorKind::ElementwiseDivide
+                ) && matches!(self.operand_type(lhs), LocalTy::Int32)
+                    && matches!(self.operand_type(rhs), LocalTy::Int32)
+                {
+                    return self.lower_int_binary(context, block, op, lhs, rhs);
+                }
                 let l = self.lower_expr(context, block, lhs)?;
                 let r = self.lower_expr(context, block, rhs)?;
                 self.apply_binary(context, block, op, l, r)
@@ -923,12 +1059,36 @@ impl FuncLowerer {
                     if let Some(handle) = self.handles.get(id) {
                         return self.lower_handle_call(context, block, handle, indexing);
                     }
+                    // `c{i}` on a boxed cell reads element `i - 1` as a scalar.
+                    if indexing.kind == IndexKind::Brace
+                        && matches!(self.operand_type(base), LocalTy::Cell)
+                    {
+                        let cell = self
+                            .box_values
+                            .borrow()
+                            .get(id)
+                            .copied()
+                            .ok_or_else(|| Error::Backend(format!("no cell for {id:?}")))?;
+                        let one_based = brace_index(indexing).ok_or_else(|| {
+                            Error::NotLowerable("cell index must be a constant".to_string())
+                        })?;
+                        let index = emit_constant(context, block, (one_based - 1) as f64)?;
+                        let op = CellGetOp::new(context, cell, index);
+                        let result = op.get_result(context);
+                        append(context, block, &op);
+                        return Ok(result);
+                    }
                 }
                 self.lower_index_scalar(context, block, base, indexing)
             }
-            HirExprKind::Member(base, name) => {
-                let cell = self.struct_cell(base)?;
-                let op = StructGetOp::new(context, cell, &name.0);
+            HirExprKind::Member(..) => {
+                // A member chain (`s.a.b`) is flattened to a single field name.
+                let (root, path) = member_path(expr).ok_or_else(|| {
+                    Error::NotLowerable("struct field base must be a binding".to_string())
+                })?;
+                let cell = self.local_cell(root)?;
+                let field = flat_field_name(&path);
+                let op = StructGetOp::new(context, cell, &field);
                 let result = op.get_result(context);
                 append(context, block, &op);
                 Ok(result)
@@ -937,17 +1097,127 @@ impl FuncLowerer {
         }
     }
 
-    /// The struct cell backing an expression that must resolve to a `Binding`.
-    fn struct_cell(&self, expr: &HirExpr) -> Result<Value> {
+    /// Lower a complex-typed expression to a boxed `convmat_value*`. All complex
+    /// arithmetic is delegated to the runtime helpers (`convmat_complex`,
+    /// `convmat_cadd`, ...), so the static lowering only emits C calls.
+    fn lower_complex_expr(
+        &self,
+        context: &mut Context,
+        block: Ptr<BasicBlock>,
+        expr: &HirExpr,
+    ) -> Result<Value> {
         match &expr.kind {
+            // The imaginary unit `i` (and `j`) is `0 + 1i`.
+            HirExprKind::Constant(symbol) if symbol.0 == "i" || symbol.0 == "j" => {
+                let zero = emit_constant(context, block, 0.0)?;
+                let one = emit_constant(context, block, 1.0)?;
+                let op = BoxCallOp::new(context, crate::runtime::COMPLEX, vec![zero, one]);
+                let result = op.get_result(context);
+                append(context, block, &op);
+                Ok(result)
+            }
             HirExprKind::Binding(id) => self
-                .locals
+                .box_values
+                .borrow()
                 .get(id)
                 .copied()
-                .ok_or_else(|| Error::Backend(format!("binding {id:?} has no cell"))),
-            _ => Err(Error::NotLowerable(
-                "struct field base must be a binding".to_string(),
-            )),
+                .ok_or_else(|| Error::Backend(format!("no complex cell for {id:?}"))),
+            HirExprKind::Unary(op, operand) => match op {
+                OperatorKind::UnaryPlus => self.lower_complex_expr(context, block, operand),
+                OperatorKind::UnaryMinus => {
+                    let zero = emit_constant(context, block, 0.0)?;
+                    let z0 = BoxCallOp::new(context, crate::runtime::COMPLEX_REAL, vec![zero]);
+                    let z0v = z0.get_result(context);
+                    append(context, block, &z0);
+                    let a = self.lower_complex_operand(context, block, operand)?;
+                    let op = BoxCallOp::new(context, crate::runtime::CSUB, vec![z0v, a]);
+                    let result = op.get_result(context);
+                    append(context, block, &op);
+                    Ok(result)
+                }
+                other => Err(Error::NotLowerable(format!(
+                    "complex unary operator {other:?}"
+                ))),
+            },
+            HirExprKind::Binary(lhs, op, rhs) => {
+                let a = self.lower_complex_operand(context, block, lhs)?;
+                let b = self.lower_complex_operand(context, block, rhs)?;
+                let helper = match op {
+                    OperatorKind::Add => crate::runtime::CADD,
+                    OperatorKind::Subtract => crate::runtime::CSUB,
+                    OperatorKind::MatrixMultiply | OperatorKind::ElementwiseMultiply => {
+                        crate::runtime::CMUL
+                    }
+                    OperatorKind::Mrdivide | OperatorKind::ElementwiseDivide => {
+                        crate::runtime::CDIV
+                    }
+                    other => {
+                        return Err(Error::NotLowerable(format!("complex operator {other:?}")))
+                    }
+                };
+                let op = BoxCallOp::new(context, helper, vec![a, b]);
+                let result = op.get_result(context);
+                append(context, block, &op);
+                Ok(result)
+            }
+            HirExprKind::Call(call) => {
+                let name = call_name(&call.callee)
+                    .ok_or_else(|| Error::NotLowerable("dynamic complex call".to_string()))?;
+                match builtins::lookup(&name) {
+                    Some(Builtin::Fft) => {
+                        let [arg] = call.args.as_slice() else {
+                            return Err(Error::NotLowerable(
+                                "fft expects a single array argument".to_string(),
+                            ));
+                        };
+                        let src = self.array_source(context, block, arg)?;
+                        let n = self.array_len_value(context, block, arg)?;
+                        let op = BoxCallOp::new(context, crate::runtime::FFT, vec![src, n]);
+                        let result = op.get_result(context);
+                        append(context, block, &op);
+                        Ok(result)
+                    }
+                    Some(Builtin::Eig) => {
+                        let [arg] = call.args.as_slice() else {
+                            return Err(Error::NotLowerable(
+                                "eig expects a single matrix argument".to_string(),
+                            ));
+                        };
+                        let shape = self.array_shape(arg)?;
+                        let src = self.array_source(context, block, arg)?;
+                        let n = emit_constant(context, block, shape.dims()[0] as f64)?;
+                        let op = BoxCallOp::new(context, crate::runtime::EIG, vec![src, n]);
+                        let result = op.get_result(context);
+                        append(context, block, &op);
+                        Ok(result)
+                    }
+                    _ => Err(Error::NotLowerable(format!(
+                        "unsupported complex call `{name}`"
+                    ))),
+                }
+            }
+            other => Err(Error::NotLowerable(format!(
+                "unsupported complex expression {other:?}"
+            ))),
+        }
+    }
+
+    /// Lower an operand of a complex expression: a complex value as-is, or a real
+    /// scalar boxed via `convmat_complex_real`.
+    fn lower_complex_operand(
+        &self,
+        context: &mut Context,
+        block: Ptr<BasicBlock>,
+        expr: &HirExpr,
+    ) -> Result<Value> {
+        if matches!(self.operand_type(expr), LocalTy::Complex) {
+            self.lower_complex_expr(context, block, expr)
+        } else {
+            let x = self.lower_expr(context, block, expr)?;
+            let op = BoxCallOp::new(context, crate::runtime::COMPLEX_REAL, vec![x]);
+            let result = op.get_result(context);
+            append(context, block, &op);
+            Ok(result)
         }
     }
 
@@ -1301,6 +1571,16 @@ impl FuncLowerer {
 
         match builtin {
             Builtin::Unary(symbol) => {
+                // `abs` of a complex value is `convmat_cabs` (a real scalar).
+                if matches!(self.operand_type(args[0]), LocalTy::Complex) {
+                    if symbol != "fabs" {
+                        return Err(Error::NotLowerable(format!(
+                            "{symbol} of a complex value is not supported"
+                        )));
+                    }
+                    let z = self.lower_complex_expr(context, block, args[0])?;
+                    return self.emit_libm_call(context, block, crate::runtime::CABS, &[z]);
+                }
                 let value = self.lower_expr(context, block, args[0])?;
                 self.emit_libm_call(context, block, symbol, &[value])
             }
@@ -1356,7 +1636,7 @@ impl FuncLowerer {
                     }
                 }
                 match self.operand_type(args[0]) {
-                    LocalTy::Scalar => emit_constant(context, block, 0.0),
+                    LocalTy::Scalar | LocalTy::Int32 => emit_constant(context, block, 0.0),
                     LocalTy::Array { shape } if shape.is_dynamic() => {
                         let n = self.array_len_value(context, block, args[0])?;
                         let zero = emit_constant(context, block, 0.0)?;
@@ -1367,9 +1647,10 @@ impl FuncLowerer {
                     LocalTy::Array { shape } => {
                         emit_constant(context, block, (shape.numel() == 0) as u8 as f64)
                     }
-                    LocalTy::Struct { .. } | LocalTy::Dynamic => {
-                        Err(Error::NotLowerable("dynamic isempty".to_string()))
-                    }
+                    LocalTy::Struct { .. }
+                    | LocalTy::Cell
+                    | LocalTy::Complex
+                    | LocalTy::Dynamic => Err(Error::NotLowerable("dynamic isempty".to_string())),
                 }
             }
             // `logical(x)` is `x != 0` (0/1); scalar form.
@@ -1379,22 +1660,40 @@ impl FuncLowerer {
                 self.apply_binary(context, block, &OperatorKind::NotEqual, x, zero)
             }
             Builtin::Var => self.variance_arg(context, block, args[0]),
+            // `strcmp(a, b)`: constant-folded when both operands are char
+            // literals (the general char-array path is not lowered yet).
+            Builtin::StrCmp => {
+                let (HirExprKind::String(a), HirExprKind::String(b)) =
+                    (&args[0].kind, &args[1].kind)
+                else {
+                    return Err(Error::NotLowerable(
+                        "strcmp currently requires two string literals".to_string(),
+                    ));
+                };
+                let equal = char_codes(&a.0) == char_codes(&b.0);
+                emit_constant(context, block, equal as u8 as f64)
+            }
+            // `int32(x)`: round to the nearest 32-bit signed integer.
+            Builtin::Int32 => {
+                let value = self.lower_expr(context, block, args[0])?;
+                self.emit_libm_call(context, block, crate::runtime::INT32, &[value])
+            }
             // `det` of a scalar is the scalar itself; of a square matrix it is a
             // runtime helper.
             Builtin::Det => match self.operand_type(args[0]) {
-                LocalTy::Scalar => self.lower_expr(context, block, args[0]),
+                LocalTy::Scalar | LocalTy::Int32 => self.lower_expr(context, block, args[0]),
                 LocalTy::Array { shape } => {
                     let src = self.array_source(context, block, args[0])?;
                     let n = emit_constant(context, block, shape.dims()[0] as f64)?;
                     self.emit_libm_call(context, block, crate::runtime::DET, &[src, n])
                 }
-                LocalTy::Struct { .. } | LocalTy::Dynamic => {
+                LocalTy::Struct { .. } | LocalTy::Cell | LocalTy::Complex | LocalTy::Dynamic => {
                     Err(Error::NotLowerable("dynamic det".to_string()))
                 }
             },
             // `norm` of a scalar is `abs`; of a vector it is the 2-norm.
             Builtin::Norm => match self.operand_type(args[0]) {
-                LocalTy::Scalar => {
+                LocalTy::Scalar | LocalTy::Int32 => {
                     let value = self.lower_expr(context, block, args[0])?;
                     self.emit_libm_call(context, block, "fabs", &[value])
                 }
@@ -1404,7 +1703,7 @@ impl FuncLowerer {
                     let n = emit_constant(context, block, n as f64)?;
                     self.emit_libm_call(context, block, crate::runtime::NORM, &[src, n])
                 }
-                LocalTy::Struct { .. } | LocalTy::Dynamic => {
+                LocalTy::Struct { .. } | LocalTy::Cell | LocalTy::Complex | LocalTy::Dynamic => {
                     Err(Error::NotLowerable("dynamic norm".to_string()))
                 }
             },
@@ -1415,8 +1714,8 @@ impl FuncLowerer {
                     self.array_len_value(context, block, args[0])
                 }
                 LocalTy::Array { shape } => emit_constant(context, block, shape.numel() as f64),
-                LocalTy::Scalar => emit_constant(context, block, 1.0),
-                LocalTy::Struct { .. } | LocalTy::Dynamic => {
+                LocalTy::Scalar | LocalTy::Int32 => emit_constant(context, block, 1.0),
+                LocalTy::Struct { .. } | LocalTy::Cell | LocalTy::Complex | LocalTy::Dynamic => {
                     Err(Error::NotLowerable("dynamic numel".to_string()))
                 }
             },
@@ -1434,8 +1733,11 @@ impl FuncLowerer {
                         return self.array_len_value(context, block, args[0]);
                     }
                     LocalTy::Array { shape } => shape.dims().iter().copied().max().unwrap_or(1),
-                    LocalTy::Scalar => 1,
-                    LocalTy::Struct { .. } | LocalTy::Dynamic => {
+                    LocalTy::Scalar | LocalTy::Int32 => 1,
+                    LocalTy::Struct { .. }
+                    | LocalTy::Cell
+                    | LocalTy::Complex
+                    | LocalTy::Dynamic => {
                         return Err(Error::NotLowerable("dynamic length".to_string()))
                     }
                 };
@@ -1476,7 +1778,9 @@ impl FuncLowerer {
             | Builtin::Inv
             | Builtin::LinSpace
             | Builtin::Repmat
-            | Builtin::Permute => Err(Error::NotLowerable(
+            | Builtin::Permute
+            | Builtin::Fft
+            | Builtin::Eig => Err(Error::NotLowerable(
                 "constructor reached scalar path".to_string(),
             )),
         }
@@ -1509,7 +1813,7 @@ impl FuncLowerer {
         reducer: Reducer,
     ) -> Result<Value> {
         match self.operand_type(operand) {
-            LocalTy::Scalar => self.lower_expr(context, block, operand),
+            LocalTy::Scalar | LocalTy::Int32 => self.lower_expr(context, block, operand),
             LocalTy::Array { shape } if shape.is_dynamic() => {
                 let src = self.array_source(context, block, operand)?;
                 let n = self.array_len_value(context, block, operand)?;
@@ -1526,7 +1830,7 @@ impl FuncLowerer {
                 let src = self.array_source(context, block, operand)?;
                 self.reduce(context, block, reducer, src, shape.numel())
             }
-            LocalTy::Struct { .. } | LocalTy::Dynamic => {
+            LocalTy::Struct { .. } | LocalTy::Cell | LocalTy::Complex | LocalTy::Dynamic => {
                 Err(Error::NotLowerable("dynamic reduction".to_string()))
             }
         }
@@ -1694,8 +1998,11 @@ impl FuncLowerer {
                                 return Err(Error::NotLowerable("dynamic size".to_string()))
                             }
                             LocalTy::Array { shape } => shape,
-                            LocalTy::Scalar => Shape::matrix(1, 1),
-                            LocalTy::Struct { .. } | LocalTy::Dynamic => {
+                            LocalTy::Scalar | LocalTy::Int32 => Shape::matrix(1, 1),
+                            LocalTy::Struct { .. }
+                            | LocalTy::Cell
+                            | LocalTy::Complex
+                            | LocalTy::Dynamic => {
                                 return Err(Error::NotLowerable("dynamic size".to_string()))
                             }
                         };
@@ -1874,6 +2181,18 @@ impl FuncLowerer {
                     unreachable!();
                 };
                 let src = self.array_source(context, block, base)?;
+                // `A(mask)`: gather the selected elements (runtime-sized result).
+                if let Some(mask) = self.mask_component(base, indexing) {
+                    let n = self.array_len_value(context, block, base)?;
+                    let mask_src = self.array_source(context, block, mask)?;
+                    self.emit_extern_call(
+                        context,
+                        block,
+                        crate::runtime::MASK_GATHER,
+                        &[dest, src, n, mask_src],
+                    );
+                    return Ok(());
+                }
                 if self.array_shape(base)?.is_dynamic() {
                     // Dynamic source: copy elementwise via a runtime helper.
                     let n = self.array_len_value(context, block, base)?;
@@ -1895,6 +2214,13 @@ impl FuncLowerer {
                 }
                 Ok(())
             }
+            // A plain array variable (`y = A`): copy its elements into `dest`.
+            HirExprKind::Binding(_) => {
+                let src = self.array_source(context, block, expr)?;
+                let n = self.array_len_value(context, block, expr)?;
+                self.emit_extern_call(context, block, crate::runtime::COPY, &[dest, src, n]);
+                Ok(())
+            }
             other => Err(Error::NotLowerable(format!("array rvalue {other:?}"))),
         }
     }
@@ -1913,6 +2239,35 @@ impl FuncLowerer {
             emit_store(context, block, flag, zero, one);
         }
         Ok(())
+    }
+
+    /// If `indexing` is a single logical-mask subscript on array `base` (a
+    /// subscript expression of the same shape as `base`, or an explicit
+    /// `Logical` component), return the mask expression. The colon and ranges
+    /// are not masks.
+    fn mask_component<'a>(
+        &self,
+        base: &HirExpr,
+        indexing: &'a IndexingSemantics,
+    ) -> Option<&'a HirExpr> {
+        let [component] = indexing.components.as_slice() else {
+            return None;
+        };
+        match component {
+            IndexComponent::Logical(expr) => Some(expr),
+            IndexComponent::Expr(expr) => {
+                if matches!(expr.kind, HirExprKind::Range(..) | HirExprKind::Colon) {
+                    return None;
+                }
+                match (self.operand_type(base), self.operand_type(expr)) {
+                    (LocalTy::Array { shape: b }, LocalTy::Array { shape: m }) if b == m => {
+                        Some(expr)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
     }
 
     /// The cell backing an array-typed expression (materializing inline array
@@ -1947,7 +2302,7 @@ impl FuncLowerer {
                 if shape.is_dynamic() {
                     // A nested dynamic expression (e.g. the `A .* A` in
                     // `y = A .* A + n`): materialize a runtime-length heap temp.
-                    let len = self.dynamic_array_len(expr)?;
+                    let len = self.dynamic_array_len(context, block, expr)?;
                     let alloc = HeapAllocOp::new(context, len);
                     let temp = alloc.get_result(context);
                     append(context, block, &alloc);
@@ -1985,7 +2340,9 @@ impl FuncLowerer {
         expr: &HirExpr,
     ) -> Result<Value> {
         match self.operand_type(expr) {
-            LocalTy::Array { shape } if shape.is_dynamic() => self.dynamic_array_len(expr),
+            LocalTy::Array { shape } if shape.is_dynamic() => {
+                self.dynamic_array_len(context, block, expr)
+            }
             LocalTy::Array { shape } => emit_constant(context, block, shape.numel() as f64),
             _ => Err(Error::NotLowerable("expected an array operand".to_string())),
         }
@@ -1993,8 +2350,14 @@ impl FuncLowerer {
 
     /// The runtime element count of a dynamic-shape array expression, by
     /// walking to the array operand that determines its length. Elementwise
-    /// operators (`scalar op A`, `-A`) and `A(:)` preserve the operand's length.
-    fn dynamic_array_len(&self, expr: &HirExpr) -> Result<Value> {
+    /// operators (`scalar op A`, `-A`) and `A(:)` preserve the operand's length;
+    /// a mask subscript (`A(mask)`) counts the selected elements.
+    fn dynamic_array_len(
+        &self,
+        context: &mut Context,
+        block: Ptr<BasicBlock>,
+        expr: &HirExpr,
+    ) -> Result<Value> {
         match &expr.kind {
             HirExprKind::Binding(id) => {
                 if let Some((_, len)) = self.dyn_values.borrow().get(id).copied() {
@@ -2005,14 +2368,25 @@ impl FuncLowerer {
                     .copied()
                     .ok_or_else(|| Error::Backend(format!("no length for array {id:?}")))
             }
-            HirExprKind::Index(base, _) | HirExprKind::Unary(_, base) => {
-                self.dynamic_array_len(base)
+            HirExprKind::Index(base, indexing) => {
+                if let Some(mask) = self.mask_component(base, indexing) {
+                    let n = self.array_len_value(context, block, base)?;
+                    let mask_src = self.array_source(context, block, mask)?;
+                    return self.emit_libm_call(
+                        context,
+                        block,
+                        crate::runtime::MASK_COUNT,
+                        &[mask_src, n],
+                    );
+                }
+                self.dynamic_array_len(context, block, base)
             }
+            HirExprKind::Unary(_, base) => self.dynamic_array_len(context, block, base),
             HirExprKind::Binary(lhs, _, rhs) => {
                 if matches!(self.operand_type(lhs), LocalTy::Array { .. }) {
-                    self.dynamic_array_len(lhs)
+                    self.dynamic_array_len(context, block, lhs)
                 } else {
-                    self.dynamic_array_len(rhs)
+                    self.dynamic_array_len(context, block, rhs)
                 }
             }
             _ => Err(Error::NotLowerable(
@@ -2096,7 +2470,7 @@ impl FuncLowerer {
         operand: &HirExpr,
     ) -> Result<Value> {
         match self.operand_type(operand) {
-            LocalTy::Scalar => self.lower_expr(context, block, operand),
+            LocalTy::Scalar | LocalTy::Int32 => self.lower_expr(context, block, operand),
             LocalTy::Array { shape } if shape.is_dynamic() => {
                 let src = self.array_source(context, block, operand)?;
                 let n = self.array_len_value(context, block, operand)?;
@@ -2110,7 +2484,7 @@ impl FuncLowerer {
                 let count = emit_constant(context, block, n as f64)?;
                 self.append_binop(context, block, BinOpKind::Div, sum, count)
             }
-            LocalTy::Struct { .. } | LocalTy::Dynamic => {
+            LocalTy::Struct { .. } | LocalTy::Cell | LocalTy::Complex | LocalTy::Dynamic => {
                 Err(Error::NotLowerable("dynamic mean".to_string()))
             }
         }
@@ -2137,7 +2511,7 @@ impl FuncLowerer {
     ) -> Result<Value> {
         match self.operand_type(operand) {
             // MATLAB defines `std` of a single value as 0.
-            LocalTy::Scalar => emit_constant(context, block, 0.0),
+            LocalTy::Scalar | LocalTy::Int32 => emit_constant(context, block, 0.0),
             LocalTy::Array { shape } if !shape.is_dynamic() => {
                 let n = shape.numel();
                 if n < 2 {
@@ -2176,9 +2550,11 @@ impl FuncLowerer {
                 let denom = emit_constant(context, block, (n - 1) as f64)?;
                 self.append_binop(context, block, BinOpKind::Div, sumsq, denom)
             }
-            LocalTy::Array { .. } | LocalTy::Struct { .. } | LocalTy::Dynamic => {
-                Err(Error::NotLowerable("dynamic variance".to_string()))
-            }
+            LocalTy::Array { .. }
+            | LocalTy::Struct { .. }
+            | LocalTy::Cell
+            | LocalTy::Complex
+            | LocalTy::Dynamic => Err(Error::NotLowerable("dynamic variance".to_string())),
         }
     }
 
@@ -2190,7 +2566,7 @@ impl FuncLowerer {
         operand: &HirExpr,
     ) -> Result<Value> {
         match self.operand_type(operand) {
-            LocalTy::Scalar => self.lower_expr(context, block, operand),
+            LocalTy::Scalar | LocalTy::Int32 => self.lower_expr(context, block, operand),
             LocalTy::Array { shape } if !shape.is_dynamic() => {
                 let n = shape.numel();
                 if n == 0 {
@@ -2226,9 +2602,11 @@ impl FuncLowerer {
                 append(context, block, &load);
                 Ok(value)
             }
-            LocalTy::Array { .. } | LocalTy::Struct { .. } | LocalTy::Dynamic => {
-                Err(Error::NotLowerable("dynamic median".to_string()))
-            }
+            LocalTy::Array { .. }
+            | LocalTy::Struct { .. }
+            | LocalTy::Cell
+            | LocalTy::Complex
+            | LocalTy::Dynamic => Err(Error::NotLowerable("dynamic median".to_string())),
         }
     }
 
@@ -2488,6 +2866,34 @@ impl FuncLowerer {
         }
     }
 
+    /// Lower `int32 <op> int32` arithmetic: evaluate both operands and wrap the
+    /// result to 32 bits via a runtime helper (stored back as `f64`).
+    fn lower_int_binary(
+        &self,
+        context: &mut Context,
+        block: Ptr<BasicBlock>,
+        op: &OperatorKind,
+        lhs: &HirExpr,
+        rhs: &HirExpr,
+    ) -> Result<Value> {
+        let l = self.lower_expr(context, block, lhs)?;
+        let r = self.lower_expr(context, block, rhs)?;
+        let helper = match op {
+            OperatorKind::Add => crate::runtime::IADD,
+            OperatorKind::Subtract => crate::runtime::ISUB,
+            OperatorKind::MatrixMultiply | OperatorKind::ElementwiseMultiply => {
+                crate::runtime::IMUL
+            }
+            OperatorKind::Mrdivide | OperatorKind::ElementwiseDivide => crate::runtime::IDIV,
+            other => {
+                return Err(Error::NotLowerable(format!(
+                    "integer operator {other:?} is not supported"
+                )))
+            }
+        };
+        self.emit_libm_call(context, block, helper, &[l, r])
+    }
+
     fn apply_binary(
         &self,
         context: &mut Context,
@@ -2699,6 +3105,23 @@ impl FuncLowerer {
         Ok(())
     }
 
+    /// Lower `try <body> catch <handler> end` to a `matlab.try` op. The op keeps
+    /// the MATLAB-level structure; the setjmp/`if` realization is the C-level
+    /// concern of the `matlab` -> `emitc` lowering pass.
+    fn lower_try(
+        &self,
+        context: &mut Context,
+        block: Ptr<BasicBlock>,
+        try_body: &HirBlock,
+        catch_body: &HirBlock,
+    ) -> Result<()> {
+        let op = TryOp::new(context);
+        append(context, block, &op);
+        self.fill_block(context, op.try_region(context), try_body)?;
+        self.fill_block(context, op.catch_region(context), catch_body)?;
+        Ok(())
+    }
+
     /// Emit a `while` loop.
     fn lower_while(
         &self,
@@ -2864,7 +3287,7 @@ impl FuncLowerer {
         Ok(())
     }
 
-    /// Lower a unary operator over an array (elementwise or 2-D transpose).
+    /// Lower a binary operator over an array (elementwise or 2-D transpose).
     fn lower_array_unary(
         &self,
         context: &mut Context,
@@ -3416,6 +3839,11 @@ impl FuncLowerer {
     fn emit_return_values(&self, context: &mut Context, block: Ptr<BasicBlock>) -> Result<()> {
         let mut values = Vec::new();
         for (output, ty) in &self.return_outputs {
+            // A boxed (complex) output is returned directly.
+            if let Some(boxed) = self.box_values.borrow().get(output).copied() {
+                values.push(boxed);
+                continue;
+            }
             let cell = self
                 .locals
                 .get(output)
@@ -3456,8 +3884,12 @@ fn struct_type(context: &mut Context, fields: &[(String, LocalTy)]) -> Result<Ty
         .iter()
         .map(|(name, ty)| {
             let f_ty: TypeHandle = match ty {
-                LocalTy::Scalar => FP64Type::get(context).into(),
-                LocalTy::Array { .. } | LocalTy::Struct { .. } | LocalTy::Dynamic => {
+                LocalTy::Scalar | LocalTy::Int32 => FP64Type::get(context).into(),
+                LocalTy::Array { .. }
+                | LocalTy::Struct { .. }
+                | LocalTy::Cell
+                | LocalTy::Complex
+                | LocalTy::Dynamic => {
                     return Err(Error::NotLowerable(
                         "only scalar struct fields are supported yet".to_string(),
                     ))

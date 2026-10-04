@@ -50,6 +50,213 @@ pub const DET: &str = "convmat_det";
 pub const NORM: &str = "convmat_norm";
 pub const SOLVE: &str = "convmat_solve";
 pub const RAND: &str = "convmat_rand";
+pub const INT32: &str = "convmat_int32";
+pub const IADD: &str = "convmat_iadd";
+pub const ISUB: &str = "convmat_isub";
+pub const IMUL: &str = "convmat_imul";
+pub const IDIV: &str = "convmat_idiv";
+pub const MASK_COUNT: &str = "convmat_mask_count";
+pub const MASK_GATHER: &str = "convmat_mask_gather";
+pub const MASK_ASSIGN: &str = "convmat_mask_assign";
+pub const ERROR_ENTER: &str = "convmat_error_enter";
+pub const ERROR_CHECK: &str = "convmat_error_check";
+pub const ERROR_LEAVE: &str = "convmat_error_leave";
+pub const ERROR_THROW: &str = "convmat_error_throw";
+
+/// Sentinel name requested by `lowering` to emit the composed cell/box runtime
+/// support ([`cell_support_source`]). It is not a single helper function.
+pub const CELL_SUPPORT: &str = "convmat_cell_support";
+pub const CELL_NEW: &str = "convmat_cell_new";
+pub const CELL_SET_SCALAR: &str = "convmat_cell_set_scalar";
+pub const CELL_GET_SCALAR: &str = "convmat_cell_get_scalar";
+/// Release a boxed value (the cell lifecycle helper, provided by the cell
+/// support blob rather than a standalone helper).
+pub const VALUE_RELEASE: &str = "convmat_value_release";
+
+/// Complex runtime helpers, provided by [`complex_support_source`].
+pub const COMPLEX_SUPPORT: &str = "convmat_complex_support";
+pub const COMPLEX: &str = "convmat_complex";
+pub const COMPLEX_REAL: &str = "convmat_complex_real";
+pub const CABS: &str = "convmat_cabs";
+pub const CADD: &str = "convmat_cadd";
+pub const CSUB: &str = "convmat_csub";
+pub const CMUL: &str = "convmat_cmul";
+pub const CDIV: &str = "convmat_cdiv";
+pub const FFT: &str = "convmat_fft";
+pub const EIG: &str = "convmat_eig";
+
+/// Whether `name` is a complex runtime helper (covered by the complex support
+/// blob rather than a standalone [`helper_source`] entry).
+pub fn is_complex_helper(name: &str) -> bool {
+    matches!(
+        name,
+        COMPLEX | COMPLEX_REAL | CABS | CADD | CSUB | CMUL | CDIV | FFT | EIG
+    )
+}
+
+/// The dynamic value-model kernel wrapped in its own include guard, so the cell
+/// and complex support blobs can each embed it without duplicating definitions.
+pub fn dynamic_kernel_source() -> String {
+    format!(
+        "#ifndef CONVMAT_DYNAMIC_KERNEL_H\n\
+#define CONVMAT_DYNAMIC_KERNEL_H\n\
+#include <setjmp.h>\n\
+{DYNAMIC_RUNTIME_H}\n{DYNAMIC_RUNTIME_C}\n\
+#endif\n"
+    )
+}
+
+/// The C support for complex numbers: the dynamic kernel plus complex helpers.
+/// Complex values are boxed `convmat_value`s with dtype `CONVMAT_COMPLEX` and
+/// interleaved `[re, im]` data (a scalar is a 1x1 complex array).
+pub fn complex_support_source() -> String {
+    format!(
+        "#ifndef CONVMAT_COMPLEX_SUPPORT_H\n\
+#define CONVMAT_COMPLEX_SUPPORT_H\n\
+#include <cmath>\n\
+{}\n{COMPLEX_WRAPPERS_C}\n\
+#endif\n",
+        dynamic_kernel_source()
+    )
+}
+
+/// The C support for cell arrays: the dynamic value-model kernel
+/// ([`DYNAMIC_RUNTIME_H`] + [`DYNAMIC_RUNTIME_C`]) plus thin scalar-element
+/// wrappers. Returned as a `String` because it concatenates separate consts.
+pub fn cell_support_source() -> String {
+    format!(
+        "#ifndef CONVMAT_CELL_SUPPORT_H\n\
+#define CONVMAT_CELL_SUPPORT_H\n\
+{}\n{CELL_WRAPPERS_C}\n\
+#endif\n",
+        dynamic_kernel_source()
+    )
+}
+
+/// Thin wrappers over the value-model kernel for scalar-element cells (the only
+/// cell form the static lowering supports today; `docs/runtime.md` §9.2).
+const CELL_WRAPPERS_C: &str = "\
+// ---- convmat cell wrappers (scalar elements) ----\n\
+static convmat_value *convmat_cell_new(double n) {\n\
+    int64_t dims[1] = { (int64_t)n };\n\
+    return convmat_cell_create(1, dims);\n\
+}\n\
+static void convmat_cell_set_scalar(convmat_value *c, double i, double v) {\n\
+    convmat_value *e = convmat_value_new(CONVMAT_SCALAR, CONVMAT_DOUBLE);\n\
+    e->u.scalar.d = v;\n\
+    convmat_cell_set(c, (int64_t)i, e);\n\
+    convmat_value_release(e);\n\
+}\n\
+static double convmat_cell_get_scalar(const convmat_value *c, double i) {\n\
+    convmat_value *e = convmat_cell_get(c, (int64_t)i);\n\
+    double v = e->u.scalar.d;\n\
+    convmat_value_release(e);\n\
+    return v;\n\
+}\n\
+";
+
+/// The complex helpers (boxed `CONVMAT_COMPLEX` values with interleaved
+/// `[re, im]` data). All complex arithmetic built-ins live here so the static
+/// lowering only has to emit C calls.
+const COMPLEX_WRAPPERS_C: &str = "\
+// ---- convmat complex helpers (boxed CONVMAT_COMPLEX values) ----\n\
+static convmat_value *convmat_complex_array(int64_t n) {\n\
+    int64_t dims[2] = {1, n};\n\
+    convmat_value *v = convmat_value_new(CONVMAT_ARRAY, CONVMAT_COMPLEX);\n\
+    v->u.array.shape.ndims = 2;\n\
+    v->u.array.shape.dims = convmat_dims_clone(2, dims);\n\
+    v->u.array.data = new double[2 * n]();\n\
+    v->u.array.capacity = n;\n\
+    v->u.array.owns_data = 1;\n\
+    return v;\n\
+}\n\
+static convmat_value *convmat_complex(double re, double im) {\n\
+    convmat_value *v = convmat_complex_array(1);\n\
+    double *d = static_cast<double *>(v->u.array.data);\n\
+    d[0] = re; d[1] = im;\n\
+    return v;\n\
+}\n\
+static convmat_value *convmat_complex_real(double x) {\n\
+    return convmat_complex(x, 0.0);\n\
+}\n\
+static const double *convmat_complex_data(const convmat_value *z) {\n\
+    return static_cast<const double *>(z->u.array.data);\n\
+}\n\
+static double convmat_cabs(const convmat_value *z) {\n\
+    const double *d = convmat_complex_data(z);\n\
+    return sqrt(d[0] * d[0] + d[1] * d[1]);\n\
+}\n\
+static convmat_value *convmat_cadd(const convmat_value *a, const convmat_value *b) {\n\
+    const double *x = convmat_complex_data(a);\n\
+    const double *y = convmat_complex_data(b);\n\
+    return convmat_complex(x[0] + y[0], x[1] + y[1]);\n\
+}\n\
+static convmat_value *convmat_csub(const convmat_value *a, const convmat_value *b) {\n\
+    const double *x = convmat_complex_data(a);\n\
+    const double *y = convmat_complex_data(b);\n\
+    return convmat_complex(x[0] - y[0], x[1] - y[1]);\n\
+}\n\
+static convmat_value *convmat_cmul(const convmat_value *a, const convmat_value *b) {\n\
+    const double *x = convmat_complex_data(a);\n\
+    const double *y = convmat_complex_data(b);\n\
+    return convmat_complex(x[0] * y[0] - x[1] * y[1], x[0] * y[1] + x[1] * y[0]);\n\
+}\n\
+static convmat_value *convmat_cdiv(const convmat_value *a, const convmat_value *b) {\n\
+    const double *x = convmat_complex_data(a);\n\
+    const double *y = convmat_complex_data(b);\n\
+    double den = y[0] * y[0] + y[1] * y[1];\n\
+    return convmat_complex((x[0] * y[0] + x[1] * y[1]) / den, (x[1] * y[0] - x[0] * y[1]) / den);\n\
+}\n\
+static convmat_value *convmat_fft(const double *data, double n) {\n\
+    int m = (int)n;\n\
+    convmat_value *v = convmat_complex_array(m);\n\
+    double *out = static_cast<double *>(v->u.array.data);\n\
+    const double pi = 3.14159265358979323846;\n\
+    for (int k = 0; k < m; k++) {\n\
+        double re = 0.0, im = 0.0;\n\
+        for (int t = 0; t < m; t++) {\n\
+            double ang = -2.0 * pi * (double)(k * t) / (double)m;\n\
+            re += data[t] * cos(ang);\n\
+            im += data[t] * sin(ang);\n\
+        }\n\
+        out[2 * k] = re;\n\
+        out[2 * k + 1] = im;\n\
+    }\n\
+    return v;\n\
+}\n\
+// Read component `part` (0 = re, 1 = im) of complex element `index`.\n\
+double convmat_complex_component(const convmat_value *z, double index, double part) {\n\
+    const double *d = convmat_complex_data(z);\n\
+    return d[2 * (int64_t)index + (int64_t)part];\n\
+}\n\
+// Eigenvalues of a small real square matrix (column-major `data`, `n x n`):\n\
+// 1x1 and 2x2 are exact (2x2 handles complex eigenvalues); larger sizes are\n\
+// rejected by the lowering before reaching here. Returned as an `n`-element\n\
+// complex vector (a real eigenvalue has zero imaginary part).\n\
+static convmat_value *convmat_eig(const double *data, double n) {\n\
+    int m = (int)n;\n\
+    convmat_value *v = convmat_complex_array(m);\n\
+    double *out = static_cast<double *>(v->u.array.data);\n\
+    if (m == 1) {\n\
+        out[0] = data[0];\n\
+        out[1] = 0.0;\n\
+        return v;\n\
+    }\n\
+    double a = data[0], c = data[1], b = data[2], d = data[3];\n\
+    double tr = a + d;\n\
+    double disc = (a - d) * (a - d) + 4.0 * b * c;\n\
+    if (disc >= 0.0) {\n\
+        double s = sqrt(disc);\n\
+        out[0] = (tr - s) / 2.0; out[1] = 0.0;\n\
+        out[2] = (tr + s) / 2.0; out[3] = 0.0;\n\
+    } else {\n\
+        double s = sqrt(-disc);\n\
+        out[0] = tr / 2.0; out[1] = -s / 2.0;\n\
+        out[2] = tr / 2.0; out[3] = s / 2.0;\n\
+    }\n\
+    return v;\n\
+}\n\
+";
 
 // --- Dynamic tier (see docs/runtime.md) -------------------------------------
 //
@@ -79,6 +286,7 @@ typedef enum convmat_dtype {\n\
     CONVMAT_LOGICAL,\n\
     CONVMAT_INT32,\n\
     CONVMAT_CHAR,\n\
+    CONVMAT_COMPLEX,\n\
 } convmat_dtype;\n\
 \n\
 typedef enum convmat_kind {\n\
@@ -446,6 +654,15 @@ pub fn helper_source(name: &str) -> Option<&'static str> {
         NORM => NORM_C,
         SOLVE => SOLVE_C,
         RAND => RAND_C,
+        INT32 => INT32_C,
+        IADD => IADD_C,
+        ISUB => ISUB_C,
+        IMUL => IMUL_C,
+        IDIV => IDIV_C,
+        MASK_COUNT => MASK_COUNT_C,
+        MASK_GATHER => MASK_GATHER_C,
+        MASK_ASSIGN => MASK_ASSIGN_C,
+        ERROR_ENTER | ERROR_CHECK | ERROR_LEAVE | ERROR_THROW => ERROR_SUPPORT_C,
         _ => return None,
     })
 }
@@ -839,6 +1056,102 @@ double convmat_rand(void) {\n\
 }\n\
 ";
 
+const INT32_C: &str = "\
+// ---- convmat_int32: round to the nearest int32 (ties away from zero) ----\n\
+double convmat_int32(double x) {\n\
+    return (double)(int32_t)llround(x);\n\
+}\n\
+";
+
+const IADD_C: &str = "\
+// ---- convmat_iadd: int32 wraparound addition ----\n\
+double convmat_iadd(double a, double b) {\n\
+    return (double)(int32_t)((int64_t)a + (int64_t)b);\n\
+}\n\
+";
+
+const ISUB_C: &str = "\
+// ---- convmat_isub: int32 wraparound subtraction ----\n\
+double convmat_isub(double a, double b) {\n\
+    return (double)(int32_t)((int64_t)a - (int64_t)b);\n\
+}\n\
+";
+
+const IMUL_C: &str = "\
+// ---- convmat_imul: int32 wraparound multiplication ----\n\
+double convmat_imul(double a, double b) {\n\
+    return (double)(int32_t)((int64_t)a * (int64_t)b);\n\
+}\n\
+";
+
+const IDIV_C: &str = "\
+// ---- convmat_idiv: int32 division (round to nearest integer) ----\n\
+double convmat_idiv(double a, double b) {\n\
+    return (double)(int32_t)llround((double)(int64_t)a / (double)(int64_t)b);\n\
+}\n\
+";
+
+const MASK_COUNT_C: &str = "\
+// ---- convmat_mask_count: number of nonzero mask entries ----\n\
+double convmat_mask_count(const double* mask, double n) {\n\
+    int m = (int)n;\n\
+    double count = 0.0;\n\
+    for (int i = 0; i < m; i++) if (mask[i] != 0.0) count += 1.0;\n\
+    return count;\n\
+}\n\
+";
+
+const MASK_GATHER_C: &str = "\
+// ---- convmat_mask_gather: dst = src(where mask); returns the count ----\n\
+double convmat_mask_gather(double* dst, const double* src, double n, const double* mask) {\n\
+    int m = (int)n;\n\
+    int k = 0;\n\
+    for (int i = 0; i < m; i++) if (mask[i] != 0.0) dst[k++] = src[i];\n\
+    return (double)k;\n\
+}\n\
+";
+
+const MASK_ASSIGN_C: &str = "\
+// ---- convmat_mask_assign: a(where mask) = v (in place) ----\n\
+void convmat_mask_assign(double* a, double n, const double* mask, double v) {\n\
+    int m = (int)n;\n\
+    for (int i = 0; i < m; i++) if (mask[i] != 0.0) a[i] = v;\n\
+}\n\
+";
+
+pub const ERROR_SUPPORT_C: &str = "\
+#ifndef CONVMAT_ERROR_SUPPORT_H\n\
+#define CONVMAT_ERROR_SUPPORT_H\n\
+#include <setjmp.h>\n\
+// ---- convmat runtime: try/catch error propagation (docs/runtime.md §7) ----\n\
+// A tiny stack of setjmp environments shared by all functions in the TU.\n\
+// `convmat_error_check` is a *macro* so the `setjmp` call is textually inlined\n\
+// into the surrounding function (setjmp must run in the frame it returns to).\n\
+typedef struct convmat_error_env { jmp_buf jmp; int active; } convmat_error_env;\n\
+static convmat_error_env convmat_error_envs[64];\n\
+static int convmat_error_depth = 0;\n\
+static double convmat_error_enter(void) {\n\
+    int d = convmat_error_depth++;\n\
+    convmat_error_envs[d].active = 1;\n\
+    return (double)d;\n\
+}\n\
+static void convmat_error_leave(double d) {\n\
+    int i = (int)d;\n\
+    convmat_error_envs[i].active = 0;\n\
+    convmat_error_depth = i;\n\
+}\n\
+static void convmat_error_throw(const char *msg) {\n\
+    (void)msg;\n\
+    for (int d = convmat_error_depth - 1; d >= 0; d--) {\n\
+        if (convmat_error_envs[d].active) {\n\
+            longjmp(convmat_error_envs[d].jmp, 1);\n\
+        }\n\
+    }\n\
+}\n\
+#define convmat_error_check(d) (setjmp(convmat_error_envs[(int)(d)].jmp) == 0)\n\
+#endif\n\
+";
+
 /// Lower a function that failed static triage into a runtime call.
 ///
 /// This is the single choke point where deferred code turns into a dynamic-tier
@@ -888,6 +1201,18 @@ mod tests {
         NORM,
         SOLVE,
         RAND,
+        INT32,
+        IADD,
+        ISUB,
+        IMUL,
+        IDIV,
+        MASK_COUNT,
+        MASK_GATHER,
+        MASK_ASSIGN,
+        ERROR_ENTER,
+        ERROR_CHECK,
+        ERROR_LEAVE,
+        ERROR_THROW,
     ];
 
     /// The dynamic-tier kernel symbols that `DYNAMIC_RUNTIME_H` declares and

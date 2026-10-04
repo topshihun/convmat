@@ -258,6 +258,11 @@ void convmat_error_throw(const char *msg);   // longjmp 到最近 armed 的 catc
 | `convmat_norm` | 向量 2-范数 | `norm(v)`（静态向量） |
 | `convmat_solve` | 方阵线性方程组 `A X = B`（高斯消元） | `A \ B`（静态方阵 `A`） |
 | `convmat_rand` | `[0,1)` 伪随机标量（xorshift64） | `rand()` |
+| `convmat_int32` | 取整到最近的 `int32`（四舍五入、越界回绕） | `int32(x)` |
+| `convmat_iadd` / `convmat_isub` / `convmat_imul` / `convmat_idiv` | `int32` 回绕加/减/乘、除法（四舍五入） | `int32` 与 `int32` 的 `+`/`-`/`*`/`./` |
+| `convmat_mask_count` | 非零掩码元素个数 | `A(mask)` 的结果长度回填 |
+| `convmat_mask_gather` | `dst = src(where mask)`，返回个数 | `A(mask)` 读 |
+| `convmat_mask_assign` | `a(where mask) = v`（原地） | `A(mask) = v` 写 |
 
 **不在本类**（编译期直接内联展开，无需 helper）：标量算术/比较/逻辑、静态数组逐元素
 与标量广播、`libm` 一元/二元内建（`sin`/`pow`/…）、常量下标读写、`zeros/ones/eye/reshape`。
@@ -265,18 +270,21 @@ void convmat_error_throw(const char *msg);   // longjmp 到最近 armed 的 catc
 ### 9.2 动态 tier 值模型内核（已实现 C，**尚未接入 `.m` 降级**）
 
 `DYNAMIC_RUNTIME_H`（类型 + 原型）+ `DYNAMIC_RUNTIME_C`（实现），由 `tests/runtime.rs`
-直接编译运行验证。**当前没有任何 `.m` 构造会发射它**——接线是 §8 step 3（seam）
-之后的逐特性工作。
+直接编译运行验证。**已接线到 cell 与复数**：`lowering` 按需发射 `cell_support_source()` /
+`complex_support_source()`（`DYNAMIC_RUNTIME_H`+`C` + 各自包装），支撑 cell 字面量/`c{i}` 读
+与复数算术/`cabs`/`fft`（`CONVMAT_COMPLEX`，交错 `[re,im]` 数据）。其余动态特性（字符串/
+嵌套 struct 等）仍待接。
 
 | 组 | 符号 | 状态 |
 |----|------|------|
 | 生命周期 | `convmat_value_new` / `retain` / `release` / `copy` | ✅ 实现 |
 | 数组 | `convmat_array_create` / `data` / `resize` | ✅ 实现 |
-| cell | `convmat_cell_create` / `get` / `set` | ✅ 实现 |
+| cell | `convmat_cell_create` / `get` / `set` | ✅ 实现；已接线（`{...}`/`c{i}`，标量元素） |
+| complex | `convmat_complex` / `complex_real` / `cabs` / `cadd` / `csub` / `cmul` / `cdiv` / `fft` / `complex_component` | ✅ 实现；已接线（`3+4i`/`abs`/`fft`） |
 | struct | `convmat_struct_create` / `field_index` / `get` / `set` | ✅ 实现 |
 | 形状/索引 | `convmat_numel` / `linear_index` | ✅ 实现 |
 | 动态 ABI | `convmat_runtime_fn`（typedef） | ⛔ 仅声明 |
-| 错误传播 | `convmat_error_throw` | ⛔ 仅声明（`try/catch` 预留，需 `<setjmp.h>`） |
+| 错误传播 | `convmat_error_enter` / `convmat_error_check`（宏，内联 `setjmp`）/ `convmat_error_leave` / `convmat_error_throw`（`longjmp`） | ✅ 实现（`ERROR_SUPPORT_C`，供 `try`/`catch` 使用，见 §7） |
 
 支持的 `convmat_dtype`：`CONVMAT_DOUBLE` / `CONVMAT_LOGICAL`（存储均为 `double`）；
 `CONVMAT_INT32` / `CONVMAT_CHAR` 预留（无实现）。

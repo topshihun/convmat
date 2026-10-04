@@ -1279,6 +1279,174 @@ fn run_struct_inout() {
     );
 }
 
+// --- Nested structs, char literals & int32 -------------------------------------
+
+#[test]
+fn run_nested_struct() {
+    // Nested fields `s.a.b` / `s.a.c` are flattened to one C field each; 3 + 4 = 7.
+    run_exact(
+        "nested_struct",
+        "double nested_struct();",
+        "printf(\"%g\\n\", nested_struct());",
+        "7",
+    );
+}
+
+#[test]
+fn run_int32_arith() {
+    // `int32(3) * int32(4) + int32(5) == 17` in 32-bit arithmetic.
+    run_exact(
+        "int32_arith",
+        "double int32_arith();",
+        "printf(\"%g\\n\", int32_arith());",
+        "17",
+    );
+}
+
+#[test]
+fn run_int32_div() {
+    // `int32(7) ./ int32(2) == 4` (integer division rounds to nearest).
+    run_exact(
+        "int32_div",
+        "double int32_div();",
+        "printf(\"%g\\n\", int32_div());",
+        "4",
+    );
+}
+
+#[test]
+fn run_int32_wrap() {
+    // `INT32_MAX + 1` wraps to `INT32_MIN` (MATLAB int32 semantics).
+    run_close(
+        "int32_wrap",
+        "double int32_wrap();",
+        "printf(\"%.17g\\n\", int32_wrap());",
+        &[-2147483648.0],
+    );
+}
+
+#[test]
+fn run_char_switch() {
+    // `'b'` (code point 98) selects the second case.
+    run_exact(
+        "char_switch",
+        "double char_switch(double);",
+        "printf(\"%g\\n\", char_switch(98.0));",
+        "2",
+    );
+}
+
+#[test]
+fn run_strcmp_lit() {
+    // `strcmp('abc','abd') == 0`, `strcmp('x','x') == 1`.
+    run_exact(
+        "strcmp_lit",
+        "double strcmp_lit();",
+        "printf(\"%g\\n\", strcmp_lit());",
+        "1",
+    );
+}
+
+// --- Logical indexing & masked assignment -------------------------------------
+
+#[test]
+fn run_logical_index() {
+    // `a = [1 2 3]; y = a(a > 1)` selects `[2 3]` (runtime-sized result).
+    run_exact(
+        "logical_index",
+        "void logical_index(double*, double*);",
+        "double y[3];\n    double n;\n    logical_index(y, &n);\n    \
+         printf(\"%g %g %g\\n\", n, y[0], y[1]);",
+        "2 2 3",
+    );
+}
+
+#[test]
+fn run_mask_assign() {
+    // `A(A < 0) = 0` on `[1 -2 3 -4]` gives `[1 0 3 0]`.
+    run_exact(
+        "mask_assign",
+        "void mask_assign(double v1[4]);",
+        "double y[4];\n    mask_assign(y);\n    \
+         printf(\"%g %g %g %g\\n\", y[0], y[1], y[2], y[3]);",
+        "1 0 3 0",
+    );
+}
+
+// --- try / catch --------------------------------------------------------------
+
+#[test]
+fn run_try_catch() {
+    // The `try` body runs (no error is raised), so `y = 1`.
+    run_exact(
+        "try_catch",
+        "double try_catch();",
+        "printf(\"%g\\n\", try_catch());",
+        "1",
+    );
+}
+
+// --- Cell arrays ---------------------------------------------------------------
+
+#[test]
+fn run_cell_literal() {
+    // `c = {1, 2, 3}; y = c{1}` reads the first scalar element.
+    run_exact(
+        "cell_literal",
+        "double cell_literal();",
+        "printf(\"%g\\n\", cell_literal());",
+        "1",
+    );
+}
+
+// --- Complex numbers -----------------------------------------------------------
+
+#[test]
+fn run_complex_abs() {
+    // `abs(3 + 4i)` is the magnitude 5 (complex arithmetic via the runtime).
+    run_exact(
+        "complex_abs",
+        "double complex_abs();",
+        "printf(\"%g\\n\", complex_abs());",
+        "5",
+    );
+}
+
+#[test]
+fn run_complex_fft() {
+    // `fft([1 2 3 4])` has real parts 10, -2, -2, -2.
+    run_exact(
+        "complex_fft",
+        "struct convmat_value;\n\
+         double convmat_complex_component(const convmat_value*, double, double);\n\
+         void convmat_value_release(convmat_value*);\n\
+         convmat_value* complex_fft();",
+        "convmat_value* z = complex_fft();\n    \
+         printf(\"%g %g %g %g\\n\", convmat_complex_component(z, 0.0, 0.0),\n    \
+         convmat_complex_component(z, 1.0, 0.0), convmat_complex_component(z, 2.0, 0.0),\n    \
+         convmat_complex_component(z, 3.0, 0.0));\n    \
+         convmat_value_release(z);",
+        "10 -2 -2 -2",
+    );
+}
+
+#[test]
+fn run_complex_eig() {
+    // `eig([2 0; 0 3])` has eigenvalues 2 and 3 (real, via the complex box).
+    run_exact(
+        "complex_eig",
+        "struct convmat_value;\n\
+         double convmat_complex_component(const convmat_value*, double, double);\n\
+         void convmat_value_release(convmat_value*);\n\
+         convmat_value* complex_eig();",
+        "convmat_value* z = complex_eig();\n    \
+         printf(\"%g %g\\n\", convmat_complex_component(z, 0.0, 0.0),\n    \
+         convmat_complex_component(z, 1.0, 0.0));\n    \
+         convmat_value_release(z);",
+        "2 3",
+    );
+}
+
 // --- Anonymous functions -------------------------------------------------------
 
 #[test]

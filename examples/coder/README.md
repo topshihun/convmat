@@ -21,8 +21,10 @@ The survey lives in `tests/coder_examples.rs`:
   so landing a feature is a deliberate "promote it into `SUPPORTED`" step.
 - `cargo test --test coder_examples -- --ignored --nocapture` prints a report of
   every example and the compiler error for the unsupported ones.
+- `docs/roadmap.md` groups the remaining failures into workstreams (WS) with the
+  root cause, implementation steps and acceptance criteria for each.
 
-Current status: **33 / 50** examples compile (33 correct, 0 miscompiled).
+Current status: **44 / 50** examples compile (44 correct, 0 miscompiled).
 
 ## Supported
 
@@ -32,7 +34,9 @@ Current status: **33 / 50** examples compile (33 correct, 0 miscompiled).
 | `array_broadcast`    | implicit singleton expansion `A + b` |
 | `array_col_slice`    | `A(:, j)` column slice            |
 | `array_concat`       | block concatenation `[a, b]`      |
-| `array_linspace`     | `linspace(0, 1, 5)`               |
+| `array_linspace`      | `linspace(0, 1, 5)`               |
+| `array_logical_index` | logical indexing `A(A > 0)`       |
+| `array_mask_assign`   | masked write `A(A < 0) = 0`       |
 | `array_nd`           | N-D arrays (`zeros(2,2,2)`, `A(i,j,k)`) |
 | `array_param_normalize` | dynamic-shape vector mean-centering (runtime matrix) |
 | `array_permute`      | `permute(A, [2 1])`               |
@@ -58,35 +62,24 @@ Current status: **33 / 50** examples compile (33 correct, 0 miscompiled).
 | `linalg_norm`        | vector 2-norm                     |
 | `linalg_solve`       | `A \ b` linear solve             |
 | `sys_random`         | `rand()` in `[0, 1)`              |
+| `sys_trycatch`       | `try` / `catch` (`setjmp`)        |
 | `mandelbrot_count`   | loops, `abs`, integer power, `break` |
 | `type_logical`       | `logical` conversion              |
 | `value_special`      | `Inf` / `NaN` literals            |
+| `struct_nested`      | nested field `s.a.b` (flattened)  |
+| `text_compare`       | `strcmp` of char literals         |
+| `text_switch`        | `switch` on a char value          |
+| `type_integer`       | `int32` arithmetic (wraparound)   |
+| `cell_basic`         | scalar-element cell `{1, 2, 3}`, `c{1}` |
+| `type_complex`       | `abs(3 + 4i)` (complex arithmetic) |
+| `sys_fft`            | `fft` (complex DFT, boxed result) |
+| `linalg_eig`         | `eig` of a 2x2 matrix (complex box) |
 
 ## Known bugs (compile, but wrong)
 
 None currently.
 
 ## Roadmap (currently rejected)
-
-### Arrays & shape
-
-| Example                | Blocker |
-|------------------------|---------|
-| `array_logical_index`  | logical indexing |
-| `array_mask_assign`    | mask assignment `A(A<0)=0` |
-
-### Linear algebra
-
-| Example           | Blocker |
-|-------------------|---------|
-| `linalg_eig`      | `eig` |
-
-### Types & values
-
-| Example          | Blocker |
-|------------------|---------|
-| `type_integer`   | integer types (`int32`) |
-| `type_complex`   | complex values |
 
 ### Functions & handles
 
@@ -95,22 +88,11 @@ None currently.
 | `func_handle_return`   | escaping anonymous handle |
 | `func_handle_builtin`  | handle to a built-in (`@sin`) |
 
-### Structs, cells & text
-
-| Example           | Blocker |
-|-------------------|---------|
-| `struct_nested`   | nested field `s.a.b` |
-| `cell_basic`      | cell arrays |
-| `text_compare`    | `strcmp` / char arrays |
-| `text_switch`     | `switch` on a char value |
-
 ### System / runtime
 
 | Example         | Blocker |
 |-----------------|---------|
 | `sys_plot`      | `plot` |
-| `sys_fft`       | `fft` |
-| `sys_trycatch`  | `try` / `catch` |
 | `sys_file_io`   | `fopen` / `fread` |
 
 ### MATLAB Coder example gallery

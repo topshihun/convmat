@@ -26,7 +26,7 @@ use pliron::{
 use crate::{
     dialects::{
         emitc,
-        matlab::{ArrayType, BinOpKind, CmpKind, PtrType, StructType},
+        matlab::{ArrayType, BinOpKind, BoxType, CmpKind, PtrType, StructType},
     },
     error::Result,
 };
@@ -229,6 +229,8 @@ impl<'a> Emitter<'a> {
             format!("double {name}[{numel}]")
         } else if is_ptr(self.context, ty) {
             format!("double* {name}")
+        } else if is_box(self.context, ty) {
+            format!("convmat_value* {name}")
         } else if is_struct(self.context, ty) {
             format!("struct {} {name}", self.struct_type_name(ty))
         } else {
@@ -318,6 +320,8 @@ impl<'a> Emitter<'a> {
     fn c_type(&mut self, ty: TypeHandle) -> String {
         if is_array(self.context, ty) {
             format!("double[{}]", array_numel(self.context, ty))
+        } else if is_box(self.context, ty) {
+            "convmat_value*".to_string()
         } else if is_struct(self.context, ty) {
             format!("struct {}", self.struct_type_name(ty))
         } else {
@@ -416,6 +420,18 @@ impl<'a> Emitter<'a> {
                 .collect();
             self.out.push_str(&format!(
                 "{pad}double {name} = {callee}({});\n",
+                args.join(", ")
+            ));
+        } else if let Some(c) = Operation::get_op::<emitc::CallBoxOp>(op, self.context) {
+            let name = self.assign_name(op);
+            let callee = c.callee(self.context);
+            let args: Vec<String> = op
+                .deref(self.context)
+                .operands()
+                .map(|v| self.expr(v))
+                .collect();
+            self.out.push_str(&format!(
+                "{pad}convmat_value* {name} = {callee}({});\n",
                 args.join(", ")
             ));
         } else if let Some(c) = Operation::get_op::<emitc::CallVoidOp>(op, self.context) {
@@ -573,6 +589,10 @@ fn is_ptr(context: &Context, ty: TypeHandle) -> bool {
 
 fn is_struct(context: &Context, ty: TypeHandle) -> bool {
     ty.deref(context).is::<StructType>()
+}
+
+fn is_box(context: &Context, ty: TypeHandle) -> bool {
+    ty.deref(context).is::<BoxType>()
 }
 
 fn array_numel(context: &Context, ty: TypeHandle) -> i64 {

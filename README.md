@@ -38,6 +38,15 @@ End-to-end codegen works for a growing subset of MATLAB:
 - **Structs** (scalar fields): `struct('a', 1, …)` construction, `s.a` read/write,
   and struct pass-by-value parameters / returns. Struct parameter layouts are
   inferred from field use (`s.a`), matching MATLAB Coder's use-site inference.
+  Nested field paths (`s.a.b`) are flattened to a single C field (`a__b`), and a
+  struct local built field-by-field (with no `struct(...)`) is typed from its
+  field writes.
+- **Char literals & `strcmp`**: a 1-char literal is a scalar code point (so
+  `switch c; case 'a'` compares code points) and a longer literal is a `1xN`
+  code-unit array; `strcmp` of two char literals folds to a logical scalar.
+- **`int32` scalars**: `int32(x)` conversion plus wraparound `+`/`-`/`*` via
+  `convmat_int32`/`convmat_iadd`/`convmat_isub`/`convmat_imul`; mixing `int32`
+  with `double` is deferred.
 - **Dynamic-shape array parameters** as `(double* data, double n)`: reduce
   (`sum`/`prod`/`min`/`max`), `numel`/`length`, runtime indexing `A(i)` / `end`, and
   runtime-bound loops (`for i = 1:numel(A)`) over a parameter whose size is only
@@ -52,7 +61,19 @@ End-to-end codegen works for a growing subset of MATLAB:
   inside a loop allocates and frees each iteration); they support scalar broadcast
   (`+`/`-`/`.*`/`./`) and nested dynamic subexpressions (`y = A .* A + n`); see
   `docs/architecture.md` §5, §10.5 P7 and `docs/runtime.md` §8–§9.
-- **Indexing**: constant subscript `A(i,j)`, linear `A(i)`, `end`, and `A(:)`.
+- **Indexing**: constant subscript `A(i,j)`, linear `A(i)`, `end`, `A(:)`, and logical
+  indexing `A(A > 0)` / masked assignment `A(A < 0) = 0` (a runtime-sized result via
+  `convmat_mask_gather`/`convmat_mask_assign`).
+- **`try`/`catch`**: the `matlab.try` op lowers to a `setjmp`-based handler stack
+  (`convmat_error_enter`/`check`/`leave`/`throw`); the `try` body is the `if` branch
+  and `catch` the `else` branch. See `docs/runtime.md` §7.
+- **Cell arrays** (scalar elements): `{1, 2, 3}` builds a boxed `convmat_value`
+  cell and `c{i}` reads a scalar element; the boxed value-model kernel
+  (`docs/runtime.md`) is emitted on demand, and cells are released block-scoped.
+- **Complex numbers**: `i` / `3 + 4i` and complex arithmetic lower to runtime
+  helpers (`convmat_complex`/`cadd`/`csub`/`cmul`/`cdiv`); `abs` (magnitude),
+  `fft` and `eig` (1x1/2x2) are runtime built-ins, and a complex result is
+  returned as a boxed `convmat_value*`. See `docs/runtime.md`.
 - **Variadic arguments (closed-world specialization)**: `nargin`/`nargout` fold to
   compile-time constants; `varargin{k}` (constant `k`) resolves to the `k`-th extra
   scalar input; `varargout{k} = scalar` resolves to the `k`-th extra scalar output.
@@ -95,7 +116,6 @@ the whole point of this crate, so they are not feature-gated):
 |-----------------|---------|-----------------------------------|------------------------------------------|
 | `runmat-parser` | 0.6.2   | Parse MATLAB/Octave tokens -> HIR | MIT                                      |
 | `runmat-hir`    | 0.6.2   | High-level IR                     | MIT                                      |
-| `runmat-mir`    | 0.6.2   | Mid-level IR (lowering boundary)  | MIT                                      |
 | `pliron`        | 0.18    | Extensible compiler IR (pure Rust) | Apache-2.0; no C++ MLIR/LLVM needed     |
 
 The build is pure `cargo build` — no local MLIR/LLVM install, no `libMLIR`,
@@ -114,12 +134,13 @@ convmat/
 ├── src/
 │   ├── main.rs            # thin CLI wrapper (arg parsing + pipeline)
 │   ├── lib.rs             # library crate (pipeline + public API)
-│   ├── frontend/          # layer 1: read `.m`, drive runmat -> MIR
+│   ├── frontend/          # layer 1: read `.m`, drive runmat -> HIR
 │   ├── triage/            # layer 2: static vs dynamic classification + shape inference
 │   ├── dialects/          # layer 2.5/4.5: `matlab` and `emitc` pliron dialects
-│   ├── mir_to_mlir/       # layer 3: MIR -> matlab dialect
+│   ├── hir_to_mlir/       # layer 3: HIR -> matlab dialect
 │   ├── builtins.rs        # builtin name -> lowering recipe table
 │   ├── lowering.rs        # layer 4: matlab -> emitc dialect
+│   ├── passes/            # dialect-scoped IR optimizations (matlab / emitc)
 │   ├── emit_c.rs          # layer 5: emitc -> C
 │   ├── backend/           # backend selection (C today; LLVM/GPU reserved)
 │   └── runtime/           # layer 6: runtime fallback seam (not implemented)
@@ -131,7 +152,8 @@ convmat/
 └── AGENTS.md              # agent working conventions
 ```
 
-See `docs/architecture.md` for the authoritative architecture; `AGENTS.md` holds
+See `docs/architecture.md` for the authoritative architecture; `docs/roadmap.md` for
+the plan that turns the remaining `examples/coder` failures green; `AGENTS.md` holds
 agent working conventions.
 
 ## Building and testing

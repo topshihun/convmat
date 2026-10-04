@@ -26,6 +26,10 @@ pub enum ValueClass {
     RuntimeMatrix,
     /// A scalar-field struct with a compile-time field layout.
     Struct,
+    /// A boxed cell array (`convmat_value*`).
+    Cell,
+    /// A boxed complex value (`convmat_value*`).
+    Complex,
     /// A value the static subset cannot realize (deferred to the runtime tier).
     Unsupported,
 }
@@ -34,10 +38,12 @@ impl ValueClass {
     /// Classify a resolved local type.
     pub fn from_local_ty(ty: &LocalTy) -> Self {
         match ty {
-            LocalTy::Scalar => ValueClass::Scalar,
+            LocalTy::Scalar | LocalTy::Int32 => ValueClass::Scalar,
             LocalTy::Array { shape } if shape.is_dynamic() => ValueClass::RuntimeMatrix,
             LocalTy::Array { shape } => ValueClass::StaticMatrix(*shape),
             LocalTy::Struct { .. } => ValueClass::Struct,
+            LocalTy::Cell => ValueClass::Cell,
+            LocalTy::Complex => ValueClass::Complex,
             LocalTy::Dynamic => ValueClass::Unsupported,
         }
     }
@@ -125,7 +131,7 @@ mod tests {
 
     #[test]
     fn unsupported_builtin_routes_to_runtime() {
-        let plan = plan_of("function y = f()\ny = fft([1, 2, 3, 4]);\nend\n");
+        let plan = plan_of("function y = f()\ny = svd([1, 2, 3, 4]);\nend\n");
         assert!(matches!(plan.route, Route::Runtime(_)));
     }
 }

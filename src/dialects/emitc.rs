@@ -33,7 +33,7 @@ use pliron::{
     value::Value,
 };
 
-use crate::dialects::matlab::{BinOpKind, BoolType, CmpKind, PtrType};
+use crate::dialects::matlab::{BinOpKind, BoolType, BoxType, CmpKind, PtrType};
 
 /// Declare a local array: `double <name>[<size>]` (stack), optionally `static`,
 /// or `double* <name> = new double[<size>]` (heap).
@@ -329,6 +329,41 @@ impl CallVoidOp {
         String::from(
             self.get_attr_ecall_void_callee(ctx)
                 .expect("call_void callee")
+                .clone(),
+        )
+    }
+}
+
+/// A call to an external function returning a boxed dynamic value
+/// (`convmat_value*`), e.g. the cell constructor.
+#[pliron_op(
+    name = "emitc.call_box",
+    format,
+    interfaces = [OneResultInterface],
+    attributes = (ecall_box_callee: StringAttr),
+    verifier = "succ",
+)]
+pub struct CallBoxOp;
+
+impl CallBoxOp {
+    pub fn new(ctx: &mut Context, callee: &str, args: Vec<Value>) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![BoxType::get(ctx).into()],
+            args,
+            vec![],
+            0,
+        );
+        let op = CallBoxOp { op };
+        op.set_attr_ecall_box_callee(ctx, StringAttr::new(callee.to_string()));
+        op
+    }
+
+    pub fn callee(&self, ctx: &Context) -> String {
+        String::from(
+            self.get_attr_ecall_box_callee(ctx)
+                .expect("call_box callee")
                 .clone(),
         )
     }

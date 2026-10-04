@@ -127,11 +127,18 @@ impl Shape {
 pub enum LocalTy {
     /// A scalar `f64` value.
     Scalar,
+    /// An `int32` scalar. Stored as `f64` (exact for every `int32`), but
+    /// arithmetic wraps to 32 bits (see `hir_to_mlir`'s `convmat_i*` helpers).
+    Int32,
     /// A `f64` array, with either a static or dynamic shape.
     Array { shape: Shape },
     /// A `struct` with an ordered field list (name + type). Field types may be
     /// scalar, array, or (recursively) struct.
     Struct { fields: Vec<(String, LocalTy)> },
+    /// A boxed cell array (`{...}`) with scalar elements (`convmat_value*`).
+    Cell,
+    /// A boxed complex value (`convmat_value*`, dtype `CONVMAT_COMPLEX`).
+    Complex,
     /// Not a numeric value / not statically resolvable; deferred to the runtime.
     Dynamic,
 }
@@ -382,6 +389,13 @@ pub(crate) fn unquote_str(s: &str) -> &str {
     }
 }
 
+/// The code units of a char-literal's raw source (`'abc'` -> `[97, 98, 99]`).
+/// Escape sequences are not interpreted yet (simple literals only), and code
+/// points above BMP are represented by their Unicode scalar value.
+pub(crate) fn char_codes(raw: &str) -> Vec<f64> {
+    unquote_str(raw).chars().map(|c| c as u32 as f64).collect()
+}
+
 /// Whether an index component is the colon operator `:`.
 ///
 /// runmat represents `a(:)` (identifier base) as
@@ -520,9 +534,12 @@ fn expr_reason(expr: &HirExpr) -> Option<String> {
         HirExprKind::Number(_) | HirExprKind::IntegerLiteral(_) => None,
         HirExprKind::End | HirExprKind::Colon => None,
         HirExprKind::Constant(symbol) => match symbol.0.as_str() {
-            "true" | "false" | "Inf" | "Infinity" | "NaN" => None,
+            "true" | "false" | "Inf" | "Infinity" | "NaN" | "i" | "j" => None,
             other => Some(format!("unsupported constant `{other}`")),
         },
+        // A char-literal (`'a'`, `'abc'`) is a code-unit value: a 1-char literal
+        // is a scalar code point (`switch` cases), a longer one is a 1xN array.
+        HirExprKind::String(_) => None,
         HirExprKind::Unary(op, operand) => {
             if supported_unary(op) {
                 expr_reason(operand)
@@ -540,7 +557,7 @@ fn expr_reason(expr: &HirExpr) -> Option<String> {
             })
         }
         HirExprKind::Tensor(rows) => rows.iter().flatten().find_map(expr_reason),
-        HirExprKind::Cell(_) => Some("cell array literals are not supported yet".to_string()),
+        HirExprKind::Cell(rows) => rows.iter().flatten().find_map(expr_reason),
         HirExprKind::Range(start, step, end) => expr_reason(start)
             .or_else(|| step.as_deref().and_then(expr_reason))
             .or_else(|| expr_reason(end)),
@@ -554,8 +571,7 @@ fn expr_reason(expr: &HirExpr) -> Option<String> {
                     .iter()
                     .find_map(|component| match component {
                         IndexComponent::Expr(expr) => expr_reason(expr),
-                        IndexComponent::Logical(expr) => expr_reason(expr)
-                            .or(Some("logical indexing is not supported yet".to_string())),
+                        IndexComponent::Logical(expr) => expr_reason(expr),
                         IndexComponent::Colon | IndexComponent::End { .. } => None,
                     })
             })
@@ -638,6 +654,22 @@ fn stmt_reason(stmt: &HirStmt, varargout_local: Option<BindingId>) -> Option<Str
                 expr_reason(value)
             } else if let HirPlace::Member(base, _) = place {
                 expr_reason(base).or_else(|| expr_reason(value))
+            } else if let HirPlace::Index(base, indexing) = place {
+                // Mask assignment `A(mask) = v`; the base/mask are validated by
+                // the lowerer (which only supports a mask subscript here).
+                expr_reason(base)
+                    .or_else(|| expr_reason(value))
+                    .or_else(|| {
+                        indexing
+                            .components
+                            .iter()
+                            .find_map(|component| match component {
+                                IndexComponent::Expr(e) | IndexComponent::Logical(e) => {
+                                    expr_reason(e)
+                                }
+                                _ => None,
+                            })
+                    })
             } else {
                 Some(format!("non-local assignment target {place:?}"))
             }
@@ -651,7 +683,7 @@ fn stmt_reason(stmt: &HirStmt, varargout_local: Option<BindingId>) -> Option<Str
         HirStmtKind::MultiAssign(..) => {
             Some("multi-assignment (`[a, b] = f()`) is not supported".to_string())
         }
-        HirStmtKind::TryCatch { .. } => Some("try/catch is not supported".to_string()),
+        HirStmtKind::TryCatch { .. } => None,
         HirStmtKind::Global(_) | HirStmtKind::Persistent(_) => None,
         HirStmtKind::Break | HirStmtKind::Continue => None,
         HirStmtKind::Return | HirStmtKind::Import(_) => None,
@@ -996,7 +1028,10 @@ impl Classifier for WhitelistClassifier {
                 LocalTy::Struct { fields } => fields
                     .iter()
                     .any(|(_, field_ty)| matches!(field_ty, LocalTy::Dynamic)),
-                LocalTy::Scalar => false,
+                LocalTy::Scalar | LocalTy::Int32 => false,
+                // A cell or complex value is a supported boxed value (the dynamic
+                // tier); a struct field of such a type is not.
+                LocalTy::Cell | LocalTy::Complex => false,
             };
             if is_dynamic {
                 return Verdict::Deferred {
@@ -1090,6 +1125,11 @@ pub fn infer_locals(function: &HirFunction) -> HashMap<BindingId, LocalTy> {
     // being silently treated as scalars (see docs/runtime.md §8 step 1).
     infer_array_params(function, &mut tys);
 
+    // Promote untyped *locals* to structs from their field-access usage, so a
+    // struct built field-by-field (`s.a.b = 1`, with no `struct(...)`
+    // constructor) is typed before `infer_block` reads `s.a.b` as a scalar.
+    infer_struct_locals(function, &mut tys);
+
     // Anonymous-function handles are compile-time-only; their bindings are not
     // numeric locals, and their call expressions are typed directly by
     // `expr_ty` against this map.
@@ -1111,15 +1151,42 @@ fn infer_struct_params(function: &HirFunction, tys: &mut HashMap<BindingId, Loca
         .copied()
         .filter(|id| matches!(tys.get(id), Some(LocalTy::Scalar)))
         .collect();
-    if params.is_empty() {
+    infer_struct_fields(function, &params, tys);
+}
+
+/// Promote untyped *local* bindings to structs from their field-access usage.
+/// This covers structs built field-by-field (`s.a = 1`) with no `struct(...)`
+/// constructor; nested paths (`s.a.b`) are flattened to a single C-safe field
+/// name (see [`flat_field_name`]).
+fn infer_struct_locals(function: &HirFunction, tys: &mut HashMap<BindingId, LocalTy>) {
+    let params: HashSet<BindingId> = function.abi.fixed_inputs.iter().copied().collect();
+    let targets: HashSet<BindingId> = function
+        .locals
+        .iter()
+        .copied()
+        // Parameters are handled by `infer_struct_params`; captures are not part
+        // of `function.locals`. A binding already resolved to a non-scalar type
+        // (e.g. a `struct(...)` constructor target) is left alone.
+        .filter(|id| !params.contains(id) && !tys.contains_key(id))
+        .collect();
+    infer_struct_fields(function, &targets, tys);
+}
+
+/// Collect struct field paths for every binding in `targets` used as a struct
+/// base (field read or write), and promote it to [`LocalTy::Struct`]. Fields are
+/// collected in first-seen order; every leaf field is `Scalar` (struct fields
+/// are scalar-only in the current lowering).
+fn infer_struct_fields(
+    function: &HirFunction,
+    targets: &HashSet<BindingId>,
+    tys: &mut HashMap<BindingId, LocalTy>,
+) {
+    if targets.is_empty() {
         return;
     }
-
-    let mut fields: HashMap<BindingId, Vec<(String, LocalTy)>> = HashMap::new();
-    for id in &params {
-        fields.insert(*id, Vec::new());
-    }
-    collect_stmt_fields(&function.body.statements, &params, &mut fields);
+    let mut fields: HashMap<BindingId, Vec<(String, LocalTy)>> =
+        targets.iter().map(|id| (*id, Vec::new())).collect();
+    collect_stmt_fields(&function.body.statements, targets, &mut fields);
 
     for (id, field_list) in fields {
         if field_list.is_empty() {
@@ -1482,21 +1549,55 @@ fn scan_array_expr(expr: &HirExpr, params: &HashSet<BindingId>, used: &mut HashS
     }
 }
 
-/// Record `name` as a scalar field of struct parameter `id`, if `id` is one of
-/// the parameters under inference and the field is not already recorded.
+/// Record the (possibly nested) field `path` as a scalar field of struct base
+/// `id`, if `id` is one of the bindings under inference and the flattened field
+/// is not already recorded.
 fn record_struct_field(
     id: BindingId,
-    name: &str,
+    path: &[String],
     params: &HashSet<BindingId>,
     fields: &mut HashMap<BindingId, Vec<(String, LocalTy)>>,
 ) {
     if !params.contains(&id) {
         return;
     }
+    let key = flat_field_name(path);
     let list = fields.entry(id).or_default();
-    if !list.iter().any(|(n, _)| n == name) {
-        list.push((name.to_string(), LocalTy::Scalar));
+    if !list.iter().any(|(n, _)| n == &key) {
+        list.push((key, LocalTy::Scalar));
     }
+}
+
+/// The root binding and dotted field path of a struct member chain:
+/// `s.a.b` -> `(s, ["a", "b"])`, or `None` if the base is not a binding.
+pub(crate) fn member_path(expr: &HirExpr) -> Option<(BindingId, Vec<String>)> {
+    match &expr.kind {
+        HirExprKind::Binding(id) => Some((*id, Vec::new())),
+        HirExprKind::Member(base, name) => {
+            let (id, mut path) = member_path(base)?;
+            path.push(name.0.clone());
+            Some((id, path))
+        }
+        _ => None,
+    }
+}
+
+/// The root binding and dotted field path of a struct member assignment target
+/// (`s.a.b = ...`).
+pub(crate) fn place_member_path(place: &HirPlace) -> Option<(BindingId, Vec<String>)> {
+    let HirPlace::Member(base, name) = place else {
+        return None;
+    };
+    let (id, mut path) = member_path(base)?;
+    path.push(name.0.clone());
+    Some((id, path))
+}
+
+/// Flatten a dotted field path into a single C-safe field name: `["a", "b"]` ->
+/// `"a__b"`. A single-element path is unchanged, so ordinary fields keep their
+/// name. (`matlab.struct` field names are emitted verbatim as C members.)
+pub(crate) fn flat_field_name(path: &[String]) -> String {
+    path.join("__")
 }
 
 /// Scan statements for struct-field access on parameters under inference.
@@ -1563,11 +1664,12 @@ fn collect_place_fields(
     fields: &mut HashMap<BindingId, Vec<(String, LocalTy)>>,
 ) {
     match place {
-        HirPlace::Member(base, name) => {
-            if let HirExprKind::Binding(id) = base.kind {
-                record_struct_field(id, &name.0, params, fields);
+        HirPlace::Member(base, _) => {
+            if let Some((id, path)) = place_member_path(place) {
+                record_struct_field(id, &path, params, fields);
+            } else {
+                collect_expr_fields(base, params, fields);
             }
-            collect_expr_fields(base, params, fields);
         }
         HirPlace::MemberDynamic(base, expr) => {
             collect_expr_fields(base, params, fields);
@@ -1592,11 +1694,14 @@ fn collect_expr_fields(
     fields: &mut HashMap<BindingId, Vec<(String, LocalTy)>>,
 ) {
     match &expr.kind {
-        HirExprKind::Member(base, name) => {
-            if let HirExprKind::Binding(id) = base.kind {
-                record_struct_field(id, &name.0, params, fields);
+        HirExprKind::Member(base, _) => {
+            // A member chain rooted at a binding is recorded as one flattened
+            // field (recursing into `base` would also record its prefixes).
+            if let Some((id, path)) = member_path(expr) {
+                record_struct_field(id, &path, params, fields);
+            } else {
+                collect_expr_fields(base, params, fields);
             }
-            collect_expr_fields(base, params, fields);
         }
         HirExprKind::Unary(_, operand) => collect_expr_fields(operand, params, fields),
         HirExprKind::Binary(lhs, _, rhs) => {
@@ -1688,6 +1793,14 @@ fn infer_block(
                     infer_block(&block.statements, variadics, handles, tys);
                 }
             }
+            HirStmtKind::TryCatch {
+                try_body,
+                catch_body,
+                ..
+            } => {
+                infer_block(&try_body.statements, variadics, handles, tys);
+                infer_block(&catch_body.statements, variadics, handles, tys);
+            }
             _ => {}
         }
     }
@@ -1704,8 +1817,19 @@ pub(crate) fn expr_ty(
         HirExprKind::Number(_) | HirExprKind::IntegerLiteral(_) => LocalTy::Scalar,
         HirExprKind::Constant(symbol) => match symbol.0.as_str() {
             "true" | "false" | "Inf" | "Infinity" | "NaN" => LocalTy::Scalar,
+            "i" | "j" => LocalTy::Complex,
             _ => LocalTy::Dynamic,
         },
+        HirExprKind::String(lit) => {
+            let n = char_codes(&lit.0).len();
+            if n <= 1 {
+                LocalTy::Scalar
+            } else {
+                LocalTy::Array {
+                    shape: Shape::matrix(1, n),
+                }
+            }
+        }
         HirExprKind::Unary(op, operand) => {
             unary_ty(*op, expr_ty(operand, tys, varargin_local, handles))
         }
@@ -1728,16 +1852,34 @@ pub(crate) fn expr_ty(
                 None => LocalTy::Dynamic,
             }
         }
-        HirExprKind::Cell(_) => LocalTy::Dynamic,
-        HirExprKind::Call(call) => call_ty(call, tys, handles),
-        HirExprKind::Member(base, name) => match expr_ty(base, tys, varargin_local, handles) {
-            LocalTy::Struct { fields } => fields
+        HirExprKind::Cell(rows) => {
+            let elems: Vec<&HirExpr> = rows.iter().flatten().collect();
+            if elems
                 .iter()
-                .find(|(field, _)| field == &name.0)
-                .map(|(_, ty)| ty.clone())
-                .unwrap_or(LocalTy::Dynamic),
-            _ => LocalTy::Dynamic,
-        },
+                .all(|e| matches!(expr_ty(e, tys, None, handles), LocalTy::Scalar))
+            {
+                LocalTy::Cell
+            } else {
+                LocalTy::Dynamic
+            }
+        }
+        HirExprKind::Call(call) => call_ty(call, tys, handles),
+        HirExprKind::Member(..) => {
+            let Some((id, path)) = member_path(expr) else {
+                return LocalTy::Dynamic;
+            };
+            match tys.get(&id) {
+                Some(LocalTy::Struct { fields }) => {
+                    let key = flat_field_name(&path);
+                    fields
+                        .iter()
+                        .find(|(field, _)| field == &key)
+                        .map(|(_, ty)| ty.clone())
+                        .unwrap_or(LocalTy::Dynamic)
+                }
+                _ => LocalTy::Dynamic,
+            }
+        }
         HirExprKind::Index(base, indexing) => {
             // `varargin{k}` (constant `k`) resolves to a scalar extra argument.
             if let HirExprKind::Binding(id) = base.kind {
@@ -1753,8 +1895,78 @@ pub(crate) fn expr_ty(
                     return LocalTy::Scalar;
                 }
             }
-            index_ty(expr_ty(base, tys, varargin_local, handles), indexing)
+            let base_ty = expr_ty(base, tys, varargin_local, handles);
+            if matches!(base_ty, LocalTy::Cell) && indexing.kind == IndexKind::Brace {
+                // `c{i}` on a scalar-element cell reads a scalar; a non-constant
+                // index is not supported (the lowerer rejects it).
+                return if brace_index(indexing).is_some() {
+                    LocalTy::Scalar
+                } else {
+                    LocalTy::Dynamic
+                };
+            }
+            if let Some(ty) = mask_index_ty(&base_ty, indexing, tys, handles) {
+                return ty;
+            }
+            index_ty(base_ty, indexing)
         }
+        _ => LocalTy::Dynamic,
+    }
+}
+
+/// If `indexing` is a single logical-mask subscript on an array (`A(mask)`), the
+/// result is a runtime-sized vector (`Array { shape: Dynamic }`). A mask is
+/// either an explicit `Logical` component or a subscript expression of the same
+/// shape as the base (e.g. `A(A > 0)`); the colon and ranges are not masks.
+fn mask_index_ty(
+    base: &LocalTy,
+    indexing: &IndexingSemantics,
+    tys: &HashMap<BindingId, LocalTy>,
+    handles: &HandleTargets,
+) -> Option<LocalTy> {
+    let LocalTy::Array { shape: base_shape } = base else {
+        return None;
+    };
+    let [component] = indexing.components.as_slice() else {
+        return None;
+    };
+    let is_mask = match component {
+        IndexComponent::Logical(_) => true,
+        IndexComponent::Expr(expr) => {
+            if matches!(expr.kind, HirExprKind::Range(..) | HirExprKind::Colon) {
+                return None;
+            }
+            matches!(
+                expr_ty(expr, tys, None, handles),
+                LocalTy::Array { shape } if shape == *base_shape
+            )
+        }
+        _ => false,
+    };
+    is_mask.then_some(LocalTy::Array {
+        shape: Shape::Dynamic,
+    })
+}
+
+/// The result type of an `int32`-by-`int32` binary operator: arithmetic stays
+/// `int32` (wrapping), comparisons/logical yield a logical scalar, and the rest
+/// (division, matrix ops, power) is deferred.
+fn int_binary_ty(op: OperatorKind) -> LocalTy {
+    match op {
+        OperatorKind::Add
+        | OperatorKind::Subtract
+        | OperatorKind::MatrixMultiply
+        | OperatorKind::ElementwiseMultiply
+        | OperatorKind::Mrdivide
+        | OperatorKind::ElementwiseDivide => LocalTy::Int32,
+        OperatorKind::Equal
+        | OperatorKind::NotEqual
+        | OperatorKind::Less
+        | OperatorKind::LessEqual
+        | OperatorKind::Greater
+        | OperatorKind::GreaterEqual
+        | OperatorKind::ElementwiseAnd
+        | OperatorKind::ElementwiseOr => LocalTy::Scalar,
         _ => LocalTy::Dynamic,
     }
 }
@@ -1795,6 +2007,11 @@ fn unary_ty(op: OperatorKind, ty: LocalTy) -> LocalTy {
         // Unary minus/plus/not preserve the shape elementwise.
         (_, LocalTy::Array { shape }) => LocalTy::Array { shape },
         (_, LocalTy::Scalar) => LocalTy::Scalar,
+        // Integer unary minus/plus stay `int32`; `~` yields a logical scalar.
+        (OperatorKind::Not, LocalTy::Int32) => LocalTy::Scalar,
+        (_, LocalTy::Int32) => LocalTy::Int32,
+        (_, LocalTy::Complex) => LocalTy::Complex,
+        (_, LocalTy::Cell) => LocalTy::Dynamic,
         (_, LocalTy::Struct { .. }) | (_, LocalTy::Dynamic) => LocalTy::Dynamic,
     }
 }
@@ -1804,6 +2021,15 @@ fn binary_ty(lhs: LocalTy, op: OperatorKind, rhs: LocalTy) -> LocalTy {
 
     match (lhs, rhs) {
         (Scalar, Scalar) => Scalar,
+        // Integer-with-integer stays integer (comparisons/logical yield a
+        // logical scalar); mixing integers and doubles is deferred.
+        (Int32, Int32) => int_binary_ty(op),
+        (Int32, _) | (_, Int32) => Dynamic,
+        // Complex arithmetic is real-wrapped in the runtime; any operand being
+        // complex makes the result complex (real operands are boxed on demand).
+        (Complex, _) | (_, Complex) => Complex,
+        // Cells are boxed; arithmetic on them is deferred.
+        (Cell, _) | (_, Cell) => Dynamic,
         (Struct { .. }, _) | (_, Struct { .. }) | (Dynamic, _) | (_, Dynamic) => Dynamic,
         // Matrix power `A ^ scalar` keeps `A`'s shape (a square matrix).
         (Array { shape }, Scalar) if op == OperatorKind::MatrixPower => Array { shape },
@@ -1926,8 +2152,29 @@ fn call_ty(call: &HirCall, tys: &HashMap<BindingId, LocalTy>, handles: &HandleTa
 
     match builtin {
         // Elementwise unary: preserves the argument's shape; `sort` also
-        // preserves shape (a sorted copy).
-        Builtin::Unary(_) | Builtin::Sort => args.first().cloned().unwrap_or(LocalTy::Dynamic),
+        // preserves shape (a sorted copy). `abs` of a complex value is a real
+        // scalar.
+        Builtin::Unary(sym) => match args.first() {
+            Some(LocalTy::Complex) => {
+                if sym == "fabs" {
+                    LocalTy::Scalar
+                } else {
+                    LocalTy::Dynamic
+                }
+            }
+            other => other.cloned().unwrap_or(LocalTy::Dynamic),
+        },
+        Builtin::Sort => args.first().cloned().unwrap_or(LocalTy::Dynamic),
+        // `fft(x)` is a complex transform.
+        Builtin::Fft => LocalTy::Complex,
+        // `eig(A)`: a complex eigenvalue vector for a small (1x1/2x2) static
+        // square matrix; other shapes are deferred.
+        Builtin::Eig => match args.first() {
+            Some(LocalTy::Array { shape }) if is_static_square(*shape) && shape.dims()[0] <= 2 => {
+                LocalTy::Complex
+            }
+            _ => LocalTy::Dynamic,
+        },
         // Reductions: one array argument reduces to a scalar; a second numeric
         // argument selects the dimension to reduce along (array result).
         Builtin::MinMax(_) | Builtin::Reduce(_) => match args.as_slice() {
@@ -1993,6 +2240,13 @@ fn call_ty(call: &HirCall, tys: &HashMap<BindingId, LocalTy>, handles: &HandleTa
             _ => LocalTy::Dynamic,
         },
         Builtin::Rand => LocalTy::Scalar,
+        // `strcmp(a, b)` is a scalar predicate.
+        Builtin::StrCmp => LocalTy::Scalar,
+        // `int32(x)` is an integer conversion (scalar-only for now).
+        Builtin::Int32 => match args.first() {
+            Some(LocalTy::Scalar) | Some(LocalTy::Int32) => LocalTy::Int32,
+            _ => LocalTy::Dynamic,
+        },
         // `cumsum` preserves the operand's shape; `diff` shortens a vector by one.
         Builtin::CumSum => match args.as_slice() {
             [LocalTy::Scalar] => LocalTy::Scalar,

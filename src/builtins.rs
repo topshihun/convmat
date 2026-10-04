@@ -72,6 +72,14 @@ pub enum Builtin {
     Norm,
     /// `rand()`: a pseudo-random scalar in `[0, 1)`.
     Rand,
+    /// `strcmp(a, b)`: whether two char arrays are equal (a scalar `0`/`1`).
+    StrCmp,
+    /// `int32(x)`: convert to a 32-bit signed integer scalar.
+    Int32,
+    /// `fft(x)`: the discrete Fourier transform (a runtime helper; complex).
+    Fft,
+    /// `eig(A)`: eigenvalues of a small square matrix (a runtime helper; complex).
+    Eig,
 }
 
 /// Which of `min`/`max` a [`Builtin::MinMax`] refers to.
@@ -106,9 +114,12 @@ impl Builtin {
             | Builtin::Var
             | Builtin::Inv
             | Builtin::Det
-            | Builtin::Norm => n == 1,
+            | Builtin::Norm
+            | Builtin::Int32
+            | Builtin::Fft
+            | Builtin::Eig => n == 1,
             Builtin::Rand => n == 0,
-            Builtin::Binary(_) | Builtin::Mod => n == 2,
+            Builtin::Binary(_) | Builtin::Mod | Builtin::StrCmp => n == 2,
             Builtin::MinMax(_) | Builtin::Reduce(_) | Builtin::Size | Builtin::Eye => {
                 n == 1 || n == 2
             }
@@ -177,6 +188,10 @@ pub fn lookup(name: &str) -> Option<Builtin> {
         "det" => Builtin::Det,
         "norm" => Builtin::Norm,
         "rand" => Builtin::Rand,
+        "strcmp" => Builtin::StrCmp,
+        "int32" => Builtin::Int32,
+        "fft" => Builtin::Fft,
+        "eig" => Builtin::Eig,
         "isnan" => Builtin::Unary("std::isnan"),
         "isinf" => Builtin::Unary("std::isinf"),
         _ => return None,
@@ -212,6 +227,10 @@ pub fn libm_symbol(builtin: Builtin) -> Option<&'static str> {
         | Builtin::Det
         | Builtin::Norm
         | Builtin::Rand
+        | Builtin::StrCmp
+        | Builtin::Int32
+        | Builtin::Fft
+        | Builtin::Eig
         | Builtin::Sort => None,
         Builtin::MinMax(MinMax::Min) => Some("fmin"),
         Builtin::MinMax(MinMax::Max) => Some("fmax"),

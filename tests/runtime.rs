@@ -9,7 +9,10 @@ use std::fs;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use convmat::runtime::{DYNAMIC_RUNTIME_C, DYNAMIC_RUNTIME_H};
+use convmat::runtime::{
+    cell_support_source, complex_support_source, DYNAMIC_RUNTIME_C, DYNAMIC_RUNTIME_H,
+    ERROR_SUPPORT_C,
+};
 
 /// Headers required by the runtime header (`jmp_buf` comes from `<setjmp.h>`).
 const PREAMBLE: &str = "\
@@ -18,8 +21,8 @@ const PREAMBLE: &str = "\
 #include <setjmp.h>
 ";
 
-/// Compile the runtime kernel plus `body` (a `main` body) and return stdout.
-fn compile_and_run(body: &str) -> String {
+/// Compile `runtime` plus `body` (a `main` body) and return stdout.
+fn compile_and_run_with(runtime: &str, body: &str) -> String {
     let compiler = std::env::var("CXX").unwrap_or_else(|_| {
         for name in ["g++", "clang++", "c++"] {
             if Command::new(name).arg("--version").output().is_ok() {
@@ -35,9 +38,7 @@ fn compile_and_run(body: &str) -> String {
     fs::create_dir_all(&dir).expect("create scratch dir");
     let src = dir.join("main.cpp");
     let bin = dir.join("prog");
-    let cpp = format!(
-        "{PREAMBLE}{DYNAMIC_RUNTIME_H}\n{DYNAMIC_RUNTIME_C}\nint main() {{\n{body}\n    return 0;\n}}\n"
-    );
+    let cpp = format!("{PREAMBLE}{runtime}\nint main() {{\n{body}\n    return 0;\n}}\n");
     fs::write(&src, &cpp).expect("write source");
 
     let compile = Command::new(&compiler)
@@ -65,6 +66,11 @@ fn compile_and_run(body: &str) -> String {
         String::from_utf8_lossy(&run.stderr)
     );
     String::from_utf8_lossy(&run.stdout).trim().to_string()
+}
+
+/// Compile the dynamic value-model kernel plus `body` and return stdout.
+fn compile_and_run(body: &str) -> String {
+    compile_and_run_with(&format!("{DYNAMIC_RUNTIME_H}\n{DYNAMIC_RUNTIME_C}"), body)
 }
 
 #[test]
@@ -172,6 +178,64 @@ fn deep_copy_is_independent() {
 ",
     );
     assert_eq!(out, "1 99");
+}
+
+#[test]
+fn cell_scalar_wrappers_create_set_get() {
+    // The scalar-element cell wrappers exercise the boxed kernel end to end.
+    let out = compile_and_run_with(
+        &cell_support_source(),
+        "\
+    convmat_value *c = convmat_cell_new(3.0);
+    convmat_cell_set_scalar(c, 0.0, 1.0);
+    convmat_cell_set_scalar(c, 1.0, 2.0);
+    convmat_cell_set_scalar(c, 2.0, 3.0);
+    printf(\"%g %g %g\\n\", convmat_cell_get_scalar(c, 0.0),
+           convmat_cell_get_scalar(c, 1.0), convmat_cell_get_scalar(c, 2.0));
+    convmat_value_release(c);
+",
+    );
+    assert_eq!(out, "1 2 3");
+}
+
+#[test]
+fn complex_helpers_arithmetic_and_abs() {
+    // `abs(3 + 4i)` is 5; `(3 + 4i) * 1i = -4 + 3i`.
+    let out = compile_and_run_with(
+        &complex_support_source(),
+        "\
+    convmat_value *z = convmat_complex(3.0, 4.0);
+    printf(\"%g\\n\", convmat_cabs(z));
+    convmat_value *w = convmat_cmul(z, convmat_complex(0.0, 1.0));
+    printf(\"%g %g\\n\", convmat_complex_component(w, 0.0, 0.0),
+           convmat_complex_component(w, 0.0, 1.0));
+    convmat_value_release(w);
+    convmat_value_release(z);
+",
+    );
+    assert_eq!(out, "5\n-4 3");
+}
+
+#[test]
+fn try_catch_error_propagation() {
+    // `convmat_error_throw` longjmps back into the `else` (catch) branch; the
+    // driver uses `convmat_error_check` as the `if` controlling expression, the
+    // canonical (standard-conforming) setjmp context.
+    let out = compile_and_run_with(
+        ERROR_SUPPORT_C,
+        "\
+    double env = convmat_error_enter();
+    if (convmat_error_check(env)) {
+        printf(\"try\\n\");
+        convmat_error_throw(\"boom\");
+        printf(\"unreachable\\n\");
+    } else {
+        printf(\"catch\\n\");
+    }
+    convmat_error_leave(env);
+",
+    );
+    assert_eq!(out, "try\ncatch");
 }
 
 #[test]
