@@ -1,3 +1,14 @@
+---
+name: convmat-dev
+description: >-
+  Use when developing, building, or testing the convmat compiler itself, a Rust
+  MATLAB/Octave-to-C compiler built on runmat (frontend) and pliron (pure-Rust,
+  MLIR-style IR). Covers the crate layout, the HIR -> matlab -> emitc -> C
+  pipeline, dependency/version policy, cargo build/check/test/clippy commands,
+  the pre-commit checks, and a verified pliron 0.18 API quick reference. Use this
+  instead of guessing at runmat/pliron APIs.
+---
+
 # convmat Development
 
 You are working on `convmat`, a Rust compiler that lowers MATLAB/Octave source
@@ -8,7 +19,7 @@ to C and aims to be a better MATLAB Coder.
 - Package: `convmat` (a lib + bin crate in a single `Cargo.toml`).
 - Edition 2021.
 - Frontend dependencies (all 0.6.2, mandatory): `runmat-parser`,
-  `runmat-hir`, `runmat-mir`.
+  `runmat-hir`. (`runmat-mir` is not used: the pipeline stops at HIR.)
 - IR dependency: `pliron` 0.18 (a pure-Rust, MLIR-inspired compiler IR
   framework). There is **no** C++ MLIR/LLVM dependency and no `melior`.
 - Authoritative architecture lives in `docs/architecture.md`; agent working
@@ -26,9 +37,9 @@ to C and aims to be a better MATLAB Coder.
 
 ```
 .m source
-  -> runmat (lexer/parser/HIR/MIR)            [src/frontend]
+  -> runmat (lexer/parser/HIR)                [src/frontend]
   -> triage (static vs dynamic)               [src/triage]
-  -> MIR -> matlab dialect (pliron)           [src/mir_to_mlir]
+  -> HIR -> matlab dialect (pliron)           [src/hir_to_mlir]
   -> matlab -> emitc dialect (pliron)         [src/lowering]
   -> emitc -> C                               [src/emit_c]
 ```

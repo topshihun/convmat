@@ -1,3 +1,13 @@
+---
+name: matlab-lowering
+description: >-
+  Use when writing or reviewing convmat's MATLAB/Octave-to-IR lowering: mapping
+  MATLAB semantics (dynamic matrices, column-major arrays, indexing, control
+  flow, functions, built-ins) onto the matlab pliron dialect and downstream to
+  emitc and C. Consult before adding a dialect or op, or a new builtin lowering
+  recipe.
+---
+
 # MATLAB → IR Lowering
 
 Use this when writing the `convmat` backend that translates MATLAB/Octave
@@ -16,20 +26,21 @@ convmat defines two pliron dialects in `src/dialects/`:
   `ternary`/`call`/`load`/`assign`, and `if`/`while`/`for`/`condition`/`yield`/
   `break`/`return`.
 
-The pipeline is `MIR -> matlab -> emitc -> C`. Introduce a new op only after the
+The pipeline is `HIR -> matlab -> emitc -> C`. Introduce a new op only after the
 two existing dialects prove insufficient for MATLAB-specific semantics (e.g.
 colon indexing, `end`, dynamic typing).
 
 ## Mapping guidelines
 
 1. **Dynamic typing**: MATLAB values are dynamically typed matrices. Carry a
-   runtime type descriptor or boxed value until static analysis (via
-   `runmat-static-analysis`) proves a concrete element type/shape, then lower
-   to `matlab.array`.
+   runtime type descriptor or boxed value until the lightweight triage pass
+   (`src/triage`, a hand-written whitelist today) proves a concrete element
+   type/shape, then lower to `matlab.array`. `runmat-static-analysis` is
+   deliberately excluded (it pulls runmat-vm -> native HDF5/OpenBLAS).
 2. **Arrays**: static shapes are tracked in `Shape`/`LocalTy` and stored as a
    flattened column-major `matlab.array` with shape metadata; elementwise,
    transpose, matmul, and reductions are expanded to `load`/`store` loops in
-   the MIR lowerer (compile-time unrolled for static shapes). Reserve `linalg`
+   the HIR lowerer (compile-time unrolled for static shapes). Reserve `linalg`
    for later fusion/vectorization, and defer dynamic shapes to the runtime.
 3. **Control flow**: `for` loops lower to `while` with a loop-binding cell;
    `while` uses `condition` (before region) + `yield` (after region); `if`/
@@ -43,7 +54,7 @@ colon indexing, `end`, dynamic typing).
 
 ## Verification
 
-- Round-trip the generated IR through `mir_to_mlir::lower` and check the dump
+- Round-trip the generated IR through `hir_to_mlir::lower` and check the dump
   (op names) rather than `mlir-opt` (no external tools are available).
 - Add a test that parses a small `.m` snippet, lowers it, and checks the
   resulting IR dump or the emitted C.
