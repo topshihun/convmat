@@ -104,6 +104,8 @@ convmat/
 │   └── runtime/           # layer 6: runtime fallback seam (not implemented)
 ├── docs/
 │   └── architecture.md    # authoritative architecture
+├── examples/
+│   └── coder/             # MATLAB Coder example coverage survey
 ├── tests/                 # end-to-end codegen tests + fixtures
 └── AGENTS.md              # agent working conventions
 ```
