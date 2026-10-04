@@ -671,6 +671,66 @@ fn run_sort_vec() {
 }
 
 #[test]
+fn run_matrix_sort() {
+    // `sort([3 1; 2 4])` sorts each column independently via `convmat_sort_cols`:
+    // column 1 [3;2] -> [2;3], column 2 [1;4] -> [1;4] (column-major [2 3 1 4]).
+    run_exact(
+        "sort_matrix",
+        "void sort_matrix(double*);",
+        "double o[4]; sort_matrix(o);\n    \
+         printf(\"%g %g %g %g\\n\", o[0], o[1], o[2], o[3]);",
+        "2 3 1 4",
+    );
+}
+
+#[test]
+fn run_linalg_det3() {
+    // det of a 3x3 whose first pivot is zero: the `convmat_det` helper must
+    // swap rows. det([0 2 1; 3 1 4; 1 5 2]) == 10.
+    run_exact(
+        "linalg_det3",
+        "double linalg_det3(void);",
+        "printf(\"%g\\n\", linalg_det3());",
+        "10",
+    );
+}
+
+#[test]
+fn run_linalg_inv3() {
+    // inv([4 7 2; 3 6 1; 2 5 3]) == (1/9) * [13 -11 -5; -7 8 2; 3 -6 3]
+    // (column-major output).
+    run_close(
+        "linalg_inv3",
+        "void linalg_inv3(double*);",
+        "double o[9]; linalg_inv3(o);\n    \
+         for (int i = 0; i < 9; i++) printf(\"%.17g\\n\", o[i]);",
+        &[
+            13.0 / 9.0,
+            -7.0 / 9.0,
+            1.0 / 3.0,
+            -11.0 / 9.0,
+            8.0 / 9.0,
+            -2.0 / 3.0,
+            -5.0 / 9.0,
+            2.0 / 9.0,
+            1.0 / 3.0,
+        ],
+    );
+}
+
+#[test]
+fn run_linalg_solve3() {
+    // [2 1 0; 1 3 1; 0 1 2] \ [1; 2; 3] == [0.5; 0; 1.5].
+    run_close(
+        "linalg_solve3",
+        "void linalg_solve3(double*);",
+        "double o[3]; linalg_solve3(o);\n    \
+         for (int i = 0; i < 3; i++) printf(\"%.17g\\n\", o[i]);",
+        &[0.5, 0.0, 1.5],
+    );
+}
+
+#[test]
 fn run_array_param_sum() {
     // A dynamic-shape array parameter lowers to `(double* data, double n)`; the
     // reduction goes through the `convmat_sum` runtime helper.
@@ -690,6 +750,41 @@ fn run_array_param_numel() {
         "double array_numel(double*, double);",
         "double a[4] = {0.0, 0.0, 0.0, 0.0};\n    printf(\"%g\\n\", array_numel(a, 4));",
         "4",
+    );
+}
+
+#[test]
+fn run_array_size_descriptor() {
+    // `size(A, ...)` forces the `(data, rows, cols)` shape-descriptor ABI.
+    run_exact(
+        "array_size",
+        "double array_size(double*, double, double);",
+        "double a[6] = {1, 2, 3, 4, 5, 6};\n    \
+         printf(\"%g\\n\", array_size(a, 2.0, 3.0));",
+        "2",
+    );
+}
+
+#[test]
+fn run_array_size_col() {
+    run_exact(
+        "array_size_col",
+        "double array_size_col(double*, double, double);",
+        "double a[6] = {1, 2, 3, 4, 5, 6};\n    \
+         printf(\"%g\\n\", array_size_col(a, 2.0, 3.0));",
+        "3",
+    );
+}
+
+#[test]
+fn run_array_size_all() {
+    // `size(A)` returns `[rows cols]`; the fixture sums them: 2 + 3 == 5.
+    run_exact(
+        "array_size_all",
+        "double array_size_all(double*, double, double);",
+        "double a[6] = {1, 2, 3, 4, 5, 6};\n    \
+         printf(\"%g\\n\", array_size_all(a, 2.0, 3.0));",
+        "5",
     );
 }
 
@@ -1367,5 +1462,59 @@ fn run_while_dynamic() {
         "double while_dynamic();",
         "printf(\"%g\\n\", while_dynamic());",
         "1",
+    );
+}
+
+#[test]
+fn run_array_intermediate() {
+    // `t = A(:); y = sum(t)` allocates a runtime-length heap buffer for `t`.
+    run_exact(
+        "array_intermediate",
+        "double array_intermediate(double*, double);",
+        "double a[3] = {1.0, 2.0, 3.0};\n    \
+         printf(\"%g\\n\", array_intermediate(a, 3.0));",
+        "6",
+    );
+}
+
+#[test]
+fn run_array_intermediate_loop() {
+    // A dynamic intermediate assigned inside a loop is block-scoped: its buffer
+    // is allocated and freed on each iteration. A=[1 2 3], 2 iterations: 6 + 6.
+    run_exact(
+        "array_intermediate_loop",
+        "double array_intermediate_loop(double*, double, double);",
+        "double a[3] = {1.0, 2.0, 3.0};\n    \
+         printf(\"%g\\n\", array_intermediate_loop(a, 3.0, 2.0));",
+        "12",
+    );
+}
+
+#[test]
+fn run_array_sq() {
+    // `n = sum(A); y = A .* A + n` with a dynamic-shape array parameter and a
+    // dynamic-shape array output (buffer + out-length). A=[1 2 3] -> [7 10 15].
+    run_exact(
+        "array_sq",
+        "void array_sq(double*, double, double*, double*);",
+        "double a[3] = {1.0, 2.0, 3.0};\n    double y[3];\n    double n = 0.0;\n    \
+         array_sq(a, 3.0, y, &n);\n    \
+         printf(\"%g %g %g %g\\n\", y[0], y[1], y[2], n);",
+        "7 10 15 3",
+    );
+}
+
+#[test]
+fn run_array_scalar_ops() {
+    // `B = A(:)` is a dynamic intermediate; `(2 - B) ./ k + B .* k` exercises
+    // scalar-broadcast subtract/divide/multiply and elementwise add. For
+    // A=[1 2 3], k=2 -> [(2-1)/2+2, (2-2)/2+4, (2-3)/2+6] = [2.5 4 5.5].
+    run_exact(
+        "array_scalar_ops",
+        "void array_scalar_ops(double*, double, double, double*, double*);",
+        "double a[3] = {1.0, 2.0, 3.0};\n    double y[3];\n    double n = 0.0;\n    \
+         array_scalar_ops(a, 3.0, 2.0, y, &n);\n    \
+         printf(\"%g %g %g %g\\n\", y[0], y[1], y[2], n);",
+        "2.5 4 5.5 3",
     );
 }

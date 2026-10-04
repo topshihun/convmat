@@ -110,10 +110,13 @@ MATLAB 是动态语言，无法（也不应）要求所有代码都静态可编�
   **不作为返回值**，而是作为**额外的输出指针入参**；缓冲空间由**调用方**分配——
   被调方只写不分配，调用方在调用前预留好空间。这相当于 C ABI 里的 sret 手法，把
   「谁分配、谁释放」的所有权固定在调用方一侧，避免数组返回值的所有权歧义。
-- **动态形状数组形参**（大小运行期才定）走「数据指针 + 长度」两个入参：形参 `A` →
+- **动态形状数组形参**（大小运行期才定）默认走「数据指针 + 元素个数」两个入参：形参 `A` →
   `double* v1, double v2`（数据 + 元素个数），如 `double f(double* v1, double v2)`。
-  形参视为向量（列主序）；降级器把 `A` 的 IR 值记为 `matlab.ptr`（发射成 `double*`），
-  长度单独记录，供 `sum(A)`/`numel(A)`/`A(i)` 等使用（见 §10.5 P7、`docs/runtime.md`）。
+  **当函数体查询 `size(A, ...)` 时**（行/列二义，仅靠元素个数无法区分行/列向量），改走
+  「数据指针 + 行 + 列」**形状描述符**入参：`double* v1, double v2, double v3`（数据 + 行 + 列）。
+  ABI 是**按使用点驱动**的（与 MATLAB Coder 一致）：只有查询形状的形参才多付两个参数。
+  形参视为向量/矩阵（列主序）；降级器把 `A` 的 IR 值记为 `matlab.ptr`（发射成 `double*`），
+  长度/形状单独记录，供 `sum(A)`/`numel(A)`/`size(A,d)`/`A(i)` 等使用（见 §10.5 P7、`docs/runtime.md`）。
 - **动态形状数组输出**（大小运行期才定）走两个输出指针入参：`double* y_out`（调用方缓冲）
   + `double* y_n`（被调方写入实际元素个数）。延续「缓冲由调用方分配」的所有权约定，
   只是长度由被调方回填（调用方需保证缓冲足够大）。如 `void f(double* v1, double v2,
@@ -182,8 +185,8 @@ flowchart TD
 | 阶段 | 模块 / 函数 | 输入 | 调用（复用/自研） | 产出 / 效果 |
 |------|-------------|------|--------------------|-------------|
 | 0 前端 | `src/frontend::parse_hir` | `.m` 源文本 | `runmat_parser::parse` → `runmat_hir::lower` | `HirAssembly`（lexer→parser→HIR，名字已解析、操作符已脱糖） |
-| 1 边界 | `src/triage::classify` | `HirAssembly` 的每个 `HirFunction` | 自研白名单 + `infer_locals`（形状推断，区分 `Static`/`Dynamic`） | `Static`（可生成）或 `Deferred`（降运行时，MVP 报错） |
-| 2 降级 | `src/hir_to_mlir::lower_to_module` | 可生成代码的 `HirFunction` | pliron + `matlab` 方言 + `builtins` 表（`matlab.call @libm`） | `matlab` 方言 module（含数组/矩阵/内建/控制流） |
+| 1 边界/调度 | `src/triage::dispatch` | `HirAssembly` 的每个 `HirFunction` | 自研白名单 + `infer_locals`（形状推断） | `FunctionPlan`：每个绑定的值分级 `ValueClass`（标量/静态矩阵/运行时矩阵/struct）+ 函数 `Route` |
+| 2 降级 | `src/hir_to_mlir::lower_to_module_with_plans` | 可生成代码的 `HirFunction` + 其 `FunctionPlan` | pliron + `matlab` 方言 + `builtins` 表（`matlab.call @libm`） | `matlab` 方言 module（含数组/矩阵/内建/控制流） |
 | 2.5 优化 | `src/passes::run_matlab_passes` | `matlab` 方言 module | pliron `Pass` 框架（`NestedOpsPass`/`OpPass`） | `matlab` 方言 module（折叠/传播/死分支已做） |
 | 3 降级 | `src/lowering::lower_module` | `matlab` 方言 module（builtin 容器） | 自研 pass（pliron 框架） | builtin module：`builtin.func`（body 为 `emitc.*` op）+ 顶层指令；ABI 已解析、数组已命名 |
 | 3.25 优化 | `src/passes::run_emitc_passes` | builtin module（`emitc.*` body） | pliron `Pass` 框架 | builtin module（死单元/死值已清） |
@@ -193,15 +196,16 @@ flowchart TD
 ```text
 .m 源码
   └─[0 前端 runmat]─────────────────────────────→ HirAssembly
-  └─[1 边界 triage]── Static ────────────────┐   └─ Deferred → runtime（MVP 报错）
+  └─[1 调度 triage::dispatch]── Route::Static ─┐   └─ Route::Runtime → runtime（MVP 报错）
   └─[2 降级 hir_to_mlir]──────────────────────┤   → matlab 方言 module
   └─[3 降级 lowering]─────────────────────────┤   → builtin module（func + emitc.* op）
   └─[4 发射 emit_c]───────────────────────────┘   → C 源码
 ```
 
 > **关键点**：
-> - 边界（阶段 1）是「静态 vs 动态」的分水岭；只有 `Static` 才进入降级，`Deferred` 走
->   运行时兔底。
+> - 阶段 1 的 `triage::dispatch` 是「标量 / 静态矩阵 / 运行时矩阵」的**编译期调度**：为每个
+>   绑定分级、为每个函数选路由，产出 `FunctionPlan`；`hir_to_mlir` 只消费该计划，不再自行
+>   推断形状。只有 `Route::Static` 才进入降级，`Route::Runtime` 走运行时兔底。
 > - 内存分配决策（栈/堆/输出指针，§11.3）在阶段 2 降级时依据 `LocalTy` 做出。
 > - 阶段 2 产出的 `matlab` 方言与后端无关，换后端只替换阶段 4（§5 可插拔策略）。
 > - 阶段 2→3→4 都是纯 Rust、进程内完成，无外部工具调用、无文本 round-trip。
@@ -212,7 +216,7 @@ flowchart TD
 |----|------------------|------|-----------|
 | 0 前端 | `runmat-parser/hir` | 解析、HIR | 复用 runmat |
 | 1 输入 | `src/frontend/` | 读取 `.m`、驱动 runmat 前端、产出 HIR | 薄封装 |
-| 2 边界 | `src/triage/` | 静态 vs 动态分类，产出「可生成代码计划」+ 形状推断（`Shape`/`LocalTy`） | 自研（核心） |
+| 2 边界/调度 | `src/triage/` | 编译期调度：为每个值分级（标量/静态矩阵/运行时矩阵/struct）、为每个函数选 `Route`，产出 `FunctionPlan`；形状推断（`Shape`/`LocalTy`） | 自研（核心） |
 | 2.5 方言 | `src/dialects/matlab.rs` | `matlab` 方言（语义）：数组类型 + 标量/数组/控制流 op | 自研（核心） |
 | 3 降级 | `src/hir_to_mlir/` | HIR → `matlab` 方言；动态部分 → 运行时调用；内存分配策略 | 自研（核心） |
 | 3.2 优化 | `src/passes/` | 按方言分层的独立优化 pass：`matlab.rs`（语义：折叠/传播/死分支/死值）、`emitc.rs`（C 层：死单元/死值）；基于 pliron `Pass` 框架 | 自研（可选） |
@@ -261,7 +265,9 @@ flowchart TD
   常量整数指数 `k ≥ 0`）走 `convmat_mpower`。
 - 转置：`.'` / `'`（2-D 交换 `dims[0]`/`dims[1]`）。
 - 矩阵乘：`*`（`m×k · k×n → m×n`）；矩阵/向量乘由同一条路径覆盖。
-- `mrdivide`/`mldivide`（矩阵 `/` `\`）、数组×数组广播、N-D 转置 → 延后（标量 `/` `\` 已支持）。
+- 左除：`\`（方阵 `A \ B` → 高斯消元 `convmat_solve`，结果 `A` 列数 × `B` 列数）；
+  矩阵 `/`（`mrdivide`）、非方阵/最小二乘、数组×数组广播、N-D 转置 → 延后
+  （标量 `/` `\` 已支持）。
 
 ### 10.2.1 降级策略：内联 vs 封装
 
@@ -270,7 +276,7 @@ flowchart TD
 | 策略 | 适用 | 产物 |
 |------|------|------|
 | **内联（展开）** | 便宜、可 1:1 直译的：标量算术、逐元素 `+ - .* ./ .\ .^`、比较/逻辑、归约、`libm` 内建 | `for` 循环 / `matlab.binop` / `matlab.call @libm` |
-| **封装（调用 runtime helper）** | 会「改变内存布局」或有算法复杂度的：转置、矩阵乘、矩阵幂 | `matlab.call_void` → `emitc.call_void` → `convmat_*` C 函数 |
+| **封装（调用 runtime helper）** | 会「改变内存布局」或有算法复杂度的：转置、矩阵乘、矩阵幂、方阵求逆/行列式/左除、向量范数、`rand` | `matlab.call_void` / `matlab.call` → `emitc.call_void`/`call` → `convmat_*` C 函数 |
 
 - 封装的操作不再在编译期展开循环，而是发射对 `convmat_*` 运行时函数的单次调用，
   结果写入调用方分配的 out-buffer（延续 §5 ABI）。`>2` 维的形状变换（`permute`/`reshape`）
@@ -291,7 +297,16 @@ flowchart TD
   行/列向量）。
 - **形状内省**：`numel length size(A,dim) size(A)`。
 - **构造器/重塑**：`zeros(m,n) ones(m,n) eye(n) reshape(A,m,n)`（维度须为常量）。
-- **排序**：`sort(v)`（仅向量，升序，封装 `convmat_sort` 运行时 helper；矩阵列排序未做）。
+- **排序**：`sort(v)` / `sort(A)`（向量升序，或 2-D 矩阵按列升序；封装 `convmat_sort` /
+  `convmat_sort_cols` 运行时 helper）。
+- **统计归约**：`mean(A)`（`sum/numel`；标量或向量）。`std(A)`（样本标准差，`n-1`
+  分母）、`median(A)`（经 `convmat_sort` 取中位）仅支持标量/静态向量（需要编译期
+  临时缓冲）。
+- **数组结果**：`cumsum(v)`（前缀和）、`diff(v)`（相邻差，长度减一）。
+- **谓词**：`isnan` / `isinf`（`std::isnan` / `std::isinf`，结果为 0/1）。
+- **线性代数**（静态方阵/向量，封装运行时 helper）：`inv(A)`（`convmat_inv`）、
+  `det(A)`（`convmat_det`）、`norm(v)`（向量 2-范数 `convmat_norm`）。
+- **随机**：`rand()`（`[0,1)`，封装 `convmat_rand`）。
 - 未支持/有副作用/形状未知的内建 → 运行时兔底（`Error::NotLowerable`）。
 
 ### 10.4 管线（按方言分层的优化）
@@ -326,23 +341,25 @@ region——循环体写过的 cell 在后续迭代值不同；只有 `if` regio
 | P1 形状模型 | ✅ 完成 | `Shape`/`LocalTy`、列主序、行/列/N-D 元数据 |
 | P2 逐元素/广播/转置/逻辑 | ✅ 完成 | 同形数组 + 标量广播 + 2-D 转置（封装 `convmat_transpose`） |
 | P3 矩阵乘/幂 | ✅ 完成 | `*` 封装 `convmat_matmul`；`^`/`.^` 已支持（矩阵幂封装 `convmat_mpower`） |
-| P4 内建 | 🟡 部分 | 归约(含按维)+形状内省+`zeros/ones/eye/reshape`+`sort`(向量) 已做；`permute/repmat/cat/horzcat/vertcat`、`sort`(矩阵列排序)、`find/mean/fft` 未做 |
-| P5 索引/冒号/`end` | 🟡 部分 | 静态数组：常量下标 `A(i,j)`、线性 `A(i)`、`end`、`A(:)`；动态数组形参：运行时下标 `A(i)`、`end`。仍缺 `A(i,:)`/`A(:,j)`/冒号区间/变量下标的静态形式/逻辑下标 |
+| P4 内建 | 🟡 部分 | 归约(含按维)+形状内省+`zeros/ones/eye/reshape`+`sort`(向量及矩阵列排序)+`mean/std/median/var/cumsum/diff/isnan/isinf/isempty/logical`+`linspace/repmat/permute`(静态)+`Inf/NaN`+`inv/det/norm/solve/rand`(静态方阵/向量) 已做；`find/fft`、`cat/horzcat/vertcat` 未做 |
+| P5 索引/冒号/`end` | 🟡 部分 | 静态数组：常量下标 `A(i,j)`、线性 `A(i)`、`end`、`A(:)`、切片 `A(i,:)`/`A(:,j)`、常量区间/步长 `A(a:b:c)`（含 `end` 边界）、N-D 下标 `A(i,j,k)`；动态数组形参：运行时下标 `A(i)`、`end`。仍缺变量/非静态下标与逻辑下标 |
 | 控制流 | ✅ 完成 | `if`/`elseif`/`else`、`while`、`for`（升/降序，编译为方向感知的 C `for`）、`switch`、`break`/`continue`；`try`/`catch` 未做 |
-| 存储类 | 🟡 部分 | 局部栈变量；`persistent`/`global` 编译为 C `static`（单函数封闭世界）；多返回值调用 `[a,b]=f()` 未做 |
+| 存储类 | 🟡 部分 | 局部栈变量；`persistent`/`global` 编译为 C `static`（单函数封闭世界），`persistent` 变量额外带 `_not_empty` 静态标志（`isempty` 首次为真，`kalmanfilter` 依赖此语义）；多返回值调用 `[a,b]=f()` 未做 |
 | struct 类型 | 🟡 部分 | `struct('a',1,...)` 构造、`s.a` 读/写、struct 按值传参/返回（含多出参 tuple）、struct 形参字段使用点推断；数组/嵌套 struct 字段、struct 数组未做 |
 | cell 类型 | ⛔ 未做 | cell 字面量 `{...}`、`c{i}` 花括号索引、`cell(...)` 构造均 defer（需运行时 cell ABI，见 §12）；`varargin`/`varargout` 的 cell 语义已通过封闭世界特化覆盖 |
 | 匿名函数句柄 | 🟡 部分 | 同函数、非逃逸、标量参数/捕获的匿名函数 `f = @(x) …` 编译期特化（捕获作为额外形参，创建时快照，见 §13）；数组参数/捕获、逃逸句柄、命名/内建句柄、立即调用、`arrayfun` 未做 |
 | 内存调度 | ✅ 完成 | 静态数组按 `numel` 调度：小数组入栈、超过 `STACK_ELEMS_LIMIT`（默认 4096 元素）的大数组堆分配并在返回前 `delete[]`；动态形状堆分配未做（见 P7） |
 | P6 优化 | 🟡 部分 | 按方言分层的独立 pass（`src/passes/matlab.rs`：常量折叠、cell 常量传播、死分支消除、死值消除；`src/passes/emitc.rs`：死单元、死值清理），基于 pliron `Pass` 框架迭代到不动点；循环条件不误折叠。CSE/canonicalize/linalg/向量化仍延后 |
-| P7 动态形状 | 🟡 部分 | 动态形状数组形参与输出均已实现：形参「指针 + 长度」ABI、输出「缓冲 + 长度回填」ABI（`matlab.ptr` 类型）。支持 `sum/prod/min/max(A)`、`numel/length(A)`、运行时下标 `A(i)`、`end`、运行时区间循环 `for i = 1:numel(A)`，以及动态数组输出 `y = A(:)`、`y = -A(:)`、`y = k * A`（标量广播）、`y = A(:) ± B(:)`、`y = A(:) .* B(:)`（两个等长动态数组逐元素，`convmat_*` helper）；动态数组*中间值*、其他逐元素运算、参数展开 `{:}`/逻辑下标、cell/string 等待做 |
+| P7 动态形状 | 🟡 部分 | 动态形状数组形参与输出均已实现：形参默认「指针 + 长度」ABI、查询 `size` 的形参走「指针 + 行 + 列」形状描述符 ABI、输出「缓冲 + 长度回填」ABI（`matlab.ptr` 类型）。支持 `size(A)`/`size(A,d)`（描述符形参）、`sum/prod/min/max(A)`、`numel/length(A)`（描述符下 `length=max(rows,cols)`）、运行时下标 `A(i)`、`end`、运行时区间循环 `for i = 1:numel(A)`，以及动态数组输出 `y = A(:)`、`y = -A(:)`、`y = k * A`（标量广播）、`y = A(:) ± B(:)`、`y = A(:) .* B(:)`（两个等长动态数组逐元素，`convmat_*` helper）；动态数组*中间值*已实现为块作用域（赋值处 `matlab.heap_alloc`，所在块末尾 `delete[]`；含控制流内，如循环体每轮分配/释放）；参数展开 `{:}`/逻辑下标、cell/string 等待做 |
+| P8 函数调用 | 🟡 部分 | 封闭世界同文件函数调用已支持（标量 ABI：全标量入参 + 单标量输出，含递归；C 发射器为所有函数发前向声明）；多返回值调用 `[a,b]=f()`、数组/结构体实参、跨文件调用未做 |
 
 > 数组形参不再被当作标量：`sum(A)`、`A(i)`、`reshape(A,…)` 等会把它推断为动态形状
 > 数组，并降为「指针 + 长度」ABI（支持归约/形状内省/运行时下标/`end`）。动态数组可以
 > 作为输出（`y = A(:)`、`y = k * A`、`y = A(:) ± B(:)`）；`A(:)` 在动态数组上是恒等
-> （直接复用数据指针）。但绑定到普通中间局部的动态数组仍 defer（`NotLowerable`：体内
-> 需要运行时分配）；无运行时越界检查。剩余无法从函数体判定数组/标量二义的形参（如
-> `A + B`、`y = A`）仍当标量处理，需入口点类型标注或静态分析。
+> （直接复用数据指针）。绑定到普通中间局部的动态数组在赋值处分配运行期长度的堆缓冲
+> （`matlab.heap_alloc`）并在返回前 `delete[]`，支持直线代码里的中间值与标量广播；在控制
+> 流区域内赋值的中间值仍 defer（缓冲作用域会超出区域）。无运行时越界检查。剩余无法从
+> 函数体判定数组/标量二义的形参（如 `A + B`、`y = A`）仍当标量处理，需入口点类型标注或静态分析。
 
 **P7 依赖困难（已实测 `cargo add runmat-static-analysis`）**：
 
@@ -375,6 +392,10 @@ region——循环体写过的 cell 在后续迭代值不同；只有 `if` regio
 - **运行时才能算出**的：动态形状的实际维度、动态类型的真实类型、越界/重分配、以及
   §4 边界外语义的兔底。
 
+> 这个分级由 `src/triage/dispatch.rs` 的**编译期调度阶段**落地：`dispatch` 为每个函数产出
+> `FunctionPlan`（`values: BindingId → LocalTy` + `route`），管线据此路由，`hir_to_mlir` 据此
+> 降级；「运行时矩阵 vs 标量」的判断只发生在编译期，不会延迟到运行期。
+>
 > 这条是 §4「形状可控」的细化：静态值走 `matlab` 方言，动态值走运行时 + 形状描述符，
 > 二者在同一个函数里可以共存（函数级/表达式级混合）。
 

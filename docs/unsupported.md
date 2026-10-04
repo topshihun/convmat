@@ -29,7 +29,7 @@
 | 花括号 `{}` 索引（cell 索引） | 报错 `only paren indexing is supported` | `mir_to_mlir::lower_index_scalar`（`IndexKind != Paren`） |
 | 动态字段 / struct 动态访问 | 不可静态解析 | 架构 §4 |
 | `classdef` 动态分派 | 不可静态解析 | 架构 §4 |
-| `global` / `persistent` 变量 | 不可静态解析（类型未知） | 架构 §4 |
+| `global` / `persistent` 变量 | 已支持（编译为 C `static`，仅限可静态定型的封闭世界单函数；`persistent` 变量带 `_not_empty` 标志） | `hir_to_mlir::lower_function`、架构 §10.5 |
 
 ## 3. 字符串与字符
 
@@ -48,8 +48,8 @@
 | `scalar ^ matrix`（`expm`）/ `matrix ^ matrix` | 不可静态降级 → defer | `triage::binary_ty` |
 | `matrix ^ 非整数/负指数`（需 `expm`/求逆） | defer | `mir_to_mlir::lower_matrix_power` |
 | `matrix ^ 运行时指数` | defer | `mir_to_mlir::lower_matrix_power` |
-| 矩阵除法 `mrdivide` / `mldivide`（矩阵 `/` `\`） | 标量 `/` `\` 已支持；矩阵级未实现 | `mir_to_mlir::apply_binary`（按标量处理）、架构 §10.2 |
-| 数组 × 数组广播（非同形逐元素） | 仅同形数组或标量广播 | `mir_to_mlir::lower_array_binary`、架构 §10.2 |
+| 矩阵除法 `mrdivide` / `mldivide`（矩阵 `/` `\`） | 标量 `/` `\` 已支持；`\`（方阵 `A \ B`）已支持（高斯消元 helper）；矩阵 `/`（`mrdivide`）及非方阵/最小二乘未实现 | `hir_to_mlir::lower_mldivide`、`triage::mldivide_ty`、架构 §10.2 |
+| 数组 × 数组广播（非同形逐元素） | 静态同形 / 单例维隐式扩展已支持；动态数组仅等长逐元素 | `hir_to_mlir::map_binary_broadcast`、`triage::broadcast_shape` |
 | N-D 转置（>2 维） | 报错 `only 2-D transpose is supported` | `mir_to_mlir::lower_array_unary` |
 | 复数运算 | 元素类型仅 `f64` | 架构 §10.1 |
 
@@ -58,18 +58,18 @@
 | 特性 | 当前行为 | 检测位置 |
 |------|----------|----------|
 | `single` / `int*` / `uint*` | 元素类型仅 `f64`（`LocalTy::Scalar` 即 `f64`） | 架构 §10.1 |
-| 逻辑数组（logical array） | 仅标量 `bool`（映射 C++ `bool`） | 架构 §10.1 |
+| 逻辑数组（logical array） | 逻辑值以 0/1 `f64` 表示；`logical`/比较结果已支持 | 架构 §10.1 |
 
 ## 6. 数组与形状变换
 
 | 特性 | 当前行为 | 检测位置 |
 |------|----------|----------|
-| `permute` / `repmat` / `cat` / `horzcat` / `vertcat` | 内建未收录 | `builtins::lookup`、架构 §10.5（P4） |
-| N-D 数组（rank > 2 的转置/广播等） | 大多未覆盖 | `MAX_RANK`/`lower_array_unary` |
-| 动态形状数组 | 数组形参/输出已支持（见下行）；任意动态形状中间值报错 `unresolved shape` / `dynamic array expression` | `triage::classify`、`hir_to_mlir::array_source`、§10.5（P7） |
-| 数组形参 | 已支持「指针 + 长度」ABI（`double* v1, double v2`）：归约（`sum/prod/min/max`）、`numel/length`、运行时下标 `A(i)`、`end`、运行时区间 `for` 循环；数组/标量二义用法（`A+B`）仍当标量；无越界检查 | `triage::infer_array_params`、`hir_to_mlir::lower_function`、§10.5 P7 |
+| `cat` / `horzcat` / `vertcat` | 内建未收录（`permute`/`repmat` 已支持 2-D / 常量） | `builtins::lookup`、架构 §10.5（P4） |
+| N-D 数组 | `zeros/ones` 接受 N 维、`A(i,j,k)` 常量下标已支持；N-D 转置/广播未覆盖 | `MAX_RANK`/`lower_array_unary` |
+| 动态形状数组 | 数组形参/输出已支持（见下行）；动态数组中间值已在体内（含控制流内）运行时分配（块作用域） | `triage::classify`、`hir_to_mlir::lower_block`、§10.5（P7） |
+| 数组形参 | 默认「指针 + 长度」ABI（`double* v1, double v2`）：归约（`sum/prod/min/max`）、`numel/length`、运行时下标 `A(i)`、`end`、运行时区间 `for` 循环；查询 `size` 的形参改为「指针 + 行 + 列」形状描述符 ABI（`double* v1, double v2, double v3`），支持 `size(A)`/`size(A,d)`；无越界检查 | `triage::infer_array_params`/`shape_descriptor_params`、`hir_to_mlir::lower_function`、§10.5 P7 |
 | 动态数组输出 | 已支持「缓冲 + 长度回填」ABI：`y = A(:)`、`y = -A(:)`、`y = k * A`（标量广播）、`y = A(:) ± B(:)`、`y = A(:) .* B(:)`（等长双数组）；其他输出表达式未支持 | `hir_to_mlir::lower_array_unary`/`lower_array_binary`、§5、§10.5 P7 |
-| 动态数组中间值 | 报错 `unresolved shape`（需体内运行时分配，未实现） | `triage::classify`、§10.5 P7 |
+| 动态数组中间值 | 已支持（含控制流内）：赋值处 `matlab.heap_alloc` 堆缓冲，在所在块末尾 `delete[]`（块作用域）；超出所在块的引用仍报错 | `hir_to_mlir::lower_block`、§10.5 P7 |
 | 数组增长 / 追加（`x(end+1) = ...`） | 需运行时堆分配，未实现 | §11.3 |
 
 ## 7. 内建函数（未收录，defer 到运行时）
@@ -77,23 +77,23 @@
 `builtins::lookup` 只收录纯数值逐元素/归约/形状内省/构造器子集，其余全部
 `unsupported builtin`（defer）。代表性未支持项：
 
-- **排序 / 查找**：`find`、`unique`、`ismember`（`sort` 已支持向量升序，见 `docs/architecture.md` §10.3；矩阵列排序未做）
-- **统计**：`mean`、`var`、`std`、`median`、`cumsum`、`cumprod`、`diff`、`all`、`any`
-- **线性代数**：`dot`、`cross`、`norm`、`det`、`inv`、`eig`、`svd`、`chol`、`lu`、`qr`、`pinv`
+- **排序 / 查找**：`find`、`unique`、`ismember`（`sort` 已支持向量升序与 2-D 矩阵按列排序，见 `docs/architecture.md` §10.3）
+- **统计**：`cumprod`、`all`、`any`（`mean`/`var`/`std`/`median`/`cumsum`/`diff` 已支持）
+- **线性代数**：`dot`、`cross`、`norm`（矩阵 2-范数/其他范数）、`det`（非方阵）、`eig`、`svd`、`chol`、`lu`、`qr`、`pinv`（方阵 `inv`/`det`、向量 `norm`、方阵 `A \ B` 已支持）
 - **信号 / 插值**：`fft`、`ifft`、`conv`、`filter`、`polyval`、`polyfit`、`interp1`、`interp2`
-- **随机**：`rand`、`randn`、`randi`、`randperm`
+- **随机**：`randn`、`randi`、`randperm`（`rand()` 标量已支持）
 - **构造 / 网格**：`linspace`、`logspace`、`diag`、`tril`、`triu`、`fliplr`、`flipud`、`rot90`、`meshgrid`、`ndgrid`、`magic`
-- **内省**：`isscalar`、`isvector`、`ismatrix`、`isempty`、`isnan`、`isinf`、`isfinite`、`class`
+- **内省**：`isscalar`、`isvector`、`ismatrix`、`isfinite`、`class`（`isempty`/`isnan`/`isinf` 已支持）
 - **I/O / 副作用**：`disp`、`fprintf`、`sprintf`、`error`、`warning`、`input`、`load`、`save`
 
 ## 8. 索引
 
 | 特性 | 当前行为 | 检测位置 |
 |------|----------|----------|
-| 切片 `A(i,:)` / `A(:,j)` | 报错 `colon slices are not supported yet` | `mir_to_mlir::static_linear_offset` |
-| 冒号区间表达式 `v = 1:10` | 报错 `unsupported rvalue`（仅 `for` 循环的 range 可迭代已支持） | `triage::rvalue_reason` / `terminator_reason` |
-| 变量下标 | 报错 `variable indices are not supported yet`（仅常量下标） | `mir_to_mlir::constant_index` |
-| 逻辑索引 `A(A>0)` | 未支持 | `mir_to_mlir::static_linear_offset` |
+| 切片 `A(i,:)` / `A(:,j)` | 静态 2-D 已支持（复制选定元素） | `triage::static_index_selection`、`hir_to_mlir` Index 分支 |
+| 冒号 / 步长区间 `A(a:b:c)`（含 `end` 边界） | 静态、常量边界已支持 | `triage::component_selection`、`hir_to_mlir` Index 分支 |
+| 变量下标（非静态） | 仍不支持（静态数组） | `hir_to_mlir::constant_index` |
+| 逻辑索引 `A(A>0)` | 未支持 | `hir_to_mlir::static_linear_offset` |
 | cell 索引 `{}` | 见 §2 | `mir_to_mlir::lower_index_scalar` |
 
 ## 9. 控制流

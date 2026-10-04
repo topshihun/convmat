@@ -33,7 +33,7 @@ use pliron::{
     value::Value,
 };
 
-use crate::dialects::matlab::{BinOpKind, BoolType, CmpKind};
+use crate::dialects::matlab::{BinOpKind, BoolType, CmpKind, PtrType};
 
 /// Declare a local array: `double <name>[<size>]` (stack), optionally `static`,
 /// or `double* <name> = new double[<size>]` (heap).
@@ -126,6 +126,31 @@ impl DeleteOp {
             0,
         );
         DeleteOp { op }
+    }
+}
+
+/// Allocate a runtime-length heap buffer: `double* <result> = new
+/// double[(int64_t)<len>];`. `len` is an `f64` operand; the buffer is released
+/// by [`DeleteOp`].
+#[pliron_op(
+    name = "emitc.heap_alloc",
+    format,
+    interfaces = [OneOpdInterface, OneResultInterface],
+    verifier = "succ",
+)]
+pub struct HeapAllocOp;
+
+impl HeapAllocOp {
+    pub fn new(ctx: &mut Context, len: Value) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![PtrType::get(ctx).into()],
+            vec![len],
+            vec![],
+            0,
+        );
+        HeapAllocOp { op }
     }
 }
 

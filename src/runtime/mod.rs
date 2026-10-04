@@ -28,6 +28,7 @@ pub const TRANSPOSE: &str = "convmat_transpose";
 pub const MATMUL: &str = "convmat_matmul";
 pub const MPOWER: &str = "convmat_mpower";
 pub const SORT: &str = "convmat_sort";
+pub const SORT_COLS: &str = "convmat_sort_cols";
 pub const SUM: &str = "convmat_sum";
 pub const PROD: &str = "convmat_prod";
 pub const MIN: &str = "convmat_min";
@@ -38,6 +39,17 @@ pub const ADD: &str = "convmat_add";
 pub const SUB: &str = "convmat_sub";
 pub const EWMUL: &str = "convmat_ewmul";
 pub const NEG: &str = "convmat_neg";
+pub const ADD_SCALAR: &str = "convmat_add_scalar";
+pub const SUB_SCALAR: &str = "convmat_sub_scalar";
+pub const RSUB_SCALAR: &str = "convmat_rsub_scalar";
+pub const DIV_SCALAR: &str = "convmat_div_scalar";
+pub const RDIV_SCALAR: &str = "convmat_rdiv_scalar";
+pub const EWDIV: &str = "convmat_ewdiv";
+pub const INV: &str = "convmat_inv";
+pub const DET: &str = "convmat_det";
+pub const NORM: &str = "convmat_norm";
+pub const SOLVE: &str = "convmat_solve";
+pub const RAND: &str = "convmat_rand";
 
 // --- Dynamic tier (see docs/runtime.md) -------------------------------------
 //
@@ -412,6 +424,7 @@ pub fn helper_source(name: &str) -> Option<&'static str> {
         MATMUL => MATMUL_C,
         MPOWER => MPOWER_C,
         SORT => SORT_C,
+        SORT_COLS => SORT_COLS_C,
         SUM => SUM_C,
         PROD => PROD_C,
         MIN => MIN_C,
@@ -422,6 +435,17 @@ pub fn helper_source(name: &str) -> Option<&'static str> {
         SUB => SUB_C,
         EWMUL => EWMUL_C,
         NEG => NEG_C,
+        ADD_SCALAR => ADD_SCALAR_C,
+        SUB_SCALAR => SUB_SCALAR_C,
+        RSUB_SCALAR => RSUB_SCALAR_C,
+        DIV_SCALAR => DIV_SCALAR_C,
+        RDIV_SCALAR => RDIV_SCALAR_C,
+        EWDIV => EWDIV_C,
+        INV => INV_C,
+        DET => DET_C,
+        NORM => NORM_C,
+        SOLVE => SOLVE_C,
+        RAND => RAND_C,
         _ => return None,
     })
 }
@@ -515,6 +539,25 @@ void convmat_sort(double* dst, const double* src, double n) {\n\
 }\n\
 ";
 
+const SORT_COLS_C: &str = "\
+// ---- convmat_sort_cols: sort each column of a (rows x cols) matrix ascending ----\n\
+void convmat_sort_cols(double* dst, const double* src, double rows, double cols) {\n\
+    int r = (int)rows, c = (int)cols;\n\
+    for (int j = 0; j < c; j++) {\n\
+        for (int i = 0; i < r; i++) dst[i + j * r] = src[i + j * r];\n\
+        for (int i = 1; i < r; i++) {\n\
+            double key = dst[i + j * r];\n\
+            int k = i - 1;\n\
+            while (k >= 0 && dst[k + j * r] > key) {\n\
+                dst[(k + 1) + j * r] = dst[k + j * r];\n\
+                k--;\n\
+            }\n\
+            dst[(k + 1) + j * r] = key;\n\
+        }\n\
+    }\n\
+}\n\
+";
+
 const SUM_C: &str = "\
 // ---- convmat_sum: sum(src[0..n)) ----\n\
 double convmat_sum(const double* src, double n) {\n\
@@ -603,6 +646,199 @@ void convmat_neg(double* dst, const double* src, double n) {\n\
 }\n\
 ";
 
+const ADD_SCALAR_C: &str = "\
+// ---- convmat_add_scalar: dst[0..n) = src[0..n) + k (scalar broadcast) ----\n\
+void convmat_add_scalar(double* dst, const double* src, double n, double k) {\n\
+    int m = (int)n;\n\
+    for (int i = 0; i < m; i++) dst[i] = src[i] + k;\n\
+}\n\
+";
+
+const SUB_SCALAR_C: &str = "\
+// ---- convmat_sub_scalar: dst[0..n) = src[0..n) - k (scalar broadcast) ----\n\
+void convmat_sub_scalar(double* dst, const double* src, double n, double k) {\n\
+    int m = (int)n;\n\
+    for (int i = 0; i < m; i++) dst[i] = src[i] - k;\n\
+}\n\
+";
+
+const RSUB_SCALAR_C: &str = "\
+// ---- convmat_rsub_scalar: dst[0..n) = k - src[0..n) (scalar broadcast) ----\n\
+void convmat_rsub_scalar(double* dst, const double* src, double n, double k) {\n\
+    int m = (int)n;\n\
+    for (int i = 0; i < m; i++) dst[i] = k - src[i];\n\
+}\n\
+";
+
+const DIV_SCALAR_C: &str = "\
+// ---- convmat_div_scalar: dst[0..n) = src[0..n) / k (scalar broadcast) ----\n\
+void convmat_div_scalar(double* dst, const double* src, double n, double k) {\n\
+    int m = (int)n;\n\
+    for (int i = 0; i < m; i++) dst[i] = src[i] / k;\n\
+}\n\
+";
+
+const RDIV_SCALAR_C: &str = "\
+// ---- convmat_rdiv_scalar: dst[0..n) = k / src[0..n) (scalar broadcast) ----\n\
+void convmat_rdiv_scalar(double* dst, const double* src, double n, double k) {\n\
+    int m = (int)n;\n\
+    for (int i = 0; i < m; i++) dst[i] = k / src[i];\n\
+}\n\
+";
+
+const EWDIV_C: &str = "\
+// ---- convmat_ewdiv: dst[0..n) = a[0..n) ./ b[0..n) (elementwise) ----\n\
+void convmat_ewdiv(double* dst, const double* a, const double* b, double n) {\n\
+    int m = (int)n;\n\
+    for (int i = 0; i < m; i++) dst[i] = a[i] / b[i];\n\
+}\n\
+";
+
+const INV_C: &str = "\
+// ---- convmat_inv: dst (n x n) = inverse of a (n x n), Gauss-Jordan with\n\
+// partial pivoting. A singular input yields a zero matrix. ----\n\
+void convmat_inv(double* dst, const double* a, double n) {\n\
+    int m = (int)n;\n\
+    double* aug = new double[m * 2 * m];\n\
+    for (int i = 0; i < m; i++) {\n\
+        for (int j = 0; j < m; j++) {\n\
+            aug[i + j * m] = a[i + j * m];\n\
+            aug[i + (j + m) * m] = (i == j) ? 1.0 : 0.0;\n\
+        }\n\
+    }\n\
+    for (int k = 0; k < m; k++) {\n\
+        int piv = k;\n\
+        double best = std::fabs(aug[k + k * m]);\n\
+        for (int i = k + 1; i < m; i++) {\n\
+            double v = std::fabs(aug[i + k * m]);\n\
+            if (v > best) { best = v; piv = i; }\n\
+        }\n\
+        if (best == 0.0) {\n\
+            for (int i = 0; i < m * m; i++) dst[i] = 0.0;\n\
+            delete[] aug;\n\
+            return;\n\
+        }\n\
+        if (piv != k) {\n\
+            for (int j = 0; j < 2 * m; j++) {\n\
+                double t = aug[k + j * m];\n\
+                aug[k + j * m] = aug[piv + j * m];\n\
+                aug[piv + j * m] = t;\n\
+            }\n\
+        }\n\
+        double d = aug[k + k * m];\n\
+        for (int j = 0; j < 2 * m; j++) aug[k + j * m] /= d;\n\
+        for (int i = 0; i < m; i++) {\n\
+            if (i == k) continue;\n\
+            double f = aug[i + k * m];\n\
+            for (int j = 0; j < 2 * m; j++) aug[i + j * m] -= f * aug[k + j * m];\n\
+        }\n\
+    }\n\
+    for (int i = 0; i < m; i++)\n\
+        for (int j = 0; j < m; j++) dst[i + j * m] = aug[i + (j + m) * m];\n\
+    delete[] aug;\n\
+}\n\
+";
+
+const DET_C: &str = "\
+// ---- convmat_det: determinant of a (n x n) via LU with partial pivoting ----\n\
+double convmat_det(const double* a, double n) {\n\
+    int m = (int)n;\n\
+    double* lu = new double[m * m];\n\
+    for (int i = 0; i < m * m; i++) lu[i] = a[i];\n\
+    double det = 1.0;\n\
+    for (int k = 0; k < m; k++) {\n\
+        int piv = k;\n\
+        double best = std::fabs(lu[k + k * m]);\n\
+        for (int i = k + 1; i < m; i++) {\n\
+            double v = std::fabs(lu[i + k * m]);\n\
+            if (v > best) { best = v; piv = i; }\n\
+        }\n\
+        if (best == 0.0) { det = 0.0; break; }\n\
+        if (piv != k) {\n\
+            for (int j = 0; j < m; j++) {\n\
+                double t = lu[k + j * m];\n\
+                lu[k + j * m] = lu[piv + j * m];\n\
+                lu[piv + j * m] = t;\n\
+            }\n\
+            det = -det;\n\
+        }\n\
+        det *= lu[k + k * m];\n\
+        for (int i = k + 1; i < m; i++) {\n\
+            double f = lu[i + k * m] / lu[k + k * m];\n\
+            for (int j = k; j < m; j++) lu[i + j * m] -= f * lu[k + j * m];\n\
+        }\n\
+    }\n\
+    delete[] lu;\n\
+    return det;\n\
+}\n\
+";
+
+const NORM_C: &str = "\
+// ---- convmat_norm: 2-norm of a vector a[0..n) ----\n\
+double convmat_norm(const double* a, double n) {\n\
+    int m = (int)n;\n\
+    double s = 0.0;\n\
+    for (int i = 0; i < m; i++) s += a[i] * a[i];\n\
+    return std::sqrt(s);\n\
+}\n\
+";
+
+const SOLVE_C: &str = "\
+// ---- convmat_solve: X (n x k) solves A (n x n) X = B (n x k), Gaussian\n\
+// elimination with partial pivoting. A singular system yields a zero X. ----\n\
+void convmat_solve(double* dst, const double* a, const double* b, double n, double k) {\n\
+    int m = (int)n, kk = (int)k;\n\
+    double* aug = new double[m * (m + kk)];\n\
+    for (int i = 0; i < m; i++) {\n\
+        for (int j = 0; j < m; j++) aug[i + j * m] = a[i + j * m];\n\
+        for (int j = 0; j < kk; j++) aug[i + (m + j) * m] = b[i + j * m];\n\
+    }\n\
+    for (int c = 0; c < m; c++) {\n\
+        int piv = c;\n\
+        double best = std::fabs(aug[c + c * m]);\n\
+        for (int i = c + 1; i < m; i++) {\n\
+            double v = std::fabs(aug[i + c * m]);\n\
+            if (v > best) { best = v; piv = i; }\n\
+        }\n\
+        if (best == 0.0) {\n\
+            for (int i = 0; i < m * kk; i++) dst[i] = 0.0;\n\
+            delete[] aug;\n\
+            return;\n\
+        }\n\
+        if (piv != c) {\n\
+            for (int j = 0; j < m + kk; j++) {\n\
+                double t = aug[c + j * m];\n\
+                aug[c + j * m] = aug[piv + j * m];\n\
+                aug[piv + j * m] = t;\n\
+            }\n\
+        }\n\
+        for (int i = c + 1; i < m; i++) {\n\
+            double f = aug[i + c * m] / aug[c + c * m];\n\
+            for (int j = c; j < m + kk; j++) aug[i + j * m] -= f * aug[c + j * m];\n\
+        }\n\
+    }\n\
+    for (int j = 0; j < kk; j++) {\n\
+        for (int i = m - 1; i >= 0; i--) {\n\
+            double s = aug[i + (m + j) * m];\n\
+            for (int p = i + 1; p < m; p++) s -= aug[i + p * m] * dst[p + j * m];\n\
+            dst[i + j * m] = s / aug[i + i * m];\n\
+        }\n\
+    }\n\
+    delete[] aug;\n\
+}\n\
+";
+
+const RAND_C: &str = "\
+// ---- convmat_rand: a pseudo-random double in [0, 1), xorshift64* ----\n\
+double convmat_rand(void) {\n\
+    static uint64_t state = 88172645463325252ULL;\n\
+    state ^= state << 13;\n\
+    state ^= state >> 7;\n\
+    state ^= state << 17;\n\
+    return (double)(state >> 11) * (1.0 / 9007199254740992.0);\n\
+}\n\
+";
+
 /// Lower a function that failed static triage into a runtime call.
 ///
 /// This is the single choke point where deferred code turns into a dynamic-tier
@@ -626,7 +862,32 @@ mod tests {
     /// supported runtime surface is explicit and machine-checked (see
     /// `docs/runtime.md` §9).
     const WRAPPED_HELPERS: &[&str] = &[
-        TRANSPOSE, MATMUL, MPOWER, SORT, SUM, PROD, MIN, MAX, COPY, SCALE, ADD, SUB, EWMUL, NEG,
+        TRANSPOSE,
+        MATMUL,
+        MPOWER,
+        SORT,
+        SORT_COLS,
+        SUM,
+        PROD,
+        MIN,
+        MAX,
+        COPY,
+        SCALE,
+        ADD,
+        SUB,
+        EWMUL,
+        NEG,
+        ADD_SCALAR,
+        SUB_SCALAR,
+        RSUB_SCALAR,
+        DIV_SCALAR,
+        RDIV_SCALAR,
+        EWDIV,
+        INV,
+        DET,
+        NORM,
+        SOLVE,
+        RAND,
     ];
 
     /// The dynamic-tier kernel symbols that `DYNAMIC_RUNTIME_H` declares and

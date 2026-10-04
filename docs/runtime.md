@@ -206,18 +206,27 @@ void convmat_error_throw(const char *msg);   // longjmp 到最近 armed 的 catc
    helper），作为内联 C（`src/runtime/mod.rs` 的 `DYNAMIC_RUNTIME_H` + `DYNAMIC_RUNTIME_C`），
    由 `tests/runtime.rs` 直接编译运行 C 源码验证。
 3. **seam**：把 `defer_to_runtime` 从报错改成 §6 的桥接 + 动态 ABI 调用。
-4. **逐特性接入**（🟡 A 动态形状已大幅推进）：动态形状数组形参已接「指针 + 长度」ABI
-   （`double* data, double n`），支持 `sum/prod/min/max(A)`（`convmat_*` 归约 helper）、
-   `numel/length(A)`、运行时下标 `A(i)`、`end`、`for i = 1:numel(A)` 运行时区间循环；
+4. **逐特性接入**（🟡 A 动态形状已大幅推进）：动态形状数组形参默认接「指针 + 长度」ABI
+   （`double* data, double n`），查询 `size` 的形参改为「指针 + 行 + 列」形状描述符 ABI
+   （`double* data, double rows, double cols`，按使用点驱动），支持
+   `size(A)`/`size(A,d)`、`sum/prod/min/max(A)`（`convmat_*` 归约 helper）、
+   `numel/length(A)`（描述符下 `length=max(rows,cols)`）、运行时下标 `A(i)`、`end`、
+   `for i = 1:numel(A)` 运行时区间循环；
    动态数组*输出*也已接入「缓冲 + 长度回填」ABI（`y = A(:)`→`convmat_copy`、
    `y = -A(:)`→`convmat_neg`、`y = k * A`→`convmat_scale`、`y = A(:) ± B(:)`→`convmat_add/sub`、
    `y = A(:) .* B(:)`→`convmat_ewmul`）。由 `tests/fixtures/array_*.m` + `run_*` 测试覆盖。
-   动态数组*中间值*、其他逐元素运算、cell/string、`try/catch`、动态分派待做。
-5. **运行时内建**（🟡 开始）：`sort(v)`（向量升序）已作为封装 helper `convmat_sort` 落地
-   （沿用 `helper_source` 机制，非 `convmat_value` 盒）；`find`/`mean`/`fft` 等待做。
+   **动态数组中间值已接入**：绑定到普通局部的动态数组在赋值处 `matlab.heap_alloc` 一个
+   运行期长度的堆缓冲（`new double[n]`），在**所在块末尾** `delete[]`（块作用域，故控制流内
+   赋值也安全，如循环体内每轮分配/释放）；支持中间值参与归约、与标量的 `+`/`-`/`.*`/`./`
+   广播（`convmat_*_scalar`）、以及嵌套动态子表达式（如 `A .* A + n`）。其他逐元素运算、
+   cell/string、`try/catch`、动态分派待做。
+5. **运行时内建**（🟡 进行中）：`sort(v)`（向量升序）作为封装 helper `convmat_sort` 已落地；
+   线代/随机 `inv`/`det`/`norm`/`solve`/`rand` 也已作为封装 helper 落地（同 `helper_source`
+   机制，见 §9.1）；`find`/`mean` 动态版/`fft`（需复数）等待做。
 
 > 说明：当前动态形状数组形参未经过 `convmat_value` 盒，而是走更轻的「`double*` + `double n`」
-> ABI（`matlab.ptr` 类型）——因为归约/形状内省/常量下标都能直接用裸指针表达，无需盒模型。
+> ABI（`matlab.ptr` 类型；查询 `size` 的形参加上 `rows`/`cols`）——因为归约/形状内省/常量下标
+> 都能直接用裸指针 + 描述符表达，无需盒模型。
 > `convmat_value` 盒与 §3 seam 是给**异构/动态类型**（cell、字符串、`s.(name)`、动态数组
 > *输出*）预留的。
 
@@ -238,10 +247,17 @@ void convmat_error_throw(const char *msg);   // longjmp 到最近 armed 的 catc
 | `convmat_transpose` | 2-D 转置 | `A.'` / `A'` |
 | `convmat_matmul` | 矩阵乘 `m×k · k×n` | `A * B`（矩阵） |
 | `convmat_mpower` | 方阵整数幂 `A^k`（`k≥0`） | `A ^ k` |
-| `convmat_sort` | 向量升序排序 | `sort(v)`（仅向量） |
+| `convmat_sort` | 向量升序排序 | `sort(v)` |
+| `convmat_sort_cols` | 2-D 矩阵按列升序排序 | `sort(A)`（两维均 >1） |
 | `convmat_sum` / `prod` / `min` / `max` | 动态形状数组归约 | `sum/prod/min/max(A)`（动态形参） |
-| `convmat_copy` / `neg` / `scale` | 动态数组输出：恒等 / 取负 / 标量广播乘 | `y = A(:)`、`y = -A(:)`、`y = k * A` |
-| `convmat_add` / `sub` / `ewmul` | 动态数组逐元素二元 | `y = A(:) ± B(:)`、`y = A(:) .* B(:)` |
+| `convmat_copy` / `neg` / `scale` | 动态数组：恒等 / 取负 / 标量广播乘 | `y = A(:)`、`y = -A(:)`、`y = k * A` |
+| `convmat_add` / `sub` / `ewmul` / `ewdiv` | 动态数组逐元素二元 | `A(:) ± B(:)`、`A(:) .* B(:)`、`A(:) ./ B(:)` |
+| `convmat_add_scalar` / `sub_scalar` / `rsub_scalar` / `div_scalar` / `rdiv_scalar` | 动态数组与标量的 `+`/`-`/`./` 广播 | `A + n`、`n - A`、`A ./ k`、`k ./ A` |
+| `convmat_inv` | 方阵求逆（Gauss-Jordan，部分主元） | `inv(A)`（静态方阵） |
+| `convmat_det` | 方阵行列式（LU，部分主元） | `det(A)`（静态方阵） |
+| `convmat_norm` | 向量 2-范数 | `norm(v)`（静态向量） |
+| `convmat_solve` | 方阵线性方程组 `A X = B`（高斯消元） | `A \ B`（静态方阵 `A`） |
+| `convmat_rand` | `[0,1)` 伪随机标量（xorshift64） | `rand()` |
 
 **不在本类**（编译期直接内联展开，无需 helper）：标量算术/比较/逻辑、静态数组逐元素
 与标量广播、`libm` 一元/二元内建（`sin`/`pow`/…）、常量下标读写、`zeros/ones/eye/reshape`。

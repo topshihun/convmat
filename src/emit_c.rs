@@ -51,7 +51,15 @@ pub fn emit(context: &Context, module: &ModuleOp) -> Result<String> {
     emitter.emit_struct_definitions(module);
     if let Some(block) = module.get_region(context).deref(context).get_entry_block() {
         let ops: Vec<Ptr<Operation>> = block.deref(context).iter(context).collect();
+        let mut prototypes_emitted = false;
         for op in ops {
+            // Emit every forward declaration right before the first function
+            // body, so top-level directives keep their source order and calls to
+            // later-defined functions still resolve.
+            if !prototypes_emitted && Operation::get_op::<FuncOp>(op, context).is_some() {
+                emitter.emit_function_prototypes(module);
+                prototypes_emitted = true;
+            }
             emitter.emit_top_level(op);
         }
     }
@@ -228,6 +236,63 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// Emit a C prototype for every `builtin.func` in the module, so calls to
+    /// functions defined later (e.g. a helper called before its definition) still
+    /// resolve.
+    fn emit_function_prototypes(&mut self, module: &ModuleOp) {
+        let Some(block) = module
+            .get_region(self.context)
+            .deref(self.context)
+            .get_entry_block()
+        else {
+            return;
+        };
+        let ops: Vec<Ptr<Operation>> = block.deref(self.context).iter(self.context).collect();
+        let mut protos = Vec::new();
+        for op in ops {
+            if let Some(func) = Operation::get_op::<FuncOp>(op, self.context) {
+                if let Some(proto) = self.prototype(&func) {
+                    protos.push(proto);
+                }
+            }
+        }
+        if protos.is_empty() {
+            return;
+        }
+        for proto in protos {
+            self.out.push_str(&proto);
+            self.out.push('\n');
+        }
+        self.out.push('\n');
+    }
+
+    /// The C prototype of a function (`ret name(params);`).
+    fn prototype(&mut self, func: &FuncOp) -> Option<String> {
+        let name = func.get_symbol_name(self.context).as_ref().to_string();
+        let (arg_types, res_types) = {
+            let fn_ty = func.get_type(self.context).deref(self.context);
+            let ft = fn_ty.downcast_ref::<FunctionType>()?;
+            (ft.arg_types(), ft.res_types())
+        };
+        let params: Vec<String> = arg_types
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| self.param_decl(&format!("v{}", i + 1), *ty))
+            .collect();
+        let ret = match res_types.as_slice() {
+            [] => "void".to_string(),
+            [ty] => self.c_type(*ty),
+            tys => format!(
+                "std::tuple<{}>",
+                tys.iter()
+                    .map(|ty| self.c_type(*ty))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        Some(format!("{ret} {name}({});", params.join(", ")))
+    }
+
     /// The emitted C `struct` tag name for a `matlab.struct` type, defining the
     /// struct (once) on first use.
     fn struct_type_name(&mut self, ty: TypeHandle) -> String {
@@ -308,6 +373,12 @@ impl<'a> Emitter<'a> {
                         .push_str(&format!("{pad}{static_kw}double {name}[{numel}];\n"));
                 }
             }
+        } else if let Some(_a) = Operation::get_op::<emitc::HeapAllocOp>(op, self.context) {
+            let name = self.assign_name(op);
+            let len = self.expr(op.deref(self.context).get_operand(0));
+            self.out.push_str(&format!(
+                "{pad}double* {name} = new double[(int64_t)({len})];\n"
+            ));
         } else if let Some(l) = Operation::get_op::<emitc::LiteralOp>(op, self.context) {
             let name = self.assign_name(op);
             self.out.push_str(&format!(

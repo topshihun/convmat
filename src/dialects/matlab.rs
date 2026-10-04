@@ -447,6 +447,32 @@ impl DeleteOp {
     }
 }
 
+/// Allocate a runtime-length heap buffer: `double* = new double[len]`. The
+/// result is a `matlab.ptr` owned by the enclosing function (freed on return by
+/// `matlab.delete`). Used for dynamic-shape array *intermediate* values whose
+/// element count is only known at run time.
+#[pliron_op(
+    name = "matlab.heap_alloc",
+    format,
+    interfaces = [OneOpdInterface, OneResultInterface],
+    verifier = "succ",
+)]
+pub struct HeapAllocOp;
+
+impl HeapAllocOp {
+    pub fn new(ctx: &mut Context, len: Value) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            vec![PtrType::get(ctx).into()],
+            vec![len],
+            vec![],
+            0,
+        );
+        HeapAllocOp { op }
+    }
+}
+
 /// Load a single `f64` element from an array at a linear (column-major) index.
 #[pliron_op(
     name = "matlab.load",

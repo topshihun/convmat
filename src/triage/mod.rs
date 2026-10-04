@@ -4,6 +4,11 @@
 //! deferred to the runtime (`Verdict::Deferred`). This is a function-level
 //! decision, so a program can mix compiled and runtime code.
 //!
+//! [`dispatch`] is the compile-time dispatch phase built on this boundary: it
+//! resolves each binding's [`ValueClass`] (scalar / static matrix / runtime
+//! matrix / struct) and each function's [`Route`] into a [`FunctionPlan`] that
+//! the pipeline and `hir_to_mlir` consume without re-deriving the choice.
+//!
 //! The current implementation is a hand-written whitelist of the scalar-double
 //! subset (plus statically-shaped array literals and pure numeric built-ins).
 //! It is exposed behind [`Classifier`] so a `runmat-static-analysis`-driven
@@ -19,6 +24,10 @@ use runmat_hir::{
 };
 
 use crate::builtins::{self, Builtin};
+
+pub mod dispatch;
+
+pub use dispatch::{dispatch, FunctionPlan, Route, ValueClass};
 
 /// A per-function classification result.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +66,20 @@ impl Shape {
         dims[0] = rows;
         dims[1] = cols;
         Shape::Static { rank: 2, dims }
+    }
+
+    /// A static N-D shape from explicit dimensions (rank = `dims.len()`), or
+    /// `None` for an empty or over-rank (`> MAX_RANK`) dimension list.
+    pub fn from_dims(dims: &[usize]) -> Option<Self> {
+        if dims.is_empty() || dims.len() > MAX_RANK {
+            return None;
+        }
+        let mut out = [1; MAX_RANK];
+        out[..dims.len()].copy_from_slice(dims);
+        Some(Shape::Static {
+            rank: dims.len(),
+            dims: out,
+        })
     }
 
     /// Whether this shape is runtime-determined.
@@ -482,13 +505,22 @@ pub fn call_name(callee: &HirCallableRef) -> Option<String> {
         .and_then(|identity| identity.display_name())
 }
 
+/// Whether a call targets a user-defined function (a closed-world, same-program
+/// call), as opposed to a builtin or a dynamic/unresolved call.
+fn is_user_call(call: &HirCall) -> bool {
+    matches!(
+        call.callee,
+        HirCallableRef::Function(_) | HirCallableRef::ExternalFunction { .. }
+    )
+}
+
 fn expr_reason(expr: &HirExpr) -> Option<String> {
     match &expr.kind {
         HirExprKind::Binding(_) => None,
         HirExprKind::Number(_) | HirExprKind::IntegerLiteral(_) => None,
         HirExprKind::End | HirExprKind::Colon => None,
         HirExprKind::Constant(symbol) => match symbol.0.as_str() {
-            "true" | "false" => None,
+            "true" | "false" | "Inf" | "Infinity" | "NaN" => None,
             other => Some(format!("unsupported constant `{other}`")),
         },
         HirExprKind::Unary(op, operand) => {
@@ -538,6 +570,11 @@ fn expr_reason(expr: &HirExpr) -> Option<String> {
 }
 
 fn call_reason(call: &HirCall) -> Option<String> {
+    // A user-defined function call (same file, closed world). The scalar-ABI
+    // subset is validated by the lowerer; non-scalar calls defer.
+    if is_user_call(call) {
+        return call.args.iter().find_map(expr_reason);
+    }
     let Some(name) = call_name(&call.callee) else {
         return Some("dynamic or non-static function call is not supported".to_string());
     };
@@ -945,21 +982,15 @@ impl Classifier for WhitelistClassifier {
             return Verdict::Deferred { reason };
         }
 
-        // Shape analysis must fully resolve every local; anything dynamic
-        // (`LocalTy::Dynamic` or a dynamic-shape array) crosses the static
-        // boundary and is deferred to the runtime. Dynamic-shape array
-        // *parameters* and *outputs* are the exceptions: they get a dedicated
-        // ABI (pointer + length), so they are allowed through here and handled
-        // (or rejected) by `hir_to_mlir`. A dynamic-shape intermediate is still
-        // deferred (it would need a runtime allocation inside the body).
-        let fixed_inputs: HashSet<BindingId> = function.abi.fixed_inputs.iter().copied().collect();
-        let fixed_outputs: HashSet<BindingId> =
-            function.abi.fixed_outputs.iter().copied().collect();
-        for (local, ty) in infer_locals(function) {
-            let abi_bound = fixed_inputs.contains(&local) || fixed_outputs.contains(&local);
+        // A dynamic-shape array local is realized by the runtime matrix tier:
+        // parameters/outputs use the pointer+length ABI, intermediates get a
+        // runtime-length heap buffer. A truly unknown type (`LocalTy::Dynamic`)
+        // still crosses the boundary, as does a struct with a dynamic field.
+        let locals = infer_locals(function);
+        for (local, ty) in &locals {
             let is_dynamic = match ty {
                 LocalTy::Dynamic => true,
-                LocalTy::Array { shape } => shape.is_dynamic() && !abi_bound,
+                LocalTy::Array { .. } => false,
                 // Struct fields must be fully static; a dynamic field defers the
                 // whole struct.
                 LocalTy::Struct { fields } => fields
@@ -1134,7 +1165,170 @@ fn array_arg_builtin(name: &str, nargs: usize) -> bool {
     match name {
         "sum" | "prod" | "reshape" | "size" | "numel" | "length" => true,
         "min" | "max" => nargs == 1,
+        "mean" | "std" | "median" | "cumsum" | "diff" => true,
+        "var" | "isempty" | "logical" | "repmat" | "permute" => true,
         _ => false,
+    }
+}
+
+/// The dynamic-shape array parameters whose size is queried with `size(...)`,
+/// which need the `(rows, cols)` shape-descriptor ABI rather than the lean
+/// `(data, n)` one (a bare element count cannot distinguish a row from a column
+/// vector). Returns the empty set for the common case.
+pub(crate) fn shape_descriptor_params(
+    function: &HirFunction,
+    tys: &HashMap<BindingId, LocalTy>,
+) -> HashSet<BindingId> {
+    let params: HashSet<BindingId> = function
+        .abi
+        .fixed_inputs
+        .iter()
+        .copied()
+        .filter(|id| matches!(tys.get(id), Some(LocalTy::Array { shape }) if shape.is_dynamic()))
+        .collect();
+    let mut used = HashSet::new();
+    if !params.is_empty() {
+        scan_shape_stmt(&function.body.statements, &params, &mut used);
+    }
+    used
+}
+
+/// Scan statements for `size(param, ...)` calls on parameters under inference.
+fn scan_shape_stmt(stmts: &[HirStmt], params: &HashSet<BindingId>, used: &mut HashSet<BindingId>) {
+    for stmt in stmts {
+        match &stmt.kind {
+            HirStmtKind::ExprStmt(expr, _) => scan_shape_expr(expr, params, used),
+            HirStmtKind::Assign(place, value, _) => {
+                scan_shape_place(place, params, used);
+                scan_shape_expr(value, params, used);
+            }
+            HirStmtKind::If {
+                cond,
+                then_body,
+                elseif_blocks,
+                else_body,
+            } => {
+                scan_shape_expr(cond, params, used);
+                scan_shape_stmt(&then_body.statements, params, used);
+                for (cond, block) in elseif_blocks {
+                    scan_shape_expr(cond, params, used);
+                    scan_shape_stmt(&block.statements, params, used);
+                }
+                if let Some(block) = else_body {
+                    scan_shape_stmt(&block.statements, params, used);
+                }
+            }
+            HirStmtKind::While { cond, body } => {
+                scan_shape_expr(cond, params, used);
+                scan_shape_stmt(&body.statements, params, used);
+            }
+            HirStmtKind::For { range, body, .. } => {
+                scan_shape_expr(range, params, used);
+                scan_shape_stmt(&body.statements, params, used);
+            }
+            HirStmtKind::Switch {
+                expr,
+                cases,
+                otherwise,
+                ..
+            } => {
+                scan_shape_expr(expr, params, used);
+                for (case, block) in cases {
+                    scan_shape_expr(case, params, used);
+                    scan_shape_stmt(&block.statements, params, used);
+                }
+                if let Some(block) = otherwise {
+                    scan_shape_stmt(&block.statements, params, used);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Scan an assignment target for `size`-relevant subexpressions.
+fn scan_shape_place(place: &HirPlace, params: &HashSet<BindingId>, used: &mut HashSet<BindingId>) {
+    match place {
+        HirPlace::Index(base, indexing) | HirPlace::IndexCell(base, indexing) => {
+            scan_shape_expr(base, params, used);
+            for component in &indexing.components {
+                if let IndexComponent::Expr(e) = component {
+                    scan_shape_expr(e, params, used);
+                }
+            }
+        }
+        HirPlace::Member(base, _) => scan_shape_expr(base, params, used),
+        HirPlace::MemberDynamic(base, expr) => {
+            scan_shape_expr(base, params, used);
+            scan_shape_expr(expr, params, used);
+        }
+        HirPlace::Binding(_) => {}
+    }
+}
+
+/// Scan an expression for `size(param, ...)` calls on parameters under
+/// inference.
+fn scan_shape_expr(expr: &HirExpr, params: &HashSet<BindingId>, used: &mut HashSet<BindingId>) {
+    match &expr.kind {
+        HirExprKind::Call(call) => {
+            if call_name(&call.callee).as_deref() == Some("size") {
+                if let Some(HirExpr {
+                    kind: HirExprKind::Binding(id),
+                    ..
+                }) = call.args.first()
+                {
+                    if params.contains(id) {
+                        used.insert(*id);
+                    }
+                }
+            }
+            for arg in &call.args {
+                scan_shape_expr(arg, params, used);
+            }
+        }
+        HirExprKind::Index(base, indexing) => {
+            scan_shape_expr(base, params, used);
+            for component in &indexing.components {
+                if let IndexComponent::Expr(e) = component {
+                    scan_shape_expr(e, params, used);
+                }
+            }
+        }
+        HirExprKind::Unary(_, operand) => scan_shape_expr(operand, params, used),
+        HirExprKind::Binary(lhs, _, rhs) => {
+            scan_shape_expr(lhs, params, used);
+            scan_shape_expr(rhs, params, used);
+        }
+        HirExprKind::Range(start, step, end) => {
+            scan_shape_expr(start, params, used);
+            if let Some(step) = step {
+                scan_shape_expr(step, params, used);
+            }
+            scan_shape_expr(end, params, used);
+        }
+        HirExprKind::Tensor(rows) | HirExprKind::Cell(rows) => {
+            for row in rows {
+                for element in row {
+                    scan_shape_expr(element, params, used);
+                }
+            }
+        }
+        HirExprKind::Member(base, _) => scan_shape_expr(base, params, used),
+        HirExprKind::MemberDynamic(base, expr) => {
+            scan_shape_expr(base, params, used);
+            scan_shape_expr(expr, params, used);
+        }
+        HirExprKind::StructLiteral(pairs) => {
+            for (_, value) in pairs {
+                scan_shape_expr(value, params, used);
+            }
+        }
+        HirExprKind::ObjectLiteral { fields: pairs, .. } => {
+            for (_, value) in pairs {
+                scan_shape_expr(value, params, used);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1509,7 +1703,7 @@ pub(crate) fn expr_ty(
         HirExprKind::Binding(id) => tys.get(id).cloned().unwrap_or(LocalTy::Scalar),
         HirExprKind::Number(_) | HirExprKind::IntegerLiteral(_) => LocalTy::Scalar,
         HirExprKind::Constant(symbol) => match symbol.0.as_str() {
-            "true" | "false" => LocalTy::Scalar,
+            "true" | "false" | "Inf" | "Infinity" | "NaN" => LocalTy::Scalar,
             _ => LocalTy::Dynamic,
         },
         HirExprKind::Unary(op, operand) => {
@@ -1520,9 +1714,20 @@ pub(crate) fn expr_ty(
             *op,
             expr_ty(rhs, tys, varargin_local, handles),
         ),
-        HirExprKind::Tensor(rows) => LocalTy::Array {
-            shape: Shape::matrix(rows.len(), rows.first().map_or(0, |row| row.len())),
-        },
+        HirExprKind::Tensor(rows) => {
+            let elem_shapes: Option<Vec<Vec<Shape>>> = rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|e| concat_operand_shape(&expr_ty(e, tys, varargin_local, handles)))
+                        .collect::<Option<Vec<_>>>()
+                })
+                .collect();
+            match elem_shapes.and_then(|shapes| concat_shape(&shapes)) {
+                Some(shape) => LocalTy::Array { shape },
+                None => LocalTy::Dynamic,
+            }
+        }
         HirExprKind::Cell(_) => LocalTy::Dynamic,
         HirExprKind::Call(call) => call_ty(call, tys, handles),
         HirExprKind::Member(base, name) => match expr_ty(base, tys, varargin_local, handles) {
@@ -1612,15 +1817,45 @@ fn binary_ty(lhs: LocalTy, op: OperatorKind, rhs: LocalTy) -> LocalTy {
                 Dynamic
             }
         }
-        // Two arrays: elementwise when the shapes agree; `*` is a matmul; `^`
-        // (matrix ^ matrix) is not defined and is deferred.
+        // Two arrays: elementwise (with implicit singleton expansion) when the
+        // shapes are broadcast-compatible; `*` is a matmul; `^` (matrix ^ matrix)
+        // is not defined and is deferred.
         (Array { shape: lhs_shape }, Array { shape: rhs_shape }) => match op {
             OperatorKind::MatrixMultiply => matmul_ty(lhs_shape, rhs_shape),
+            OperatorKind::Mldivide => mldivide_ty(lhs_shape, rhs_shape),
             OperatorKind::MatrixPower => Dynamic,
-            _ if lhs_shape == rhs_shape && is_elementwise(op) => Array { shape: lhs_shape },
+            _ if is_elementwise(op) => match broadcast_shape(lhs_shape, rhs_shape) {
+                Some(shape) => Array { shape },
+                // Two dynamic-shape (vector) arrays of equal runtime length.
+                None if lhs_shape.is_dynamic() && rhs_shape.is_dynamic() => Array {
+                    shape: Shape::Dynamic,
+                },
+                None => Dynamic,
+            },
             _ => Dynamic,
         },
     }
+}
+
+/// The result shape of implicit singleton expansion (MATLAB broadcasting) for
+/// two static 2-D shapes, or `None` when they are not broadcast-compatible.
+pub(crate) fn broadcast_shape(lhs: Shape, rhs: Shape) -> Option<Shape> {
+    if lhs.is_dynamic() || rhs.is_dynamic() || lhs.rank() != 2 || rhs.rank() != 2 {
+        return None;
+    }
+    let mut dims = Vec::with_capacity(2);
+    for (&l, &r) in lhs.dims().iter().zip(rhs.dims()) {
+        dims.push(if l == r {
+            l
+        } else if l == 1 {
+            r
+        } else if r == 1 {
+            l
+        } else {
+            return None;
+        });
+    }
+    Shape::from_dims(&dims)
 }
 
 /// The shape of `A * B` for two 2-D operands (`m x k` times `k x n`).
@@ -1637,7 +1872,40 @@ fn matmul_ty(lhs: Shape, rhs: Shape) -> LocalTy {
     }
 }
 
+/// The shape of `A \ B` for two static 2-D operands: solving `A X = B` with a
+/// square `A` gives an `n x k` result.
+fn mldivide_ty(lhs: Shape, rhs: Shape) -> LocalTy {
+    if lhs.is_dynamic() || rhs.is_dynamic() {
+        return LocalTy::Dynamic;
+    }
+    if lhs.rank() == 2
+        && rhs.rank() == 2
+        && lhs.dims()[0] == lhs.dims()[1]
+        && lhs.dims()[0] == rhs.dims()[0]
+    {
+        LocalTy::Array {
+            shape: Shape::matrix(lhs.dims()[1], rhs.dims()[1]),
+        }
+    } else {
+        LocalTy::Dynamic
+    }
+}
+
 fn call_ty(call: &HirCall, tys: &HashMap<BindingId, LocalTy>, handles: &HandleTargets) -> LocalTy {
+    // A user-defined function call: the scalar-ABI subset (all scalar args,
+    // single scalar result) is lowered directly; arrays defer.
+    if is_user_call(call) {
+        let args: Vec<LocalTy> = call
+            .args
+            .iter()
+            .map(|arg| expr_ty(arg, tys, None, handles))
+            .collect();
+        return if args.iter().all(|ty| matches!(ty, LocalTy::Scalar)) {
+            LocalTy::Scalar
+        } else {
+            LocalTy::Dynamic
+        };
+    }
     let Some(name) = call_name(&call.callee) else {
         return LocalTy::Dynamic;
     };
@@ -1683,10 +1951,69 @@ fn call_ty(call: &HirCall, tys: &HashMap<BindingId, LocalTy>, handles: &HandleTa
                 LocalTy::Scalar
             }
         }
+        // Scalar reductions. `mean` accepts a dynamic-shape (vector) parameter;
+        // `std`/`median`/`var` are static-only (they need a compile-time temp).
+        Builtin::Mean => match args.as_slice() {
+            [LocalTy::Scalar] => LocalTy::Scalar,
+            [LocalTy::Array { shape }] if is_vector_shape(*shape) => LocalTy::Scalar,
+            _ => LocalTy::Dynamic,
+        },
+        Builtin::Std | Builtin::Median | Builtin::Var => match args.as_slice() {
+            [LocalTy::Scalar] => LocalTy::Scalar,
+            [LocalTy::Array { shape }] if is_static_vector(*shape) => LocalTy::Scalar,
+            _ => LocalTy::Dynamic,
+        },
+        // `isempty` is a scalar predicate; `logical` is elementwise.
+        Builtin::IsEmpty => LocalTy::Scalar,
+        Builtin::Logical => args.first().cloned().unwrap_or(LocalTy::Dynamic),
+        // Array constructors with constant shape controls.
+        Builtin::LinSpace => {
+            let n = constant_arg(call, 2).unwrap_or(100);
+            LocalTy::Array {
+                shape: Shape::matrix(1, n),
+            }
+        }
+        Builtin::Repmat => repmat_ty(call, &args),
+        Builtin::Permute => permute_ty(call, &args),
+        // Linear algebra on static square matrices / vectors.
+        Builtin::Inv => match args.first() {
+            Some(LocalTy::Array { shape }) if is_static_square(*shape) => {
+                LocalTy::Array { shape: *shape }
+            }
+            _ => LocalTy::Dynamic,
+        },
+        Builtin::Det => match args.first() {
+            Some(LocalTy::Scalar) => LocalTy::Scalar,
+            Some(LocalTy::Array { shape }) if is_static_square(*shape) => LocalTy::Scalar,
+            _ => LocalTy::Dynamic,
+        },
+        Builtin::Norm => match args.first() {
+            Some(LocalTy::Scalar) => LocalTy::Scalar,
+            Some(LocalTy::Array { shape }) if is_static_vector(*shape) => LocalTy::Scalar,
+            _ => LocalTy::Dynamic,
+        },
+        Builtin::Rand => LocalTy::Scalar,
+        // `cumsum` preserves the operand's shape; `diff` shortens a vector by one.
+        Builtin::CumSum => match args.as_slice() {
+            [LocalTy::Scalar] => LocalTy::Scalar,
+            [LocalTy::Array { shape }] if is_static_vector(*shape) => {
+                LocalTy::Array { shape: *shape }
+            }
+            _ => LocalTy::Dynamic,
+        },
+        Builtin::Diff => match args.as_slice() {
+            [LocalTy::Array { shape }] => match diff_result_shape(*shape) {
+                Some(shape) => LocalTy::Array { shape },
+                None => LocalTy::Dynamic,
+            },
+            _ => LocalTy::Dynamic,
+        },
         // Everything else in the supported set is scalar-valued.
         Builtin::Binary(_) | Builtin::Mod | Builtin::Sign => LocalTy::Scalar,
-        // Constructors and reshape: array shapes from constant dim arguments.
-        Builtin::Fill(_) | Builtin::Eye => match (constant_arg(call, 0), constant_arg(call, 1)) {
+        // Constructors: array shapes from constant dim arguments (`zeros`/`ones`
+        // accept N dimensions; `eye` is 2-D).
+        Builtin::Fill(_) => fill_ty(call),
+        Builtin::Eye => match (constant_arg(call, 0), constant_arg(call, 1)) {
             (Some(n), None) => LocalTy::Array {
                 shape: Shape::matrix(n, n),
             },
@@ -1702,6 +2029,88 @@ fn call_ty(call: &HirCall, tys: &HashMap<BindingId, LocalTy>, handles: &HandleTa
             _ => LocalTy::Dynamic,
         },
     }
+}
+
+/// The shape of `zeros`/`ones` from its constant dimension arguments: one
+/// argument is a square matrix, more form an N-D array.
+fn fill_ty(call: &HirCall) -> LocalTy {
+    let mut dims = Vec::with_capacity(call.args.len());
+    for i in 0..call.args.len() {
+        match constant_arg(call, i) {
+            Some(n) => dims.push(n),
+            None => return LocalTy::Dynamic,
+        }
+    }
+    if dims.is_empty() {
+        return LocalTy::Dynamic;
+    }
+    let full = if dims.len() == 1 {
+        vec![dims[0], dims[0]]
+    } else {
+        dims
+    };
+    match Shape::from_dims(&full) {
+        Some(shape) => LocalTy::Array { shape },
+        None => LocalTy::Dynamic,
+    }
+}
+
+/// The shape of `repmat(A, m, n)` for a static 2-D `A` and constant `m`/`n`.
+fn repmat_ty(call: &HirCall, args: &[LocalTy]) -> LocalTy {
+    let Some(LocalTy::Array { shape }) = args.first() else {
+        return LocalTy::Dynamic;
+    };
+    if shape.is_dynamic() || shape.rank() != 2 {
+        return LocalTy::Dynamic;
+    }
+    let Some(m) = constant_arg(call, 1) else {
+        return LocalTy::Dynamic;
+    };
+    let n = constant_arg(call, 2).unwrap_or(m);
+    LocalTy::Array {
+        shape: Shape::matrix(shape.dims()[0] * m, shape.dims()[1] * n),
+    }
+}
+
+/// The shape of `permute(A, order)` for a static `A` and a constant `order`.
+fn permute_ty(call: &HirCall, args: &[LocalTy]) -> LocalTy {
+    let Some(LocalTy::Array { shape }) = args.first() else {
+        return LocalTy::Dynamic;
+    };
+    if shape.is_dynamic() {
+        return LocalTy::Dynamic;
+    }
+    let Some(order) = constant_int_list(call, 1) else {
+        return LocalTy::Dynamic;
+    };
+    if order.len() != shape.rank() {
+        return LocalTy::Dynamic;
+    }
+    let mut seen = vec![false; order.len()];
+    let mut dims = Vec::with_capacity(order.len());
+    for &p in &order {
+        if p == 0 || p > order.len() || seen[p - 1] {
+            return LocalTy::Dynamic;
+        }
+        seen[p - 1] = true;
+        dims.push(shape.dims()[p - 1]);
+    }
+    match Shape::from_dims(&dims) {
+        Some(shape) => LocalTy::Array { shape },
+        None => LocalTy::Dynamic,
+    }
+}
+
+/// The constant integer values of a row-vector literal argument (e.g. `[2 1]`).
+pub(crate) fn constant_int_list(call: &HirCall, index: usize) -> Option<Vec<usize>> {
+    let expr = call.args.get(index)?;
+    let HirExprKind::Tensor(rows) = &expr.kind else {
+        return None;
+    };
+    if rows.len() != 1 {
+        return None;
+    }
+    rows[0].iter().map(constant_expr_value).collect()
 }
 
 /// The type of a `struct('a', 1, 'b', 2, ...)` construction: alternating
@@ -1742,6 +2151,56 @@ fn reduction_dim(call: &HirCall) -> Option<usize> {
     constant_expr_value(&call.args[1])
 }
 
+/// The static 2-D shape of a concatenation operand: a scalar is `1x1`, a static
+/// array is its shape; a dynamic/struct operand has no static shape.
+pub(crate) fn concat_operand_shape(ty: &LocalTy) -> Option<Shape> {
+    match ty {
+        LocalTy::Scalar => Some(Shape::matrix(1, 1)),
+        LocalTy::Array { shape } if !shape.is_dynamic() => Some(*shape),
+        _ => None,
+    }
+}
+
+/// The shape of a block-concatenation literal `[a b; c d]` from its operand
+/// shapes, or `None` when they do not form a consistent block matrix (every
+/// block must be 2-D; blocks in one row share a row count; blocks in one column
+/// share a column count).
+pub(crate) fn concat_shape(rows: &[Vec<Shape>]) -> Option<Shape> {
+    if rows.is_empty() || rows[0].is_empty() {
+        return None;
+    }
+    let cols = rows[0].len();
+    if rows.iter().any(|row| row.len() != cols) {
+        return None;
+    }
+    if rows
+        .iter()
+        .flatten()
+        .any(|shape| shape.is_dynamic() || shape.rank() != 2)
+    {
+        return None;
+    }
+    let mut heights = Vec::with_capacity(rows.len());
+    for row in rows {
+        let h = row[0].dims()[0];
+        if row.iter().any(|shape| shape.dims()[0] != h) {
+            return None;
+        }
+        heights.push(h);
+    }
+    let mut widths = Vec::with_capacity(cols);
+    for c in 0..cols {
+        let w = rows[0][c].dims()[1];
+        if rows.iter().any(|row| row[c].dims()[1] != w) {
+            return None;
+        }
+        widths.push(w);
+    }
+    let total_rows: usize = heights.iter().sum();
+    let total_cols: usize = widths.iter().sum();
+    Some(Shape::matrix(total_rows, total_cols))
+}
+
 /// The shape of reducing a 2-D array along dimension `dim` (1 or 2).
 fn reduce_axis_ty(shape: Shape, dim: usize) -> LocalTy {
     let Shape::Static { rank, mut dims } = shape else {
@@ -1760,44 +2219,275 @@ fn reduce_axis_ty(shape: Shape, dim: usize) -> LocalTy {
     }
 }
 
+/// Whether a shape is a vector (rank-2 with a singleton dimension). A
+/// dynamic-shape array parameter is treated as a vector by the runtime ABI.
+fn is_vector_shape(shape: Shape) -> bool {
+    match shape {
+        Shape::Dynamic => true,
+        Shape::Static { rank, dims } => rank == 2 && (dims[0] == 1 || dims[1] == 1),
+    }
+}
+
+/// Whether a shape is a statically-known vector.
+fn is_static_vector(shape: Shape) -> bool {
+    !shape.is_dynamic() && is_vector_shape(shape)
+}
+
+/// Whether a shape is a statically-known square matrix.
+fn is_static_square(shape: Shape) -> bool {
+    matches!(shape, Shape::Static { rank: 2, dims } if dims[0] == dims[1])
+}
+
+/// The shape of `diff` of a static vector (one element shorter), if defined.
+fn diff_result_shape(shape: Shape) -> Option<Shape> {
+    let Shape::Static { rank, dims } = shape else {
+        return None;
+    };
+    if rank != 2 {
+        return None;
+    }
+    let mut out = dims;
+    if out[0] == 1 && out[1] >= 2 {
+        out[1] -= 1;
+    } else if out[1] == 1 && out[0] >= 2 {
+        out[0] -= 1;
+    } else {
+        return None;
+    }
+    Some(Shape::Static { rank: 2, dims: out })
+}
+
 /// The type of an indexing expression `base(...)`.
 fn index_ty(base: LocalTy, indexing: &IndexingSemantics) -> LocalTy {
     let LocalTy::Array { shape } = base else {
         return LocalTy::Dynamic;
     };
-    let has_colon = indexing.components.iter().any(component_is_colon);
-    if has_colon {
-        // `A(:)` flattens to a column vector; other slices are deferred.
-        if indexing.components.len() == 1 && component_is_colon(&indexing.components[0]) {
-            if shape.is_dynamic() {
-                LocalTy::Array {
-                    shape: Shape::Dynamic,
-                }
-            } else {
-                LocalTy::Array {
+    let comps = indexing.components.as_slice();
+
+    if shape.is_dynamic() {
+        // `A(:)` on a dynamic vector is the identity; a scalar/tuntime subscript
+        // yields a scalar element (the parameter is treated as a vector; see
+        // `hir_to_mlir`).
+        if comps.len() == 1 && component_is_colon(&comps[0]) {
+            return LocalTy::Array {
+                shape: Shape::Dynamic,
+            };
+        }
+        return LocalTy::Scalar;
+    }
+
+    if shape.rank() != 2 {
+        return static_or_dynamic_scalar(comps);
+    }
+
+    match comps {
+        // Linear indexing: `A(:)` columnizes; a constant range keeps a vector's
+        // orientation; a scalar subscript is an element (scalar).
+        [c] => {
+            if component_is_colon(c) {
+                return LocalTy::Array {
                     shape: Shape::matrix(shape.numel(), 1),
+                };
+            }
+            if !is_scalar_selector(c) {
+                if let Some(sel) = component_selection(c, shape.numel()) {
+                    let k = sel.len();
+                    return LocalTy::Array {
+                        shape: if shape.dims()[0] == 1 {
+                            Shape::matrix(1, k)
+                        } else {
+                            Shape::matrix(k, 1)
+                        },
+                    };
                 }
             }
-        } else {
-            LocalTy::Dynamic
+            static_or_dynamic_scalar(comps)
         }
-    } else if shape.is_dynamic() {
-        // A scalar subscript into a dynamic-shape array yields a scalar element
-        // (the parameter is treated as a vector; see `hir_to_mlir`).
+        // Two subscripts: a slice `A(i,:)` / `A(:,j)` / `A(i0:i1, j0:j1)`; two
+        // scalar selectors are an element (scalar).
+        [r, c] => {
+            let (Some(rows), Some(cols)) = (
+                component_selection(r, shape.dims()[0]),
+                component_selection(c, shape.dims()[1]),
+            ) else {
+                return static_or_dynamic_scalar(comps);
+            };
+            if is_scalar_selector(r) && is_scalar_selector(c) {
+                LocalTy::Scalar
+            } else {
+                LocalTy::Array {
+                    shape: Shape::matrix(rows.len(), cols.len()),
+                }
+            }
+        }
+        _ => static_or_dynamic_scalar(comps),
+    }
+}
+
+/// A scalar subscript (all components constant / `end`) is a scalar element;
+/// anything else is deferred.
+fn static_or_dynamic_scalar(comps: &[IndexComponent]) -> LocalTy {
+    if static_scalar_subscript(comps) {
         LocalTy::Scalar
     } else {
-        // A scalar subscript read requires every component to be a constant or
-        // `end`. Anything else (variable subscript or logical indexing) is
-        // deferred to the runtime.
-        let all_static = indexing.components.iter().all(|component| {
-            component_end_offset(component).is_some()
-                || matches!(component, IndexComponent::Expr(expr) if constant_expr_value(expr).is_some())
-        });
-        if all_static {
-            LocalTy::Scalar
-        } else {
-            LocalTy::Dynamic
+        LocalTy::Dynamic
+    }
+}
+
+/// Whether every index component is a constant scalar or `end` (a scalar
+/// subscript).
+fn static_scalar_subscript(comps: &[IndexComponent]) -> bool {
+    !comps.is_empty()
+        && comps.iter().all(|c| {
+            component_end_offset(c).is_some()
+                || matches!(c, IndexComponent::Expr(e) if constant_expr_value(e).is_some())
+        })
+}
+
+/// Whether a component selects one position without a range (`i` or `end`), as
+/// opposed to `:` or a range.
+fn is_scalar_selector(component: &IndexComponent) -> bool {
+    if component_is_colon(component) {
+        return false;
+    }
+    if component_end_offset(component).is_some() {
+        return true;
+    }
+    match component {
+        IndexComponent::Expr(e) => {
+            !matches!(e.kind, HirExprKind::Range(..)) && constant_expr_value(e).is_some()
         }
+        _ => false,
+    }
+}
+
+/// The 0-based positions selected by an index component along a dimension of
+/// length `dim`: `:` selects all, `i`/`end±k` selects one, a constant range
+/// selects its values. `None` when not statically resolvable.
+fn component_selection(component: &IndexComponent, dim: usize) -> Option<Vec<usize>> {
+    if component_is_colon(component) {
+        return Some((0..dim).collect());
+    }
+    if let Some(offset) = component_end_offset(component) {
+        let idx = dim as isize + offset;
+        if idx < 1 || idx as usize > dim {
+            return None;
+        }
+        return Some(vec![idx as usize - 1]);
+    }
+    let IndexComponent::Expr(expr) = component else {
+        return None;
+    };
+    if let HirExprKind::Range(start, step, end) = &expr.kind {
+        let vals = range_values(start, step.as_deref(), end, dim)?;
+        return vals
+            .into_iter()
+            .map(|v| {
+                if v >= 1 && v as usize <= dim {
+                    Some(v as usize - 1)
+                } else {
+                    None
+                }
+            })
+            .collect();
+    }
+    constant_expr_value(expr).and_then(|v| {
+        if v >= 1 && v <= dim {
+            Some(vec![v - 1])
+        } else {
+            None
+        }
+    })
+}
+
+/// The source linear (column-major) index of each element of `base(indexing)`,
+/// for a statically-shaped rank-2 base, in destination (column-major) order.
+/// `None` when the selection is not statically resolvable.
+pub(crate) fn static_index_selection(
+    base: Shape,
+    indexing: &IndexingSemantics,
+) -> Option<Vec<usize>> {
+    if base.is_dynamic() || base.rank() != 2 {
+        return None;
+    }
+    let comps = indexing.components.as_slice();
+    match comps {
+        [c] => {
+            if component_is_colon(c) {
+                return Some((0..base.numel()).collect());
+            }
+            component_selection(c, base.numel())
+        }
+        [r, c] => {
+            let rows = component_selection(r, base.dims()[0])?;
+            let cols = component_selection(c, base.dims()[1])?;
+            let mut out = Vec::with_capacity(rows.len() * cols.len());
+            for &col in &cols {
+                for &row in &rows {
+                    out.push(base.linear(&[row, col]));
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// The 1-based values of a constant range `start:step:end`, with `end` resolved
+/// against `dim`.
+fn range_values(
+    start: &HirExpr,
+    step: Option<&HirExpr>,
+    end: &HirExpr,
+    dim: usize,
+) -> Option<Vec<isize>> {
+    let s = int_value(start, dim)?;
+    let e = int_value(end, dim)?;
+    let st = match step {
+        Some(expr) => int_value(expr, dim)?,
+        None => 1,
+    };
+    if st == 0 {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut v = s;
+    if st > 0 {
+        while v <= e {
+            out.push(v);
+            v += st;
+        }
+    } else {
+        while v >= e {
+            out.push(v);
+            v += st;
+        }
+    }
+    Some(out)
+}
+
+/// The constant integer value of an expression, with `end`/`end±k` resolved
+/// against `dim` (1-based).
+fn int_value(expr: &HirExpr, dim: usize) -> Option<isize> {
+    if let Some(offset) = expr_end_offset(expr) {
+        return Some(dim as isize + offset);
+    }
+    match &expr.kind {
+        HirExprKind::Number(text) => text.trim().parse::<isize>().ok(),
+        HirExprKind::IntegerLiteral(literal) => Some(literal.bits() as isize),
+        HirExprKind::Unary(op, operand) if *op == OperatorKind::UnaryMinus => {
+            int_value(operand, dim).and_then(|v| v.checked_neg())
+        }
+        HirExprKind::Binary(lhs, op, rhs) => {
+            let l = int_value(lhs, dim)?;
+            let r = int_value(rhs, dim)?;
+            match op {
+                OperatorKind::Add => l.checked_add(r),
+                OperatorKind::Subtract => l.checked_sub(r),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 

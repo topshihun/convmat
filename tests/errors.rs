@@ -44,7 +44,7 @@ fn matrix_power_non_square_rejected() {
 
 #[test]
 fn unsupported_builtin_rejected() {
-    assert_not_lowerable("unsupported_builtin", "unsupported builtin `mean`");
+    assert_not_lowerable("unsupported_builtin", "unsupported builtin `fft`");
 }
 
 #[test]
@@ -83,36 +83,6 @@ fn cell_literal_rejected() {
     // Cell arrays are deferred: a heterogeneous cell cannot map to a fixed C
     // type without a runtime cell ABI (see docs/architecture.md §10.5).
     assert_not_lowerable("cell_literal", "cell array literals are not supported yet");
-}
-
-#[test]
-fn dynamic_array_add_rejected() {
-    // A dynamic array combined with a scalar under a non-`*` operator (here
-    // `(A .* A) + n`) is deferred; only `.*`/`*` scalar broadcast is supported.
-    assert_not_lowerable(
-        "array_sq",
-        "only `.*`/`*` scalar broadcast is supported for dynamic arrays",
-    );
-}
-
-#[test]
-fn dynamic_array_intermediate_rejected() {
-    // A dynamic-shape array bound to a plain local (neither a parameter nor an
-    // output) needs a runtime allocation inside the body; it is deferred.
-    assert_not_lowerable("array_intermediate", "unresolved shape");
-}
-
-#[test]
-fn dynamic_array_size_rejected() {
-    // `size(A)` of a dynamic array parameter is ambiguous (row vs column), so it
-    // is deferred rather than crashing on the missing static dimensions.
-    assert_not_lowerable("array_size", "dynamic size");
-}
-
-#[test]
-fn matrix_sort_rejected() {
-    // `sort` on a matrix (column sort) is not supported yet; only vectors.
-    assert_not_lowerable("sort_matrix", "sort is only supported for vectors");
 }
 
 #[test]

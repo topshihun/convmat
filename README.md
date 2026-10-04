@@ -19,21 +19,39 @@ End-to-end codegen works for a growing subset of MATLAB:
   operator is lowerable; `^` / `.^` lower to `libm::pow` (scalar) or a `convmat_mpower`
   runtime call (square-matrix integer power).
 - **Wrapped runtime helpers**: transpose (`convmat_transpose`), matrix multiply
-  (`convmat_matmul`), and integer matrix power (`convmat_mpower`) are emitted as
+  (`convmat_matmul`), integer matrix power (`convmat_mpower`), square-matrix
+  inverse/determinant/left-division (`convmat_inv`/`convmat_det`/`convmat_solve`),
+  vector 2-norm (`convmat_norm`) and `rand` (`convmat_rand`) are emitted as
   calls to a small C runtime library (`src/runtime`) — emitted only when used —
   instead of unrolled loops; see `docs/architecture.md` §10.2.1.
 - **Pure numeric built-ins** (`sin`/`cos`/`sqrt`/`abs`/`floor`/…,
   `sum`/`prod`/`min`/`max` with an optional dimension, `numel`/`length`/`size`,
   `zeros`/`ones`/`eye`, `reshape`, `sort`) lowered to `libm` calls.
+- **Statistics, differences and predicates**: `mean`/`std`/`median`/`var` (vector
+  reductions to a scalar), `cumsum`/`diff` (array results), and
+  `isnan`/`isinf`/`isempty`/`logical` and `Inf`/`NaN` literals.
+- **Linear algebra & random** (static square matrices / vectors): `inv`, `det`,
+  `norm` (vector 2-norm), `A \ b` (square linear solve) and `rand()`.
+- **Array constructors & shape ops**: block concatenation `[a b; c d]`, implicit
+  singleton expansion (`A + b`), slices `A(i,:)`/`A(:,j)` and ranges `A(a:b:c)`,
+  N-D arrays, `linspace`, `repmat`, `permute`.
 - **Structs** (scalar fields): `struct('a', 1, …)` construction, `s.a` read/write,
   and struct pass-by-value parameters / returns. Struct parameter layouts are
   inferred from field use (`s.a`), matching MATLAB Coder's use-site inference.
 - **Dynamic-shape array parameters** as `(double* data, double n)`: reduce
   (`sum`/`prod`/`min`/`max`), `numel`/`length`, runtime indexing `A(i)` / `end`, and
   runtime-bound loops (`for i = 1:numel(A)`) over a parameter whose size is only
-  known at run time. **Dynamic-shape array outputs** use an out-buffer plus an
+  known at run time. Parameters whose size is queried (`size(A)` / `size(A, d)`)
+  instead use a `(double* data, double rows, double cols)` **shape-descriptor** ABI
+  (usage-driven, so lean parameters keep the shorter signature). **Dynamic-shape
+  array outputs** use an out-buffer plus an
   out-length cell the callee fills (`y = A(:)`, `y = -A(:)`, `y = k * A`,
-  `y = A(:) + B(:)`, `y = A(:) .* B(:)`); see `docs/architecture.md` §5, §10.5 P7.
+  `y = A(:) + B(:)`, `y = A(:) .* B(:)`). **Dynamic-shape array intermediates**
+  are heap-allocated at run time (`matlab.heap_alloc` → `new double[n]`) and freed
+  at the end of the block that allocated them (block-scoped, so a `t = A(:)`
+  inside a loop allocates and frees each iteration); they support scalar broadcast
+  (`+`/`-`/`.*`/`./`) and nested dynamic subexpressions (`y = A .* A + n`); see
+  `docs/architecture.md` §5, §10.5 P7 and `docs/runtime.md` §8–§9.
 - **Indexing**: constant subscript `A(i,j)`, linear `A(i)`, `end`, and `A(:)`.
 - **Variadic arguments (closed-world specialization)**: `nargin`/`nargout` fold to
   compile-time constants; `varargin{k}` (constant `k`) resolves to the `k`-th extra
@@ -45,6 +63,9 @@ End-to-end codegen works for a growing subset of MATLAB:
   compile time to a helper whose captured variables are passed as extra
   arguments, snapshotted at creation (MATLAB capture-by-value semantics); see
   `docs/architecture.md` §13.
+- **Closed-world user-function calls** within one file, for the scalar ABI (all
+  scalar inputs, a single scalar output), including recursion. The C emitter
+  forward-declares every function so calls to later-defined functions resolve.
 - **Layered, dialect-based optimizations** (`src/passes`, on pliron's pass framework):
   `matlab`-dialect semantic passes (constant folding, scalar-cell constant
   propagation, dead-branch elimination, dead-value elimination) run after
@@ -128,9 +149,10 @@ cargo clippy --all-targets -- -D warnings
 - `runmat-static-analysis`-driven type/shape inference (dynamic shapes); the
   current boundary is a lightweight local inference over the static-from-literal
   subset.
-- Full matrix linear algebra: `mrdivide`/`mldivide` (`/` `\`) at the matrix level,
-  `scalar ^ matrix` (`expm`), `matrix ^ matrix`, non-integer/negative matrix
-  power, array-array broadcasting, N-D transpose.
+- Full matrix linear algebra: `mrdivide` (`/`) at the matrix level and
+  `mldivide` (`\`) for non-square/least-squares systems, `scalar ^ matrix`
+  (`expm`), `matrix ^ matrix`, non-integer/negative matrix power, array-array
+  broadcasting, N-D transpose.
 - Remaining shape transforms: `permute`/`repmat`/`cat`/`horzcat`/`vertcat`.
 - Advanced indexing: `A(i,:)` / `A(:,j)` slices, colon ranges, variable indices.
 - Optimization passes (CSE / canonicalize / linalg fusion / vectorization); the

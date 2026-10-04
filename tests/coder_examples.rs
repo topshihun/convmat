@@ -1,13 +1,17 @@
-//! Survey of the MATLAB Coder example programs in `examples/coder/`.
+//! Survey of the MATLAB Coder test cases in `examples/coder/`.
 //!
-//! Every example is compiled end-to-end to C. The [`EXPECTED`] table records
-//! whether convmat's current codegen subset covers each example; the test fails
-//! if an example is missing from the table or its outcome changes, so it doubles
-//! as a coverage regression guard. Examples marked supported are additionally
-//! compiled together with a tiny `main` driver and run, so the survey also
-//! checks runtime behavior, not just that C was produced.
+//! Every `.m` file is compiled end-to-end to C. [`SUPPORTED`] lists the examples
+//! convmat currently lowers; every other file is a tracked roadmap item that is
+//! expected to fail until its feature lands. The survey fails if an example's
+//! outcome disagrees with that classification, so landing a feature is a
+//! deliberate "promote it into `SUPPORTED`" step; the failure names the example
+//! and shows the compiler error.
+//!
+//! Examples in `SUPPORTED` are also linked with a tiny `main` driver and run, so
+//! "supported" means the generated C both compiles and produces the right
+//! answer. Run `cargo test --test coder_examples -- --ignored --nocapture` for a
+//! report of every example and why the unsupported ones are rejected.
 
-use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -18,17 +22,52 @@ use convmat::backend::BackendKind;
 use convmat::frontend::SourceFile;
 use convmat::pipeline;
 
-/// Whether each example under `examples/coder/` currently compiles. Names are
-/// file stems. A missing entry or a changed outcome fails the survey test.
-const EXPECTED: &[(&str, bool)] = &[
-    ("addone", true),
-    ("averaging_filter", false),
-    ("dijkstra", false),
-    ("fib", false),
-    ("kalmanfilter", false),
-    ("mandelbrot_count", true),
-    ("sierpinski", false),
+/// Examples that compile to correct C today. Extend this as features land.
+const SUPPORTED: &[&str] = &[
+    "addone",
+    "array_broadcast",
+    "array_col_slice",
+    "array_concat",
+    "array_linspace",
+    "array_nd",
+    "array_param_normalize",
+    "array_permute",
+    "array_repmat",
+    "array_row_slice",
+    "array_stride",
+    "averaging_filter",
+    "builtin_binary_math",
+    "builtin_clamp",
+    "builtin_cumsum",
+    "builtin_diff",
+    "builtin_mean",
+    "builtin_mean_param",
+    "builtin_median",
+    "builtin_predicates",
+    "builtin_std",
+    "fib",
+    "func_helper",
+    "func_recursion",
+    "kalmanfilter",
+    "linalg_det",
+    "linalg_inv",
+    "linalg_norm",
+    "linalg_solve",
+    "mandelbrot_count",
+    "sys_random",
+    "type_logical",
+    "value_special",
 ];
+
+/// Examples convmat currently compiles but miscompiles. They are accepted by the
+/// coverage test (they do produce C); any `#[ignore]`d expected-value test
+/// documents the intended behavior until the underlying semantics land. Empty
+/// today: the last entry (`kalmanfilter`) was fixed by modeling `isempty` of a
+/// `persistent` variable.
+const KNOWN_BUGS: &[&str] = &[];
+
+/// Tolerance for floating-point runtime comparisons.
+const TOLERANCE: f64 = 1e-9;
 
 /// The directory holding the examples.
 fn example_dir() -> PathBuf {
@@ -86,7 +125,7 @@ fn scratch_dir(name: &str) -> PathBuf {
 }
 
 /// Compile a supported example with a `main` driver and return trimmed stdout.
-fn run_example(name: &str, decls: &str, body: &str) -> String {
+fn run_program(name: &str, decls: &str, body: &str) -> String {
     let cpp = compile_example(name).expect("supported example should compile");
     let compiler = find_compiler()
         .unwrap_or_else(|| panic!("no C++ compiler found (set `CXX`); run tests need one"));
@@ -137,23 +176,46 @@ fn run_example(name: &str, decls: &str, body: &str) -> String {
     String::from_utf8_lossy(&run.stdout).trim().to_string()
 }
 
-/// Every example on disk must be classified in [`EXPECTED`], and compiling it
-/// must agree with that classification.
+/// Assert that a driver prints exactly `expected`.
+fn run_exact(name: &str, decls: &str, body: &str, expected: &str) {
+    let got = run_program(name, decls, body);
+    assert_eq!(got, expected, "`{name}` produced wrong output");
+}
+
+/// Assert that a driver prints one value per line, matching within `TOLERANCE`.
+fn run_close(name: &str, decls: &str, body: &str, expected: &[f64]) {
+    let stdout = run_program(name, decls, body);
+    let got: Vec<f64> = stdout
+        .lines()
+        .map(|line| {
+            line.trim()
+                .parse::<f64>()
+                .unwrap_or_else(|_| panic!("`{name}` printed non-numeric output: {line:?}"))
+        })
+        .collect();
+    assert_eq!(
+        got.len(),
+        expected.len(),
+        "`{name}` printed {} values, expected {}",
+        got.len(),
+        expected.len()
+    );
+    for (i, (got, want)) in got.iter().zip(expected).enumerate() {
+        assert!(
+            (got - want).abs() <= TOLERANCE * (1.0 + want.abs()),
+            "`{name}` value {i}: got {got}, expected {want}"
+        );
+    }
+}
+
+/// Each example must compile iff it is listed in [`SUPPORTED`].
 #[test]
 fn coder_examples_match_coverage() {
     let names = example_names();
     assert!(!names.is_empty(), "no examples found under examples/coder");
 
-    let expected: std::collections::BTreeMap<&str, bool> = EXPECTED
-        .iter()
-        .copied()
-        .collect::<std::collections::BTreeMap<_, _>>(
-    );
-
     for name in &names {
-        let Some(&want_ok) = expected.get(name.as_str()) else {
-            panic!("example `{name}` is missing from the EXPECTED table");
-        };
+        let want_ok = SUPPORTED.contains(&name.as_str()) || KNOWN_BUGS.contains(&name.as_str());
         let result = compile_example(name);
         assert_eq!(
             result.is_ok(),
@@ -163,37 +225,346 @@ fn coder_examples_match_coverage() {
         );
     }
 
-    let on_disk: BTreeSet<&str> = names.iter().map(String::as_str).collect();
-    for (name, _) in EXPECTED {
+    for name in SUPPORTED.iter().chain(KNOWN_BUGS) {
         assert!(
-            on_disk.contains(name),
-            "EXPECTED lists `{name}` but no `examples/coder/{name}.m` exists"
+            names.iter().any(|n| n == name),
+            "coverage lists `{name}` but no `examples/coder/{name}.m` exists"
         );
     }
 }
 
-/// The examples convmat currently covers must also behave correctly at run time.
+/// The supported examples must also behave correctly at run time.
 #[test]
 fn coder_examples_supported_run() {
     // addone(2) == 3.
-    assert_eq!(
-        run_example(
-            "addone",
-            "double addone(double);",
-            "printf(\"%g\\n\", addone(2.0));"
-        ),
-        "3"
+    run_exact(
+        "addone",
+        "double addone(double);",
+        "printf(\"%g\\n\", addone(2.0));",
+        "3",
+    );
+
+    // min(max(x, 0), 1) at the upper, lower and interior bounds.
+    run_exact(
+        "builtin_clamp",
+        "double builtin_clamp(double);",
+        "printf(\"%g\\n\", builtin_clamp(2.0));\n    \
+         printf(\"%g\\n\", builtin_clamp(-0.5));\n    \
+         printf(\"%g\\n\", builtin_clamp(0.5));",
+        "1\n0\n0.5",
     );
 
     // mandelbrot_count stays inside the set for c=0 and breaks at n=3 for c=1
     // with 10 iterations (0 -> 1 -> 2 -> 5, where |z| > 2).
-    assert_eq!(
-        run_example(
-            "mandelbrot_count",
-            "double mandelbrot_count(double, double);",
-            "printf(\"%g\\n\", mandelbrot_count(0.0, 10.0));\n    \
-             printf(\"%g\\n\", mandelbrot_count(1.0, 10.0));",
-        ),
-        "10\n3"
+    run_exact(
+        "mandelbrot_count",
+        "double mandelbrot_count(double, double);",
+        "printf(\"%g\\n\", mandelbrot_count(0.0, 10.0));\n    \
+         printf(\"%g\\n\", mandelbrot_count(1.0, 10.0));",
+        "10\n3",
     );
+
+    // atan2(4, 2) + hypot(4, 2) + mod(4, 2) + rem(4, 2); the last two are 0.
+    let expected = 4.0f64.atan2(2.0) + 4.0f64.hypot(2.0);
+    run_close(
+        "builtin_binary_math",
+        "double builtin_binary_math(double, double);",
+        "printf(\"%.17g\\n\", builtin_binary_math(4.0, 2.0));",
+        &[expected],
+    );
+
+    // mean([1 2 3 4]) == 10 / 4.
+    run_exact(
+        "builtin_mean",
+        "double builtin_mean(void);",
+        "printf(\"%g\\n\", builtin_mean());",
+        "2.5",
+    );
+
+    // mean of a dynamic-shape array parameter (pointer + length ABI).
+    run_exact(
+        "builtin_mean_param",
+        "double builtin_mean_param(double*, double);",
+        "double a[4] = {1.0, 2.0, 3.0, 4.0};\n    \
+         printf(\"%g\\n\", builtin_mean_param(a, 4.0));",
+        "2.5",
+    );
+
+    // median([3 1 2]) sorts to [1 2 3], middle element 2.
+    run_exact(
+        "builtin_median",
+        "double builtin_median(void);",
+        "printf(\"%g\\n\", builtin_median());",
+        "2",
+    );
+
+    // std([1 2 3 4]) == sqrt(5 / 3) (sample standard deviation, n - 1).
+    run_close(
+        "builtin_std",
+        "double builtin_std(void);",
+        "printf(\"%.17g\\n\", builtin_std());",
+        &[(5.0f64 / 3.0).sqrt()],
+    );
+
+    // cumsum([1 2 3 4]) == [1 3 6 10] (array result via an out-buffer).
+    run_exact(
+        "builtin_cumsum",
+        "void builtin_cumsum(double*);",
+        "double y[4];\n    builtin_cumsum(y);\n    \
+         printf(\"%g %g %g %g\\n\", y[0], y[1], y[2], y[3]);",
+        "1 3 6 10",
+    );
+
+    // diff([1 4 9 16]) == [3 5 7].
+    run_exact(
+        "builtin_diff",
+        "void builtin_diff(double*);",
+        "double y[3];\n    builtin_diff(y);\n    \
+         printf(\"%g %g %g\\n\", y[0], y[1], y[2]);",
+        "3 5 7",
+    );
+
+    // isnan/isinf: NAN -> 1, INFINITY -> 1, a finite scalar -> 0.
+    run_exact(
+        "builtin_predicates",
+        "double builtin_predicates(double);",
+        "printf(\"%g\\n\", builtin_predicates(NAN));\n    \
+         printf(\"%g\\n\", builtin_predicates(INFINITY));\n    \
+         printf(\"%g\\n\", builtin_predicates(3.0));",
+        "1\n1\n0",
+    );
+
+    // Mean-centered dynamic-shape vector: A=[1 2 3 4], mean=2.5 -> [-1.5 -0.5 0.5 1.5].
+    run_exact(
+        "array_param_normalize",
+        "void array_param_normalize(double*, double, double*, double*);",
+        "double a[4] = {1.0, 2.0, 3.0, 4.0};\n    double y[4];\n    double n = 0.0;\n    \
+         array_param_normalize(a, 4.0, y, &n);\n    \
+         printf(\"%g %g %g %g %g\\n\", y[0], y[1], y[2], y[3], n);",
+        "-1.5 -0.5 0.5 1.5 4",
+    );
+    // array_concat: [1 2] concatenated with [3 4] is [1 2 3 4]; sum is 10.
+    run_exact(
+        "array_concat",
+        "double array_concat(void);",
+        "printf(\"%g\\n\", array_concat());",
+        "10",
+    );
+
+    // A(1,:) on [1 2 3; 4 5 6] is [1 2 3].
+    run_exact(
+        "array_row_slice",
+        "void array_row_slice(double*);",
+        "double y[3];\n    array_row_slice(y);\n    \
+         printf(\"%g %g %g\\n\", y[0], y[1], y[2]);",
+        "1 2 3",
+    );
+
+    // A(:,2) on [1 2 3; 4 5 6] is [2; 5].
+    run_exact(
+        "array_col_slice",
+        "void array_col_slice(double*);",
+        "double y[2];\n    array_col_slice(y);\n    \
+         printf(\"%g %g\\n\", y[0], y[1]);",
+        "2 5",
+    );
+
+    // A(1:2:5) on [1 2 3 4 5] is [1 3 5].
+    run_exact(
+        "array_stride",
+        "void array_stride(double*);",
+        "double y[3];\n    array_stride(y);\n    \
+         printf(\"%g %g %g\\n\", y[0], y[1], y[2]);",
+        "1 3 5",
+    );
+
+    // Implicit expansion: [1 2; 3 4] + [10 20] == [11 22; 13 24] (column-major
+    // [11 13 22 24]).
+    run_exact(
+        "array_broadcast",
+        "void array_broadcast(double*);",
+        "double y[4];\n    array_broadcast(y);\n    \
+         printf(\"%g %g %g %g\\n\", y[0], y[1], y[2], y[3]);",
+        "11 13 22 24",
+    );
+
+    // N-D array: zeros(2,2,2) is all zeros, so A(1,2,1) is 0.
+    run_exact(
+        "array_nd",
+        "double array_nd(void);",
+        "printf(\"%g\\n\", array_nd());",
+        "0",
+    );
+
+    // linspace(0, 1, 5) == [0 0.25 0.5 0.75 1].
+    run_close(
+        "array_linspace",
+        "void array_linspace(double*);",
+        "double y[5];\n    array_linspace(y);\n    \
+         printf(\"%.17g\\n%.17g\\n%.17g\\n%.17g\\n%.17g\\n\", \
+             y[0], y[1], y[2], y[3], y[4]);",
+        &[0.0, 0.25, 0.5, 0.75, 1.0],
+    );
+
+    // repmat([1 2], 2, 1) == [1 2; 1 2] (column-major [1 1 2 2]).
+    run_exact(
+        "array_repmat",
+        "void array_repmat(double*);",
+        "double y[4];\n    array_repmat(y);\n    \
+         printf(\"%g %g %g %g\\n\", y[0], y[1], y[2], y[3]);",
+        "1 1 2 2",
+    );
+
+    // permute([1 2; 3 4], [2 1]) transposes to [1 3; 2 4] (column-major [1 2 3 4]).
+    run_exact(
+        "array_permute",
+        "void array_permute(double*);",
+        "double y[4];\n    array_permute(y);\n    \
+         printf(\"%g %g %g %g\\n\", y[0], y[1], y[2], y[3]);",
+        "1 2 3 4",
+    );
+
+    // logical(1) + logical(0) == 1.
+    run_exact(
+        "type_logical",
+        "double type_logical(void);",
+        "printf(\"%g\\n\", type_logical());",
+        "1",
+    );
+
+    // det([1 2; 3 4]) == 1*4 - 2*3 == -2.
+    run_exact(
+        "linalg_det",
+        "double linalg_det(void);",
+        "printf(\"%g\\n\", linalg_det());",
+        "-2",
+    );
+
+    // inv([1 2; 3 4]) == [-2 1; 1.5 -0.5] (column-major [-2 1.5 1 -0.5]).
+    run_exact(
+        "linalg_inv",
+        "void linalg_inv(double*);",
+        "double y[4];\n    linalg_inv(y);\n    \
+         printf(\"%g %g %g %g\\n\", y[0], y[1], y[2], y[3]);",
+        "-2 1.5 1 -0.5",
+    );
+
+    // norm([3 4]) == 5.
+    run_exact(
+        "linalg_norm",
+        "double linalg_norm(void);",
+        "printf(\"%g\\n\", linalg_norm());",
+        "5",
+    );
+
+    // [2 0; 0 2] \ [2; 4] == [1; 2].
+    run_exact(
+        "linalg_solve",
+        "void linalg_solve(double*);",
+        "double y[2];\n    linalg_solve(y);\n    \
+         printf(\"%g %g\\n\", y[0], y[1]);",
+        "1 2",
+    );
+
+    // rand() returns a pseudo-random scalar in [0, 1).
+    {
+        let out = run_program(
+            "sys_random",
+            "double sys_random(void);",
+            "printf(\"%.17g\\n\", sys_random());",
+        );
+        let value: f64 = out
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("sys_random printed non-numeric output: {out:?}"));
+        assert!(
+            (0.0..1.0).contains(&value),
+            "rand() must lie in [0, 1), got {value}"
+        );
+    }
+
+    // isinf(Inf) + isnan(NaN) == 2.
+    run_exact(
+        "value_special",
+        "double value_special(void);",
+        "printf(\"%g\\n\", value_special());",
+        "2",
+    );
+
+    // averaging_filter: a 16-sample moving average over a persistent buffer.
+    // Two calls with 16 then 0 both average to 16 / 16 == 1.
+    run_exact(
+        "averaging_filter",
+        "double averaging_filter(double);",
+        "printf(\"%g\\n\", averaging_filter(16.0));\n    \
+         printf(\"%g\\n\", averaging_filter(0.0));",
+        "1\n1",
+    );
+
+    // fib(7) == 13 (recursion).
+    run_exact(
+        "fib",
+        "double fib(double);",
+        "printf(\"%g\\n\", fib(7.0));",
+        "13",
+    );
+
+    // func_helper(3) == square(3) + 1 == 10 (call to a later-defined function).
+    run_exact(
+        "func_helper",
+        "double func_helper(double);",
+        "printf(\"%g\\n\", func_helper(3.0));",
+        "10",
+    );
+
+    // func_recursion(5) == 5! == 120 (recursion).
+    run_exact(
+        "func_recursion",
+        "double func_recursion(double);",
+        "printf(\"%g\\n\", func_recursion(5.0));",
+        "120",
+    );
+
+    // kalmanfilter relies on `isempty` of a `persistent` variable being true on
+    // the first call, which initializes `P = 1`. First call with z = 1:
+    // x = 0, P = 1; Q = 0.01, R = 0.1.
+    let (q, r, z) = (0.01f64, 0.1f64, 1.0f64);
+    let p = 1.0 + q;
+    let k = p / (p + r);
+    let x = k * z;
+    run_close(
+        "kalmanfilter",
+        "double kalmanfilter(double);",
+        "printf(\"%.17g\\n\", kalmanfilter(1.0));",
+        &[x],
+    );
+}
+
+/// Manual report: prints the compile outcome (and rejection reason) of every
+/// example. Ignored by default; run with `--ignored --nocapture`.
+#[test]
+#[ignore = "report only"]
+fn coder_examples_report() {
+    let supported = SUPPORTED
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut passed = 0;
+    for name in example_names() {
+        match compile_example(&name) {
+            Ok(_) => {
+                passed += 1;
+                let mark = if supported.contains(name.as_str()) {
+                    "PASS"
+                } else if KNOWN_BUGS.contains(&name.as_str()) {
+                    "PASS (known bug)"
+                } else {
+                    "PASS (not in SUPPORTED)"
+                };
+                println!("{mark:24} {name}");
+            }
+            Err(err) => println!("FAIL                     {name}: {err}"),
+        }
+    }
+    println!("\n{passed} / {} examples compile", example_names().len());
 }

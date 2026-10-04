@@ -183,6 +183,10 @@ impl Lowerer {
             };
             self.map_result(context, op, &e, 0);
             append(context, dst, &e);
+        } else if let Some(_c) = Operation::get_op::<matlab::HeapAllocOp>(op, context) {
+            let e = emitc::HeapAllocOp::new(context, self.opd(context, op, 0));
+            self.map_result(context, op, &e, 0);
+            append(context, dst, &e);
         } else if let Some(_c) = Operation::get_op::<matlab::LoadOp>(op, context) {
             let e = emitc::LoadOp::new(context, self.opd(context, op, 0), self.opd(context, op, 1));
             self.map_result(context, op, &e, 0);

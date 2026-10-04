@@ -41,6 +41,37 @@ pub enum Builtin {
     /// `sort(A)`: sort a vector ascending (a wrapped `convmat_sort` runtime
     /// helper; only vectors are supported in the MVP).
     Sort,
+    /// `mean(A)`: arithmetic mean of a vector (a reduction to a scalar).
+    Mean,
+    /// `std(A)`: sample standard deviation of a vector (a reduction to a
+    /// scalar).
+    Std,
+    /// `median(A)`: middle value of a sorted vector (a reduction to a scalar).
+    Median,
+    /// `cumsum(A)`: cumulative sum (an array of the same shape as `A`).
+    CumSum,
+    /// `diff(A)`: adjacent differences (an array one element shorter than `A`).
+    Diff,
+    /// `isempty(x)`: whether the value has zero elements (`0`/`1`).
+    IsEmpty,
+    /// `logical(x)`: elementwise `x != 0` (`0`/`1`), preserving shape.
+    Logical,
+    /// `var(A)`: sample variance of a vector (a reduction to a scalar).
+    Var,
+    /// `linspace(a, b, n)`: `n` evenly spaced points (a 1xN row).
+    LinSpace,
+    /// `repmat(A, m, n)`: tile `A` `m`x`n` times (an array).
+    Repmat,
+    /// `permute(A, order)`: reorder the dimensions of `A` (an array).
+    Permute,
+    /// `inv(A)`: the inverse of a square matrix (a runtime helper).
+    Inv,
+    /// `det(A)`: the determinant of a square matrix (a scalar).
+    Det,
+    /// `norm(v)`: the 2-norm of a vector (a scalar).
+    Norm,
+    /// `rand()`: a pseudo-random scalar in `[0, 1)`.
+    Rand,
 }
 
 /// Which of `min`/`max` a [`Builtin::MinMax`] refers to.
@@ -61,13 +92,30 @@ impl Builtin {
     /// Whether `n` positional arguments are valid for this built-in.
     pub fn valid_arity(self, n: usize) -> bool {
         match self {
-            Builtin::Unary(_) | Builtin::Sign | Builtin::Numel | Builtin::Length => n == 1,
+            Builtin::Unary(_)
+            | Builtin::Sign
+            | Builtin::Numel
+            | Builtin::Length
+            | Builtin::Mean
+            | Builtin::Std
+            | Builtin::Median
+            | Builtin::CumSum
+            | Builtin::Diff
+            | Builtin::IsEmpty
+            | Builtin::Logical
+            | Builtin::Var
+            | Builtin::Inv
+            | Builtin::Det
+            | Builtin::Norm => n == 1,
+            Builtin::Rand => n == 0,
             Builtin::Binary(_) | Builtin::Mod => n == 2,
-            Builtin::MinMax(_)
-            | Builtin::Reduce(_)
-            | Builtin::Size
-            | Builtin::Fill(_)
-            | Builtin::Eye => n == 1 || n == 2,
+            Builtin::MinMax(_) | Builtin::Reduce(_) | Builtin::Size | Builtin::Eye => {
+                n == 1 || n == 2
+            }
+            Builtin::LinSpace | Builtin::Repmat => n == 2 || n == 3,
+            Builtin::Permute => n == 2,
+            // `zeros`/`ones` accept any number of dimensions (N-D).
+            Builtin::Fill(_) => n >= 1,
             Builtin::Reshape => n == 3,
             Builtin::Sort => n == 1,
         }
@@ -114,6 +162,23 @@ pub fn lookup(name: &str) -> Option<Builtin> {
         "eye" => Builtin::Eye,
         "reshape" => Builtin::Reshape,
         "sort" => Builtin::Sort,
+        "mean" => Builtin::Mean,
+        "std" => Builtin::Std,
+        "median" => Builtin::Median,
+        "cumsum" => Builtin::CumSum,
+        "diff" => Builtin::Diff,
+        "isempty" => Builtin::IsEmpty,
+        "logical" => Builtin::Logical,
+        "var" => Builtin::Var,
+        "linspace" => Builtin::LinSpace,
+        "repmat" => Builtin::Repmat,
+        "permute" => Builtin::Permute,
+        "inv" => Builtin::Inv,
+        "det" => Builtin::Det,
+        "norm" => Builtin::Norm,
+        "rand" => Builtin::Rand,
+        "isnan" => Builtin::Unary("std::isnan"),
+        "isinf" => Builtin::Unary("std::isinf"),
         _ => return None,
     })
 }
@@ -126,12 +191,27 @@ pub fn libm_symbol(builtin: Builtin) -> Option<&'static str> {
         Builtin::Mod => Some("fmod"),
         Builtin::Sign
         | Builtin::Reduce(_)
+        | Builtin::Mean
+        | Builtin::Std
+        | Builtin::Median
+        | Builtin::CumSum
+        | Builtin::Diff
+        | Builtin::IsEmpty
+        | Builtin::Logical
+        | Builtin::Var
+        | Builtin::LinSpace
+        | Builtin::Repmat
+        | Builtin::Permute
         | Builtin::Numel
         | Builtin::Length
         | Builtin::Size
         | Builtin::Fill(_)
         | Builtin::Eye
         | Builtin::Reshape
+        | Builtin::Inv
+        | Builtin::Det
+        | Builtin::Norm
+        | Builtin::Rand
         | Builtin::Sort => None,
         Builtin::MinMax(MinMax::Min) => Some("fmin"),
         Builtin::MinMax(MinMax::Max) => Some("fmax"),
