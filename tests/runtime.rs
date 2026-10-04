@@ -10,8 +10,8 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use convmat::runtime::{
-    cell_support_source, complex_support_source, DYNAMIC_RUNTIME_C, DYNAMIC_RUNTIME_H,
-    ERROR_SUPPORT_C,
+    cell_support_source, complex_support_source, handle_support_source, DYNAMIC_RUNTIME_C,
+    DYNAMIC_RUNTIME_H, ERROR_SUPPORT_C,
 };
 
 /// Headers required by the runtime header (`jmp_buf` comes from `<setjmp.h>`).
@@ -214,6 +214,36 @@ fn complex_helpers_arithmetic_and_abs() {
 ",
     );
     assert_eq!(out, "5\n-4 3");
+}
+
+#[test]
+fn function_handle_env_set_and_call() {
+    // The generated module defines `convmat_handle_dispatch`; this stub exercises
+    // the handle wrappers: `convmat_function_handle`, `convmat_handle_set_env`,
+    // `convmat_handle_env`, and `convmat_handle_call`.
+    let runtime = format!(
+        "{}\n\
+         double convmat_handle_dispatch(double id, convmat_value *h, double x) {{\n\
+             return convmat_handle_env(h, 0.0) + x + id;\n\
+         }}\n",
+        handle_support_source()
+    );
+    let out = compile_and_run_with(
+        &runtime,
+        "\
+    convmat_value *h = convmat_function_handle(10.0);\n    \
+    convmat_handle_set_env(h, 0.0, 2.0);\n    \
+    printf(\"%g\\n\", convmat_handle_env(h, 0.0));\n    \
+    printf(\"%g\\n\", convmat_handle_call(h, 5.0));\n    \
+    convmat_value *c = convmat_value_copy(h);\n    \
+    printf(\"%g %g\\n\", convmat_handle_env(c, 0.0), (double)c->u.func.handle_id);\n    \
+    printf(\"%g\\n\", convmat_handle_env(h, 9.0));\n    \
+    convmat_value_release(c);\n    \
+    convmat_value_release(h);\n",
+    );
+    // env=2; call = env + x + id = 2 + 5 + 10 = 17; the copy preserves both; an
+    // out-of-range env index reads as 0.
+    assert_eq!(out, "2\n17\n2 10\n0");
 }
 
 #[test]

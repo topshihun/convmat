@@ -4,7 +4,7 @@
 > 失败的用例归到若干**工作流（WS）**，每个工作流给出根因（所在层次 + 代码路径）、
 > 落地步骤、验收标准、难度与依赖，并按批次排出推进顺序。
 >
-> - 现状：`examples/coder/` **50 个用例，44 个编译**（44 正确，已知误编译 0），**6 个待实现**。
+> - 现状：`examples/coder/` **50 个用例，50 个编译**（全部正确，已知误编译 0），**0 个待实现**。
 > - 报告：`cargo test --test coder_examples -- --ignored --nocapture`。
 > - 负向测试：`tests/errors.rs` 有意拒绝的构造；**落地某项时要同步翻正**（见各 WS 说明）。
 > - 每落地一项的**收尾清单**见文末 §4（提升进 `SUPPORTED`、补运行驱动、同步
@@ -15,16 +15,9 @@
 
 ---
 
-## 0. 当前失败的 6 个用例
+## 0. 当前失败的用例
 
-| 用例 | 编译器报错 | 阻塞特性 | 工作流 |
-|------|-----------|----------|--------|
-| `func_handle_return` | `function handle N escapes as a return value` | 闭包值（逃逸句柄） | WS5 |
-| `func_handle_builtin` | `unsupported expression FunctionHandle(@sin)` | 内建句柄 / 闭包值 | WS5 |
-| `sys_plot` | `unsupported builtin 'plot'` | 图形（边界外） | WS7 |
-| `sierpinski` | `unsupported builtin 'plot'` | 图形（边界外） | WS7 |
-| `sys_file_io` | `unsupported builtin 'fopen'` | 文件 I/O（边界外） | WS7 |
-| `dijkstra` | `unsupported builtin 'Inf'`（首个） | 动态数组复合能力 | WS8 |
+无：`examples/coder/` 50 个用例全部编译且运行正确。
 
 ## 1. 工作流总览（按建议顺序）
 
@@ -37,10 +30,10 @@
 | WS6 | try / catch | `sys_trycatch` | ✅ 已完成 | 中-大 | D,L,T,R |
 | WS9 | cell 数组（运行时 box 接线） | `cell_basic` | ✅ 已完成 | 大 | R,D,L,T |
 | WS4b | 复数 + fft | `type_complex`、`sys_fft` | ✅ 已完成 | 大 | T,D,L,E,R |
-| WS5 | 逃逸 / 内建函数句柄 | `func_handle_return`、`func_handle_builtin` | 闭包值 | 大 | D,L,T(,R) |
+| WS5 | 逃逸 / 内建函数句柄 | `func_handle_return`、`func_handle_builtin` | ✅ 已完成 | 大 | D,L,T(,R) |
 | WS4c | eig | `linalg_eig` | ✅ 已完成 | 大 | R,L |
-| WS7 | 图形 / 文件 I/O 取舍 | `sys_plot`、`sierpinski`、`sys_file_io` | 范围决策 | 小-中 / 0 | R,L |
-| WS8 | dijkstra（收口） | `dijkstra` | WS1 + 动态数组 | 大 | T,L,R |
+| WS7 | 图形 / 文件 I/O | `sys_plot`、`sierpinski`、`sys_file_io` | ✅ 已完成 | 小-中 | R,L |
+| WS8 | dijkstra（收口） | `dijkstra` | ✅ 已完成 | 大 | T,L,R |
 
 > 依赖关系决定顺序：WS3/WS2/WS4a 互不依赖、可并行；WS1 是动态数组基建，WS4b 依赖
 > WS4a 的类型系统；WS4c 依赖 WS4b；WS8 依赖 WS1；WS9（运行时 box 接线）与 WS5（闭包
@@ -161,7 +154,15 @@
   `eig(A)` 对静态方阵（n≤2）类型为 Complex，n>2 defer。验收 `run_complex_eig` → `[2, 3]`。
   难度 **大**；层次 R,L。
 
-### WS5 · 逃逸 / 内建函数句柄（闭包值）
+### WS5 · 逃逸 / 内建函数句柄（闭包值）✅ 已完成
+
+> 已落地：函数句柄降级为盒式 `convmat_value`（`CONVMAT_FUNCTION`）：`hir_to_mlir` 为
+> 每个逃逸句柄点生成一个 thunk（`convmat_handle_thunk_<id>`）与模块级
+> `convmat_handle_dispatch`（select 链，无需新控制流 op），捕获标量快照进 `u.func.env`；
+> 运行时 `convmat_function_handle`/`handle_set_env`/`handle_env`/`handle_call`（
+> `handle_support_source()`）；`@sin` 直接调用亦支持（`g = @sin; y = g(2)`）。
+> 验收 `run_handle_return`/`run_handle_builtin`，coder 例 `func_handle_return`/
+> `func_handle_builtin`。边界：一元句柄、标量捕获/返回；多参数、数组捕获、跨函数传递仍 defer。
 
 **解锁**：`func_handle_return`（`f = @(x) x + k` 作为返回值）、
 `func_handle_builtin`（`f = @sin`）。
@@ -238,25 +239,30 @@ supported yet`）；`hir_to_mlir::lower_index_scalar` 拒绝花括号索引（`{
 **翻正负向**：`cell_literal_rejected`（fixture `cell_literal.m`）。
 **难度** 大；层次 R,D,L,T。
 
-### WS7 · 图形 / 文件 I/O（需范围决策）
+### WS7 · 图形 / 文件 I/O ✅ 已完成
 
-**解锁候选**：`sys_plot`、`sierpinski`（`plot`）、`sys_file_io`（`fopen`/`fread`/`fclose`）。
+**解锁**：`sys_plot`、`sierpinski`（`plot`）、`sys_file_io`（`fopen`/`fread`/`fclose`）。
 
-**根因**：这些内建未收录；`docs/architecture.md §4` 将它们视为「边界外 / 设计排除」。
+> 已落地（路线 (a)）：`plot`/`plot3` 降为**文档化的 no-op**（实参先求值，再调用
+> `convmat_plot`；作为值使用会 defer）；`fopen(name, mode)`/`fread(fid)`/`fclose(fid)`
+> 降为基于 C stdio 的运行时 helper（`FILE*` 表 + 标量 id；`name` 为 char 数组，`mode`
+> 为单字符码点；`fread` 读二进制 `double` 返回动态形状数组）。验收 `run_sys_plot`/
+> `run_sierpinski`/`run_sys_file_io`（后者在临时目录建 `data.bin` 后读取）。语义边界见
+> `docs/unsupported.md` §7.1/§7.2。
 
-**两条路线（须明确取舍）**
+**根因**：这些内建未收录；`docs/architecture.md §4` 将它们视为「边界外」。
 
-- **(a) 运行时 stub**：`plot(...)` → 无副作用 helper `convmat_plot`（或记录点）；
-  `fopen`/`fread`/`fclose` → 基于 C `stdio` 的 helper。三例可「编译 + 运行不崩」，但 `plot`
-  无输出、`fread` 语义简陋。难度 **小-中**（R,L,T）。
-- **(b) 重分类**：承认图形/文件 I/O 超出「薄数值编译器」范围，把这三个用例标为「**设计排除**」
-  并从语料库/通过率中移出。难度 **0**。
-
-**建议**：明确二选一并写入 `docs/unsupported.md`。选 (a) 与项目定位有张力；选 (b) 更诚实。
-
-### WS8 · dijkstra（动态数组收口）
+### WS8 · dijkstra（动态数组收口）✅ 已完成
 
 **解锁**：`dijkstra`。
+
+> 已落地：① `Inf`/`NaN` 作为 `Fill` 构造（`Inf(1,n)`），非恒定维度 → `Array{Dynamic}`
+> （`fill_ty`），降为 `convmat_fill`；② 动态数组的**运行时标量下标写** `dist(source)=0`
+> （`lower_stmt` 的 Index 分支 → `matlab.store`）；③ **运行时列切片** `W(:, j)`
+> （`index_ty` 动态 slice → `Array{Dynamic}`；`convmat_column`，形状来自描述符）；
+> ④ 两数组**逐元素** `min`/`max`（`call_ty` + `convmat_ewmin`/`ewmax`）；⑤ `dynamic_array_len`
+> 支持 Fill/列切片/元素逐元素 min 与动态输出的 out-length。验收 `run_dijkstra`（3×3 W、
+> source=1 → `dist=[0 3 5]`）。语料库 49→50。
 
 **根因**：首报 `unsupported builtin 'Inf'`，但实际是多项动态数组能力的**合成**：
 
@@ -283,10 +289,10 @@ supported yet`）；`hir_to_mlir::lower_index_scalar` 拒绝花括号索引（`{
 | 3 ✅ | WS6 | +1 | try/catch（已完成） |
 | 4 ✅ | WS4b | +2 | 复数主线：`type_complex` + `sys_fft`（已完成） |
 | 5 ✅ | WS9 | +1 | 运行时 box 接线：`cell_basic`（已完成） |
-| 6 | WS5 | +2 | 闭包值：逃逸/内建句柄 |
+| 6 ✅ | WS5 | +2 | 闭包值：逃逸/内建句柄（已完成） |
 | 7 ✅ | WS4c | +1 | `eig`（已完成） |
-| 8 | WS7 | +3 | 图形/I/O：stub 或重分类（取决于决策） |
-| 9 | WS8 | +1 | `dijkstra`（动态数组收口） |
+| 8 ✅ | WS7 | +3 | 图形 no-op + stdio 文件 I/O（已完成） |
+| 9 ✅ | WS8 | +1 | `dijkstra`（动态数组收口）（已完成） |
 
 > 合计 17。批次内若某 WS 可独立落地，可并行推进（写入范围互不重叠）。
 
@@ -340,3 +346,12 @@ supported yet`）；`hir_to_mlir::lower_index_scalar` 拒绝花括号索引（`{
   复数算术/`cabs`/`fft`（`complex_support_source`）；`matlab.box_call` op；复数输出以
   `convmat_value*` 返回。语料库 41→43。
 - **第 12 批（batch 7：WS4c）**：`convmat_eig`（1x1/2x2 解析解）复用复数盒。语料库 43→44。
+- **第 13 批（batch 6：WS5）**：函数句柄闭包值（`CONVMAT_FUNCTION` 盒）：逃逸匿名句柄
+  （返回捕获快照）、内建句柄（`@sin` 直接调用/返回）；`hir_to_mlir` 生成 thunk +
+  `convmat_handle_dispatch`，运行时 `convmat_handle_call`。语料库 44→46。
+- **第 14 批（batch 8：WS7）**：图形 `plot`/`plot3` 降为文档化 no-op（`convmat_plot`，
+  实参先求值）；`fopen`/`fread`/`fclose` 降为 stdio 运行时 helper（`FILE*` 表 + 标量 id，
+  `fread` 读二进制 `double` 返回动态形状数组）。语料库 46→49。
+- **第 15 批（batch 9：WS8）**：动态数组收口——`Inf`/`NaN` 动态填充（`convmat_fill`）、
+  运行时标量下标写 `dist(source)=0`、运行时列切片 `W(:,j)`（`convmat_column`）、
+  两数组逐元素 `min`/`max`（`convmat_ewmin`/`ewmax`）；`dijkstra` 通过。语料库 49→50。

@@ -80,6 +80,19 @@ pub enum Builtin {
     Fft,
     /// `eig(A)`: eigenvalues of a small square matrix (a runtime helper; complex).
     Eig,
+    /// A graphics/output builtin with no C representation (`plot`, ...). Its
+    /// arguments are evaluated for side effects and it lowers to the no-op
+    /// runtime helper [`crate::runtime::PLOT`]; see `docs/unsupported.md`. It is
+    /// meaningful only as an expression statement (using its result defers).
+    Noop,
+    /// `fopen(name, mode)`: open a file (a runtime helper); returns a scalar id.
+    /// `name` is a char array; `mode` is a single-char code point (`'r'`/`'w'`).
+    Fopen,
+    /// `fread(fid)`: read a binary file of `double`s (a runtime helper); returns
+    /// a dynamic-shape array.
+    Fread,
+    /// `fclose(fid)`: close a file (a runtime helper); returns a scalar status.
+    Fclose,
 }
 
 /// Which of `min`/`max` a [`Builtin::MinMax`] refers to.
@@ -129,6 +142,11 @@ impl Builtin {
             Builtin::Fill(_) => n >= 1,
             Builtin::Reshape => n == 3,
             Builtin::Sort => n == 1,
+            // Graphics no-ops take one or more data arguments / format strings.
+            Builtin::Noop => n >= 1,
+            // File I/O: `fopen(name, mode)`, `fread(fid)`, `fclose(fid)`.
+            Builtin::Fopen => n == 2,
+            Builtin::Fread | Builtin::Fclose => n == 1,
         }
     }
 }
@@ -170,6 +188,9 @@ pub fn lookup(name: &str) -> Option<Builtin> {
         "size" => Builtin::Size,
         "zeros" => Builtin::Fill(0.0),
         "ones" => Builtin::Fill(1.0),
+        // `Inf`/`NaN` as constructors (`Inf(1, n)`): a constant-filled array.
+        "Inf" | "Infinity" => Builtin::Fill(f64::INFINITY),
+        "NaN" => Builtin::Fill(f64::NAN),
         "eye" => Builtin::Eye,
         "reshape" => Builtin::Reshape,
         "sort" => Builtin::Sort,
@@ -194,6 +215,13 @@ pub fn lookup(name: &str) -> Option<Builtin> {
         "eig" => Builtin::Eig,
         "isnan" => Builtin::Unary("std::isnan"),
         "isinf" => Builtin::Unary("std::isinf"),
+        // Graphics: accepted for codegen readiness but lowered to a no-op (there
+        // is no graphics backend in the generated C; see `docs/unsupported.md`).
+        "plot" | "plot3" => Builtin::Noop,
+        // File I/O: stdio-backed runtime helpers (see `docs/unsupported.md`).
+        "fopen" => Builtin::Fopen,
+        "fread" => Builtin::Fread,
+        "fclose" => Builtin::Fclose,
         _ => return None,
     })
 }
@@ -231,6 +259,10 @@ pub fn libm_symbol(builtin: Builtin) -> Option<&'static str> {
         | Builtin::Int32
         | Builtin::Fft
         | Builtin::Eig
+        | Builtin::Noop
+        | Builtin::Fopen
+        | Builtin::Fread
+        | Builtin::Fclose
         | Builtin::Sort => None,
         Builtin::MinMax(MinMax::Min) => Some("fmin"),
         Builtin::MinMax(MinMax::Max) => Some("fmax"),

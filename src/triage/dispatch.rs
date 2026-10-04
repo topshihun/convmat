@@ -30,6 +30,8 @@ pub enum ValueClass {
     Cell,
     /// A boxed complex value (`convmat_value*`).
     Complex,
+    /// A boxed function handle (`convmat_value*`, `CONVMAT_FUNCTION`).
+    Handle,
     /// A value the static subset cannot realize (deferred to the runtime tier).
     Unsupported,
 }
@@ -44,6 +46,7 @@ impl ValueClass {
             LocalTy::Struct { .. } => ValueClass::Struct,
             LocalTy::Cell => ValueClass::Cell,
             LocalTy::Complex => ValueClass::Complex,
+            LocalTy::Handle => ValueClass::Handle,
             LocalTy::Dynamic => ValueClass::Unsupported,
         }
     }

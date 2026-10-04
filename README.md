@@ -84,6 +84,23 @@ End-to-end codegen works for a growing subset of MATLAB:
   compile time to a helper whose captured variables are passed as extra
   arguments, snapshotted at creation (MATLAB capture-by-value semantics); see
   `docs/architecture.md` §13.
+- **Function handles as closure values**: a handle that escapes (returned from a
+  function, e.g. `f = @(x) x + k` or `f = @sin`) is boxed into a
+  `convmat_value` (`CONVMAT_FUNCTION`) that snapshots its captured scalars; the
+  caller invokes it through a generated thunk dispatcher (`convmat_handle_call`).
+  A builtin handle called directly (`g = @sin; y = g(2)`) lowers to the builtin
+  call. Handles are unary with scalar captures today; see `docs/architecture.md`
+  §13.5 and `docs/runtime.md` §9.5.
+- **Graphics & file I/O** (documented stubs): `plot`/`plot3` have no C
+  representation and lower to a no-op (`convmat_plot`) after evaluating their
+  arguments; `fopen`/`fread`/`fclose` lower to a small stdio-backed runtime
+  shim (a scalar file id into a `FILE*` table; `fread` reads binary `double`s as
+  a dynamic-shape array). See `docs/unsupported.md` §7.1–§7.2.
+- **Dynamic-array primitives**: runtime subscript read *and write* (`A(i)` /
+  `A(i) = v`), runtime column slices (`A(:, j)`), runtime-dimension constant
+  fills (`Inf(1, n)` / `zeros(1, n)`), and elementwise two-array `min`/`max`
+  (`min(A, B)`). These close the `dijkstra` integration case; see
+  `docs/architecture.md` §10.5 P7.
 - **Closed-world user-function calls** within one file, for the scalar ABI (all
   scalar inputs, a single scalar output), including recursion. The C emitter
   forward-declares every function so calls to later-defined functions resolve.

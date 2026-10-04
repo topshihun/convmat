@@ -18,9 +18,9 @@
 use std::collections::{HashMap, HashSet};
 
 use runmat_hir::{
-    BindingId, FunctionId, HirCall, HirCallableRef, HirExpr, HirExprKind, HirFunction, HirPlace,
-    HirStmt, HirStmtKind, IndexComponent, IndexKind, IndexResultContext, IndexingSemantics,
-    OperatorKind,
+    BindingId, FunctionHandleTarget, FunctionId, HirCall, HirCallableRef, HirExpr, HirExprKind,
+    HirFunction, HirPlace, HirStmt, HirStmtKind, IndexComponent, IndexKind, IndexResultContext,
+    IndexingSemantics, OperatorKind,
 };
 
 use crate::builtins::{self, Builtin};
@@ -139,6 +139,10 @@ pub enum LocalTy {
     Cell,
     /// A boxed complex value (`convmat_value*`, dtype `CONVMAT_COMPLEX`).
     Complex,
+    /// A boxed function handle (`convmat_value*`, kind `CONVMAT_FUNCTION`): an
+    /// anonymous function or a builtin used as a value (returned from a function
+    /// or called through a binding). See `docs/architecture.md` §13.
+    Handle,
     /// Not a numeric value / not statically resolvable; deferred to the runtime.
     Dynamic,
 }
@@ -637,12 +641,15 @@ fn stmt_reason(stmt: &HirStmt, varargout_local: Option<BindingId>) -> Option<Str
     match &stmt.kind {
         HirStmtKind::ExprStmt(expr, _) => expr_reason(expr),
         HirStmtKind::Assign(place, value, _) => {
-            // An anonymous-function definition `f = @(...)` is compile-time only;
-            // its validity (single assignment, non-escaping) is checked by
-            // [`analyze_handles`]. The `@(...)` literal itself is not a value we
-            // lower here.
+            // An anonymous/builtin-function handle definition `f = @(...)` or
+            // `f = @name` is compile-time only; its validity (single assignment,
+            // supported usage) is checked by [`analyze_handles`]. The handle
+            // literal itself is not a value we lower here.
             if matches!(place, HirPlace::Binding(_))
-                && matches!(value.kind, HirExprKind::AnonymousFunction(_))
+                && matches!(
+                    value.kind,
+                    HirExprKind::AnonymousFunction(_) | HirExprKind::FunctionHandle(_)
+                )
             {
                 return None;
             }
@@ -691,61 +698,113 @@ fn stmt_reason(stmt: &HirStmt, varargout_local: Option<BindingId>) -> Option<Str
     }
 }
 
-/// Map from a handle binding to the anonymous function it holds.
-pub type HandleTargets = HashMap<BindingId, FunctionId>;
+/// The target of a function handle: an anonymous function (specialized to a
+/// helper) or a builtin called through the handle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandleKind {
+    Anonymous(FunctionId),
+    Builtin(String),
+}
 
-/// Resolve the non-escaping anonymous-function handles defined in `function`.
+/// Map from a handle binding to the handle it holds (a non-escaping handle that
+/// is called directly, or one returned as an output).
+pub type HandleTargets = HashMap<BindingId, HandleKind>;
+
+/// The result of [`analyze_handles`]: the handles defined in one function, split
+/// by how they are used.
+#[derive(Debug, Clone, Default)]
+pub struct HandleAnalysis {
+    /// Non-escaping handles, called directly as `f(args)` within the function.
+    pub local: HandleTargets,
+    /// Handles returned as a function output. They escape the function frame, so
+    /// they are boxed into a `convmat_value` closure (see `docs/architecture.md`
+    /// §13.5) rather than resolved to a direct call.
+    pub returned: HandleTargets,
+}
+
+/// The resolvable name of a `@name` function handle (`@sin` -> `"sin"`), if any.
+pub fn handle_target_name(target: &FunctionHandleTarget) -> Option<String> {
+    target.identity().display_name()
+}
+
+/// Resolve the function handles defined in `function`.
 ///
 /// A binding `f` is a supported handle iff it is assigned exactly once, at the
-/// top level of the function body, with an `@(...)` literal, and every use of
-/// `f` is a direct call `f(args)` (paren indexing). Anything else — the handle
-/// is returned, passed on, copied, or otherwise examined as a value — needs the
-/// dynamic closure tier (`docs/architecture.md` §11.2) and is deferred.
+/// top level of the function body, from either an `@(...)` literal or a `@name`
+/// built-in handle, and either:
+///
+/// - it is **returned as an output** (an escaping handle), which boxes a closure
+///   value (only unary handles are supported; the arity is checked in lowering);
+///   or
+/// - every use of `f` is a direct call `f(args)` (paren indexing) — the
+///   non-escaping case. Anything else (the handle is copied, passed on, stored,
+///   or otherwise examined as a value) is deferred.
 ///
 /// The captured bindings (the environment) are *not* resolved here: the caller
 /// of this function has the full assembly and resolves them from the target
 /// `HirFunction` when it needs the capture order.
-pub fn analyze_handles(function: &HirFunction) -> Result<HandleTargets, String> {
-    let mut targets: HandleTargets = HashMap::new();
+pub fn analyze_handles(function: &HirFunction) -> Result<HandleAnalysis, String> {
+    let mut kinds: HandleTargets = HashMap::new();
     let mut assignments: HashMap<BindingId, usize> = HashMap::new();
 
     for stmt in &function.body.statements {
         if let HirStmtKind::Assign(HirPlace::Binding(target), value, _) = &stmt.kind {
-            if let HirExprKind::AnonymousFunction(id) = value.kind {
+            let kind = match &value.kind {
+                HirExprKind::AnonymousFunction(id) => Some(HandleKind::Anonymous(*id)),
+                HirExprKind::FunctionHandle(handle) => match handle_target_name(handle) {
+                    Some(name) => Some(HandleKind::Builtin(name)),
+                    None => {
+                        return Err(
+                            "function handle `@...` has no resolvable name (deferred)".to_string()
+                        )
+                    }
+                },
+                _ => None,
+            };
+            if let Some(kind) = kind {
                 *assignments.entry(*target).or_insert(0) += 1;
-                targets.insert(*target, id);
+                kinds.insert(*target, kind);
             }
         }
     }
 
     if nested_handle_definition(&function.body.statements) {
         return Err(
-            "anonymous function handle defined inside control flow is not supported (deferred)"
-                .to_string(),
+            "function handle defined inside control flow is not supported (deferred)".to_string(),
         );
     }
 
-    if targets.is_empty() {
-        return Ok(targets);
+    if kinds.is_empty() {
+        return Ok(HandleAnalysis::default());
     }
 
-    for (target, count) in &assignments {
-        if *count > 1 {
+    let mut analysis = HandleAnalysis::default();
+    for (target, kind) in &kinds {
+        if *assignments.get(target).unwrap_or(&0) > 1 {
             return Err(format!(
                 "function handle {} is assigned more than once (deferred)",
                 target.0
             ));
         }
+        if let HandleKind::Builtin(name) = kind {
+            if builtins::lookup(name).is_none() {
+                return Err(format!("unsupported builtin handle `@{name}` (deferred)"));
+            }
+        }
         if function.abi.fixed_outputs.contains(target) {
-            return Err(format!(
-                "function handle {} escapes as a return value (needs the dynamic closure tier)",
-                target.0
-            ));
+            analysis.returned.insert(*target, kind.clone());
+        } else {
+            analysis.local.insert(*target, kind.clone());
         }
     }
 
-    check_handle_uses_block(&function.body.statements, &targets)?;
-    Ok(targets)
+    let returned: HashSet<BindingId> = analysis.returned.keys().copied().collect();
+    let uses = HandleUses {
+        handles: &kinds,
+        returned: &returned,
+    };
+    check_handle_uses_block(&function.body.statements, &uses)?;
+    Ok(analysis)
 }
 
 /// Whether a handle is defined anywhere in a nested block of `stmts` (that is,
@@ -783,18 +842,27 @@ fn nested_handle_definition(stmts: &[HirStmt]) -> bool {
     })
 }
 
-/// Whether any statement at any depth defines an anonymous-function handle.
+/// Whether any statement at any depth defines a function handle.
 fn block_defines_handle(stmts: &[HirStmt]) -> bool {
     stmts.iter().any(|stmt| match &stmt.kind {
-        HirStmtKind::Assign(HirPlace::Binding(_), value, _) => {
-            matches!(value.kind, HirExprKind::AnonymousFunction(_))
-        }
+        HirStmtKind::Assign(HirPlace::Binding(_), value, _) => matches!(
+            value.kind,
+            HirExprKind::AnonymousFunction(_) | HirExprKind::FunctionHandle(_)
+        ),
         _ => nested_handle_definition(std::slice::from_ref(stmt)),
     })
 }
 
+/// The handle bindings in scope for a usage check: every handle, plus the subset
+/// returned as outputs (which must not be used at all — a handle cannot be both
+/// called and returned in the current closure-value subset).
+struct HandleUses<'a> {
+    handles: &'a HandleTargets,
+    returned: &'a HashSet<BindingId>,
+}
+
 /// Verify that no handle binding escapes through the statements in `stmts`.
-fn check_handle_uses_block(stmts: &[HirStmt], handles: &HandleTargets) -> Result<(), String> {
+fn check_handle_uses_block(stmts: &[HirStmt], uses: &HandleUses) -> Result<(), String> {
     for stmt in stmts {
         match &stmt.kind {
             HirStmtKind::Assign(place, value, _) => {
@@ -802,52 +870,55 @@ fn check_handle_uses_block(stmts: &[HirStmt], handles: &HandleTargets) -> Result
                 // as a storage location, not as a value; skip it (the target is
                 // checked for reassignment/escape separately).
                 if let HirPlace::Binding(target) = place {
-                    if handles.contains_key(target)
-                        && matches!(value.kind, HirExprKind::AnonymousFunction(_))
+                    if uses.handles.contains_key(target)
+                        && matches!(
+                            value.kind,
+                            HirExprKind::AnonymousFunction(_) | HirExprKind::FunctionHandle(_)
+                        )
                     {
                         continue;
                     }
                 }
-                check_handle_uses_place(place, handles)?;
-                check_handle_uses_expr(value, handles)?;
+                check_handle_uses_place(place, uses)?;
+                check_handle_uses_expr(value, uses)?;
             }
-            HirStmtKind::ExprStmt(expr, _) => check_handle_uses_expr(expr, handles)?,
+            HirStmtKind::ExprStmt(expr, _) => check_handle_uses_expr(expr, uses)?,
             HirStmtKind::If {
                 cond,
                 then_body,
                 elseif_blocks,
                 else_body,
             } => {
-                check_handle_uses_expr(cond, handles)?;
-                check_handle_uses_block(&then_body.statements, handles)?;
+                check_handle_uses_expr(cond, uses)?;
+                check_handle_uses_block(&then_body.statements, uses)?;
                 for (cond, block) in elseif_blocks {
-                    check_handle_uses_expr(cond, handles)?;
-                    check_handle_uses_block(&block.statements, handles)?;
+                    check_handle_uses_expr(cond, uses)?;
+                    check_handle_uses_block(&block.statements, uses)?;
                 }
                 if let Some(block) = else_body {
-                    check_handle_uses_block(&block.statements, handles)?;
+                    check_handle_uses_block(&block.statements, uses)?;
                 }
             }
             HirStmtKind::While { cond, body } => {
-                check_handle_uses_expr(cond, handles)?;
-                check_handle_uses_block(&body.statements, handles)?;
+                check_handle_uses_expr(cond, uses)?;
+                check_handle_uses_block(&body.statements, uses)?;
             }
             HirStmtKind::For { range, body, .. } => {
-                check_handle_uses_expr(range, handles)?;
-                check_handle_uses_block(&body.statements, handles)?;
+                check_handle_uses_expr(range, uses)?;
+                check_handle_uses_block(&body.statements, uses)?;
             }
             HirStmtKind::Switch {
                 expr,
                 cases,
                 otherwise,
             } => {
-                check_handle_uses_expr(expr, handles)?;
+                check_handle_uses_expr(expr, uses)?;
                 for (case, block) in cases {
-                    check_handle_uses_expr(case, handles)?;
-                    check_handle_uses_block(&block.statements, handles)?;
+                    check_handle_uses_expr(case, uses)?;
+                    check_handle_uses_block(&block.statements, uses)?;
                 }
                 if let Some(block) = otherwise {
-                    check_handle_uses_block(&block.statements, handles)?;
+                    check_handle_uses_block(&block.statements, uses)?;
                 }
             }
             _ => {}
@@ -857,26 +928,32 @@ fn check_handle_uses_block(stmts: &[HirStmt], handles: &HandleTargets) -> Result
 }
 
 /// Verify that no handle binding is read through an assignment target.
-fn check_handle_uses_place(place: &HirPlace, handles: &HandleTargets) -> Result<(), String> {
+fn check_handle_uses_place(place: &HirPlace, uses: &HandleUses) -> Result<(), String> {
     match place {
         HirPlace::Binding(_) => Ok(()),
-        HirPlace::Member(base, _) => check_handle_uses_expr(base, handles),
+        HirPlace::Member(base, _) => check_handle_uses_expr(base, uses),
         HirPlace::MemberDynamic(base, key) => {
-            check_handle_uses_expr(base, handles)?;
-            check_handle_uses_expr(key, handles)
+            check_handle_uses_expr(base, uses)?;
+            check_handle_uses_expr(key, uses)
         }
         HirPlace::Index(base, indexing) | HirPlace::IndexCell(base, indexing) => {
-            check_handle_uses_expr(base, handles)?;
-            check_handle_uses_components(indexing, handles)
+            check_handle_uses_expr(base, uses)?;
+            check_handle_uses_components(indexing, uses)
         }
     }
 }
 
 /// Verify that no handle binding escapes through the expression tree `expr`.
-fn check_handle_uses_expr(expr: &HirExpr, handles: &HandleTargets) -> Result<(), String> {
+fn check_handle_uses_expr(expr: &HirExpr, uses: &HandleUses) -> Result<(), String> {
     match &expr.kind {
         HirExprKind::Binding(id) => {
-            if handles.contains_key(id) {
+            if uses.returned.contains(id) {
+                return Err(format!(
+                    "function handle {} is returned and also used as a value (deferred)",
+                    id.0
+                ));
+            }
+            if uses.handles.contains_key(id) {
                 return Err(format!(
                     "function handle {} escapes (used as a value, not called) \
                      (needs the dynamic closure tier)",
@@ -899,36 +976,42 @@ fn check_handle_uses_expr(expr: &HirExpr, handles: &HandleTargets) -> Result<(),
         HirExprKind::Unary(_, operand)
         | HirExprKind::Member(operand, _)
         | HirExprKind::Await(operand)
-        | HirExprKind::Spawn(operand) => check_handle_uses_expr(operand, handles),
+        | HirExprKind::Spawn(operand) => check_handle_uses_expr(operand, uses),
         HirExprKind::Binary(lhs, _, rhs) => {
-            check_handle_uses_expr(lhs, handles)?;
-            check_handle_uses_expr(rhs, handles)
+            check_handle_uses_expr(lhs, uses)?;
+            check_handle_uses_expr(rhs, uses)
         }
         HirExprKind::Tensor(rows) | HirExprKind::Cell(rows) => {
             for row in rows {
                 for element in row {
-                    check_handle_uses_expr(element, handles)?;
+                    check_handle_uses_expr(element, uses)?;
                 }
             }
             Ok(())
         }
         HirExprKind::StructLiteral(fields) | HirExprKind::ObjectLiteral { fields, .. } => {
             for (_, value) in fields {
-                check_handle_uses_expr(value, handles)?;
+                check_handle_uses_expr(value, uses)?;
             }
             Ok(())
         }
         HirExprKind::Range(start, step, end) => {
-            check_handle_uses_expr(start, handles)?;
+            check_handle_uses_expr(start, uses)?;
             if let Some(step) = step {
-                check_handle_uses_expr(step, handles)?;
+                check_handle_uses_expr(step, uses)?;
             }
-            check_handle_uses_expr(end, handles)
+            check_handle_uses_expr(end, uses)
         }
         HirExprKind::Index(base, indexing) => {
             // A direct call `f(args)` is the only legal use of a handle value.
             if let HirExprKind::Binding(id) = &base.kind {
-                if handles.contains_key(id) {
+                if uses.handles.contains_key(id) {
+                    if uses.returned.contains(id) {
+                        return Err(format!(
+                            "function handle {} is returned and also called (deferred)",
+                            id.0
+                        ));
+                    }
                     if indexing.kind != IndexKind::Paren {
                         return Err(format!(
                             "function handle {} must be called with `()` (deferred)",
@@ -942,24 +1025,24 @@ fn check_handle_uses_expr(expr: &HirExpr, handles: &HandleTargets) -> Result<(),
                                 id.0
                             ));
                         };
-                        check_handle_uses_expr(arg, handles)?;
+                        check_handle_uses_expr(arg, uses)?;
                     }
                     return Ok(());
                 }
             }
-            check_handle_uses_expr(base, handles)?;
-            check_handle_uses_components(indexing, handles)
+            check_handle_uses_expr(base, uses)?;
+            check_handle_uses_components(indexing, uses)
         }
         HirExprKind::MemberDynamic(base, key) => {
-            check_handle_uses_expr(base, handles)?;
-            check_handle_uses_expr(key, handles)
+            check_handle_uses_expr(base, uses)?;
+            check_handle_uses_expr(key, uses)
         }
         HirExprKind::Call(call) => {
             if let HirCallableRef::DynamicExpr(callee) = &call.callee {
-                check_handle_uses_expr(callee, handles)?;
+                check_handle_uses_expr(callee, uses)?;
             }
             for arg in &call.args {
-                check_handle_uses_expr(arg, handles)?;
+                check_handle_uses_expr(arg, uses)?;
             }
             Ok(())
         }
@@ -969,11 +1052,11 @@ fn check_handle_uses_expr(expr: &HirExpr, handles: &HandleTargets) -> Result<(),
 /// Verify that no handle binding escapes through an index's components.
 fn check_handle_uses_components(
     indexing: &IndexingSemantics,
-    handles: &HandleTargets,
+    uses: &HandleUses,
 ) -> Result<(), String> {
     for component in &indexing.components {
         if let IndexComponent::Expr(expr) | IndexComponent::Logical(expr) = component {
-            check_handle_uses_expr(expr, handles)?;
+            check_handle_uses_expr(expr, uses)?;
         }
     }
     Ok(())
@@ -1031,7 +1114,7 @@ impl Classifier for WhitelistClassifier {
                 LocalTy::Scalar | LocalTy::Int32 => false,
                 // A cell or complex value is a supported boxed value (the dynamic
                 // tier); a struct field of such a type is not.
-                LocalTy::Cell | LocalTy::Complex => false,
+                LocalTy::Cell | LocalTy::Complex | LocalTy::Handle => false,
             };
             if is_dynamic {
                 return Verdict::Deferred {
@@ -1130,11 +1213,20 @@ pub fn infer_locals(function: &HirFunction) -> HashMap<BindingId, LocalTy> {
     // constructor) is typed before `infer_block` reads `s.a.b` as a scalar.
     infer_struct_locals(function, &mut tys);
 
-    // Anonymous-function handles are compile-time-only; their bindings are not
-    // numeric locals, and their call expressions are typed directly by
-    // `expr_ty` against this map.
+    // Function handles (anonymous or builtin) are compile-time-only when called
+    // directly; when returned they are boxed into a `convmat_value` closure. In
+    // both cases the binding itself is typed `Handle`, and a direct call is typed
+    // by `expr_ty` against this map.
     let handles = analyze_handles(function).unwrap_or_default();
-    infer_block(&function.body.statements, &variadics, &handles, &mut tys);
+    for binding in handles.local.keys().chain(handles.returned.keys()) {
+        tys.insert(*binding, LocalTy::Handle);
+    }
+    infer_block(
+        &function.body.statements,
+        &variadics,
+        &handles.local,
+        &mut tys,
+    );
 
     tys
 }
@@ -1758,9 +1850,12 @@ fn infer_block(
     for stmt in stmts {
         match &stmt.kind {
             HirStmtKind::Assign(HirPlace::Binding(target), value, _) => {
-                // Handle definitions hold no numeric value; the binding is
-                // resolved through `handles` instead.
-                if matches!(value.kind, HirExprKind::AnonymousFunction(_)) {
+                // Handle definitions hold no numeric value; the binding is typed
+                // `Handle` up front and its calls are resolved through `handles`.
+                if matches!(
+                    value.kind,
+                    HirExprKind::AnonymousFunction(_) | HirExprKind::FunctionHandle(_)
+                ) {
                     continue;
                 }
                 let ty = expr_ty(value, tys, variadics.varargin_local, handles);
@@ -1864,6 +1959,7 @@ pub(crate) fn expr_ty(
             }
         }
         HirExprKind::Call(call) => call_ty(call, tys, handles),
+        HirExprKind::AnonymousFunction(_) | HirExprKind::FunctionHandle(_) => LocalTy::Handle,
         HirExprKind::Member(..) => {
             let Some((id, path)) = member_path(expr) else {
                 return LocalTy::Dynamic;
@@ -2012,7 +2108,9 @@ fn unary_ty(op: OperatorKind, ty: LocalTy) -> LocalTy {
         (_, LocalTy::Int32) => LocalTy::Int32,
         (_, LocalTy::Complex) => LocalTy::Complex,
         (_, LocalTy::Cell) => LocalTy::Dynamic,
-        (_, LocalTy::Struct { .. }) | (_, LocalTy::Dynamic) => LocalTy::Dynamic,
+        (_, LocalTy::Struct { .. }) | (_, LocalTy::Dynamic) | (_, LocalTy::Handle) => {
+            LocalTy::Dynamic
+        }
     }
 }
 
@@ -2028,8 +2126,8 @@ fn binary_ty(lhs: LocalTy, op: OperatorKind, rhs: LocalTy) -> LocalTy {
         // Complex arithmetic is real-wrapped in the runtime; any operand being
         // complex makes the result complex (real operands are boxed on demand).
         (Complex, _) | (_, Complex) => Complex,
-        // Cells are boxed; arithmetic on them is deferred.
-        (Cell, _) | (_, Cell) => Dynamic,
+        // Cells and handles are boxed; arithmetic on them is deferred.
+        (Cell, _) | (_, Cell) | (Handle, _) | (_, Handle) => Dynamic,
         (Struct { .. }, _) | (_, Struct { .. }) | (Dynamic, _) | (_, Dynamic) => Dynamic,
         // Matrix power `A ^ scalar` keeps `A`'s shape (a square matrix).
         (Array { shape }, Scalar) if op == OperatorKind::MatrixPower => Array { shape },
@@ -2177,7 +2275,29 @@ fn call_ty(call: &HirCall, tys: &HashMap<BindingId, LocalTy>, handles: &HandleTa
         },
         // Reductions: one array argument reduces to a scalar; a second numeric
         // argument selects the dimension to reduce along (array result).
-        Builtin::MinMax(_) | Builtin::Reduce(_) => match args.as_slice() {
+        // `min(A, B)`/`max(A, B)` between two arrays is elementwise.
+        Builtin::MinMax(_) => match args.as_slice() {
+            [LocalTy::Array { shape: a }, LocalTy::Array { shape: b }] => {
+                if a.is_dynamic() || b.is_dynamic() {
+                    LocalTy::Array {
+                        shape: Shape::Dynamic,
+                    }
+                } else if a == b {
+                    LocalTy::Array { shape: *a }
+                } else {
+                    LocalTy::Dynamic
+                }
+            }
+            [LocalTy::Scalar] | [LocalTy::Array { .. }] | [LocalTy::Scalar, LocalTy::Scalar] => {
+                LocalTy::Scalar
+            }
+            [LocalTy::Array { shape }, _] => match reduction_dim(call) {
+                Some(dim) => reduce_axis_ty(*shape, dim),
+                None => LocalTy::Dynamic,
+            },
+            _ => LocalTy::Dynamic,
+        },
+        Builtin::Reduce(_) => match args.as_slice() {
             [LocalTy::Scalar] | [LocalTy::Array { .. }] | [LocalTy::Scalar, LocalTy::Scalar] => {
                 LocalTy::Scalar
             }
@@ -2266,7 +2386,7 @@ fn call_ty(call: &HirCall, tys: &HashMap<BindingId, LocalTy>, handles: &HandleTa
         Builtin::Binary(_) | Builtin::Mod | Builtin::Sign => LocalTy::Scalar,
         // Constructors: array shapes from constant dim arguments (`zeros`/`ones`
         // accept N dimensions; `eye` is 2-D).
-        Builtin::Fill(_) => fill_ty(call),
+        Builtin::Fill(_) => fill_ty(call, &args),
         Builtin::Eye => match (constant_arg(call, 0), constant_arg(call, 1)) {
             (Some(n), None) => LocalTy::Array {
                 shape: Shape::matrix(n, n),
@@ -2282,17 +2402,40 @@ fn call_ty(call: &HirCall, tys: &HashMap<BindingId, LocalTy>, handles: &HandleTa
             },
             _ => LocalTy::Dynamic,
         },
+        // Graphics no-ops have no numeric result; using one as a value defers
+        // (they are only valid as expression statements).
+        Builtin::Noop => LocalTy::Dynamic,
+        // File I/O: `fopen` returns a scalar file id; `fread` returns a
+        // dynamic-shape array (length known only at run time); `fclose` returns a
+        // scalar status.
+        Builtin::Fopen | Builtin::Fclose => LocalTy::Scalar,
+        Builtin::Fread => LocalTy::Array {
+            shape: Shape::Dynamic,
+        },
     }
 }
 
-/// The shape of `zeros`/`ones` from its constant dimension arguments: one
-/// argument is a square matrix, more form an N-D array.
-fn fill_ty(call: &HirCall) -> LocalTy {
+/// The shape of `zeros`/`ones`/`Inf`/`NaN` from its dimension arguments: one
+/// constant argument is a square matrix, more form an N-D array. A runtime
+/// dimension makes the whole array dynamic (`Array { Shape::Dynamic }`); a
+/// non-scalar argument is not a valid dimension.
+fn fill_ty(call: &HirCall, args: &[LocalTy]) -> LocalTy {
+    if args
+        .iter()
+        .any(|ty| !matches!(ty, LocalTy::Scalar | LocalTy::Int32))
+    {
+        return LocalTy::Dynamic;
+    }
     let mut dims = Vec::with_capacity(call.args.len());
     for i in 0..call.args.len() {
         match constant_arg(call, i) {
             Some(n) => dims.push(n),
-            None => return LocalTy::Dynamic,
+            // A runtime dimension makes the whole array dynamic.
+            None => {
+                return LocalTy::Array {
+                    shape: Shape::Dynamic,
+                }
+            }
         }
     }
     if dims.is_empty() {
@@ -2519,10 +2662,10 @@ fn index_ty(base: LocalTy, indexing: &IndexingSemantics) -> LocalTy {
     let comps = indexing.components.as_slice();
 
     if shape.is_dynamic() {
-        // `A(:)` on a dynamic vector is the identity; a scalar/tuntime subscript
-        // yields a scalar element (the parameter is treated as a vector; see
-        // `hir_to_mlir`).
-        if comps.len() == 1 && component_is_colon(&comps[0]) {
+        // A dynamic array is treated as a vector for single-element subscripts;
+        // a slice (colon, range, or logical mask) yields a dynamic-shape array.
+        // `A(:)` on a dynamic vector is the identity.
+        if comps.iter().any(component_is_slice) {
             return LocalTy::Array {
                 shape: Shape::Dynamic,
             };
@@ -2575,6 +2718,20 @@ fn index_ty(base: LocalTy, indexing: &IndexingSemantics) -> LocalTy {
             }
         }
         _ => static_or_dynamic_scalar(comps),
+    }
+}
+
+/// Whether a component selects a slice (colon, range, or logical mask) rather
+/// than a single element. Used for dynamic-shape bases, where a scalar index may
+/// be a runtime expression.
+pub(crate) fn component_is_slice(component: &IndexComponent) -> bool {
+    if component_is_colon(component) {
+        return true;
+    }
+    match component {
+        IndexComponent::Logical(_) => true,
+        IndexComponent::Expr(expr) => matches!(expr.kind, HirExprKind::Range(..)),
+        _ => false,
     }
 }
 

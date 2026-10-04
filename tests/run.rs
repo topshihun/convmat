@@ -1686,3 +1686,30 @@ fn run_array_scalar_ops() {
         "2.5 4 5.5 3",
     );
 }
+
+#[test]
+fn run_handle_return() {
+    // A returned anonymous handle snapshots its capture: `f(1)` is `1 + 3`.
+    run_exact(
+        "handle_return",
+        "struct convmat_value;\n\
+         convmat_value* handle_return(double);\n\
+         double convmat_handle_call(convmat_value*, double);\n\
+         void convmat_value_release(convmat_value*);",
+        "convmat_value* f = handle_return(3.0);\n    \
+         printf(\"%g\\n\", convmat_handle_call(f, 1.0));\n    \
+         convmat_value_release(f);",
+        "4",
+    );
+}
+
+#[test]
+fn run_handle_builtin() {
+    // A builtin handle called directly: `g = @sin; y = g(2)` is `sin(2)`.
+    run_exact(
+        "handle_builtin",
+        "double handle_builtin();",
+        "printf(\"%.17g\\n\", handle_builtin());",
+        "0.90929742682568171",
+    );
+}

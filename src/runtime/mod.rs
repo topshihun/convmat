@@ -58,6 +58,24 @@ pub const IDIV: &str = "convmat_idiv";
 pub const MASK_COUNT: &str = "convmat_mask_count";
 pub const MASK_GATHER: &str = "convmat_mask_gather";
 pub const MASK_ASSIGN: &str = "convmat_mask_assign";
+/// Runtime-length constant fill (`Inf(1, n)`/`zeros(1, n)` with a runtime dim),
+/// runtime column slice (`A(:, j)`), and elementwise two-array `min`/`max`.
+pub const FILL: &str = "convmat_fill";
+pub const COLUMN: &str = "convmat_column";
+pub const EWMIN: &str = "convmat_ewmin";
+pub const EWMAX: &str = "convmat_ewmax";
+/// Graphics no-op helper (`plot`/`plot3`): the generated C has no plotting
+/// backend, so these builtins lower to a documented no-op (see
+/// `docs/unsupported.md`).
+pub const PLOT: &str = "convmat_plot";
+
+/// File I/O helpers (`fopen`/`fread`/`fread_count`/`fclose`): a small table of
+/// `FILE*` keyed by an integer id, so a file handle is a plain scalar. See
+/// `docs/unsupported.md`.
+pub const FOPEN: &str = "convmat_fopen";
+pub const FREAD: &str = "convmat_fread";
+pub const FREAD_COUNT: &str = "convmat_fread_count";
+pub const FCLOSE: &str = "convmat_fclose";
 pub const ERROR_ENTER: &str = "convmat_error_enter";
 pub const ERROR_CHECK: &str = "convmat_error_check";
 pub const ERROR_LEAVE: &str = "convmat_error_leave";
@@ -72,6 +90,23 @@ pub const CELL_GET_SCALAR: &str = "convmat_cell_get_scalar";
 /// Release a boxed value (the cell lifecycle helper, provided by the cell
 /// support blob rather than a standalone helper).
 pub const VALUE_RELEASE: &str = "convmat_value_release";
+
+/// Sentinel name requested by `lowering` to emit the composed function-handle
+/// runtime support ([`handle_support_source`]). It is not a single helper.
+pub const HANDLE_SUPPORT: &str = "convmat_handle_support";
+pub const FUNCTION_HANDLE: &str = "convmat_function_handle";
+pub const HANDLE_SET_ENV: &str = "convmat_handle_set_env";
+pub const HANDLE_ENV: &str = "convmat_handle_env";
+pub const HANDLE_CALL: &str = "convmat_handle_call";
+
+/// Whether `name` is a function-handle runtime helper (covered by the handle
+/// support blob rather than a standalone [`helper_source`] entry).
+pub fn is_handle_helper(name: &str) -> bool {
+    matches!(
+        name,
+        FUNCTION_HANDLE | HANDLE_SET_ENV | HANDLE_ENV | HANDLE_CALL
+    )
+}
 
 /// Complex runtime helpers, provided by [`complex_support_source`].
 pub const COMPLEX_SUPPORT: &str = "convmat_complex_support";
@@ -132,6 +167,60 @@ pub fn cell_support_source() -> String {
         dynamic_kernel_source()
     )
 }
+
+/// The C support for function handles: the dynamic value-model kernel plus thin
+/// wrappers over a `CONVMAT_FUNCTION` box. A handle stores a registry id plus the
+/// scalars it captured at creation; `convmat_handle_call` dispatches through
+/// `convmat_handle_dispatch`, which the lowering emits per module (one `case`
+/// per handle site). See `docs/runtime.md` §9.2 and `docs/architecture.md` §13.
+pub fn handle_support_source() -> String {
+    format!(
+        "#ifndef CONVMAT_HANDLE_SUPPORT_H\n\
+#define CONVMAT_HANDLE_SUPPORT_H\n\
+{}\n{HANDLE_WRAPPERS_C}\n\
+#endif\n",
+        dynamic_kernel_source()
+    )
+}
+
+/// Thin wrappers over the value-model kernel for function handles. `id` selects
+/// the generated thunk (see `convmat_handle_dispatch`); the captured scalars are
+/// read back by index. `convmat_handle_call` is non-`static` so a hand-written
+/// driver can invoke a returned handle.
+const HANDLE_WRAPPERS_C: &str = "\
+// ---- convmat function handles (boxed CONVMAT_FUNCTION values) ----\n\
+// Defined by the generated module: dispatch `id` to the matching thunk.\n\
+double convmat_handle_dispatch(double id, convmat_value *h, double x);\n\
+static convmat_value *convmat_function_handle(double id) {\n\
+    convmat_value *v = convmat_value_new(CONVMAT_FUNCTION, CONVMAT_DOUBLE);\n\
+    v->u.func.handle_id = (int64_t)id;\n\
+    v->u.func.nenv = 0;\n\
+    v->u.func.env = nullptr;\n\
+    return v;\n\
+}\n\
+static void convmat_handle_set_env(convmat_value *h, double i, double value) {\n\
+    int64_t idx = (int64_t)i;\n\
+    if (idx < 0) return;\n\
+    if (idx >= h->u.func.nenv) {\n\
+        int64_t newn = idx + 1;\n\
+        double *buf = new double[newn]();\n\
+        for (int64_t k = 0; k < h->u.func.nenv; k++) buf[k] = h->u.func.env[k];\n\
+        delete[] h->u.func.env;\n\
+        h->u.func.env = buf;\n\
+        h->u.func.nenv = newn;\n\
+    }\n\
+    h->u.func.env[idx] = value;\n\
+}\n\
+static double convmat_handle_env(const convmat_value *h, double i) {\n\
+    int64_t idx = (int64_t)i;\n\
+    if (idx < 0 || idx >= h->u.func.nenv) return 0.0;\n\
+    return h->u.func.env[idx];\n\
+}\n\
+// Invoke a unary function handle.\n\
+double convmat_handle_call(convmat_value *h, double x) {\n\
+    return convmat_handle_dispatch((double)h->u.func.handle_id, h, x);\n\
+}\n\
+";
 
 /// Thin wrappers over the value-model kernel for scalar-element cells (the only
 /// cell form the static lowering supports today; `docs/runtime.md` §9.2).
@@ -327,6 +416,8 @@ typedef struct convmat_value {\n\
         } strct;\n\
         struct {\n\
             int64_t handle_id;\n\
+            int64_t nenv;\n\
+            double *env;\n\
         } func;\n\
     } u;\n\
 } convmat_value;\n\
@@ -419,7 +510,11 @@ convmat_value *convmat_value_new(convmat_kind kind, convmat_dtype dtype) {
             v->u.strct.field_names = nullptr;
             v->u.strct.fields = nullptr;
             break;
-        case CONVMAT_FUNCTION: v->u.func.handle_id = -1; break;
+        case CONVMAT_FUNCTION:
+            v->u.func.handle_id = -1;
+            v->u.func.nenv = 0;
+            v->u.func.env = nullptr;
+            break;
         case CONVMAT_EMPTY: break;
     }
     return v;
@@ -454,6 +549,10 @@ void convmat_value_release(convmat_value *v) {
             for (int64_t f = 0; f < v->u.strct.nfields; f++) delete[] v->u.strct.field_names[f];
             delete[] v->u.strct.field_names;
             delete[] v->u.strct.shape.dims;
+            break;
+        }
+        case CONVMAT_FUNCTION: {
+            delete[] v->u.func.env;
             break;
         }
         default: break;
@@ -616,6 +715,12 @@ convmat_value *convmat_value_copy(const convmat_value *src) {
         case CONVMAT_FUNCTION: {
             convmat_value *v = convmat_value_new(CONVMAT_FUNCTION, src->dtype);
             v->u.func.handle_id = src->u.func.handle_id;
+            v->u.func.nenv = src->u.func.nenv;
+            v->u.func.env = nullptr;
+            if (src->u.func.nenv > 0) {
+                v->u.func.env = new double[src->u.func.nenv];
+                for (int64_t i = 0; i < src->u.func.nenv; i++) v->u.func.env[i] = src->u.func.env[i];
+            }
             return v;
         }
     }
@@ -662,6 +767,12 @@ pub fn helper_source(name: &str) -> Option<&'static str> {
         MASK_COUNT => MASK_COUNT_C,
         MASK_GATHER => MASK_GATHER_C,
         MASK_ASSIGN => MASK_ASSIGN_C,
+        FILL => FILL_C,
+        COLUMN => COLUMN_C,
+        EWMIN => EWMIN_C,
+        EWMAX => EWMAX_C,
+        PLOT => PLOT_C,
+        FOPEN | FREAD | FREAD_COUNT | FCLOSE => FILE_SUPPORT_C,
         ERROR_ENTER | ERROR_CHECK | ERROR_LEAVE | ERROR_THROW => ERROR_SUPPORT_C,
         _ => return None,
     })
@@ -1119,6 +1230,104 @@ void convmat_mask_assign(double* a, double n, const double* mask, double v) {\n\
 }\n\
 ";
 
+/// Graphics no-op: `plot`/`plot3` have no C representation. The lowering
+/// evaluates their arguments (for side effects) and calls this, so plotting-heavy
+/// MATLAB code still compiles; the call produces no output. It returns a dummy
+/// scalar so the call can stand in for a value-typed expression.
+const PLOT_C: &str = "\
+// ---- convmat graphics no-op (docs/unsupported.md) ----\n\
+static double convmat_plot(void) { return 0.0; }\n\
+";
+
+/// `convmat_fill`: write `n` copies of `v` into `dest` (a runtime-length constant
+/// fill, e.g. `Inf(1, n)` with a runtime `n`).
+const FILL_C: &str = "\
+static void convmat_fill(double* dest, double n, double v) {\n\
+    int64_t m = (int64_t)n;\n\
+    for (int64_t i = 0; i < m; i++) dest[i] = v;\n\
+}\n\
+";
+
+/// `convmat_column`: copy column `j` (1-based) of a column-major `rows`x`cols`
+/// array (`src`) into `dest` (a runtime column slice `A(:, j)`).
+const COLUMN_C: &str = "\
+static void convmat_column(double* dest, const double* src, double rows, double j) {\n\
+    int64_t r = (int64_t)rows;\n\
+    int64_t c = (int64_t)j - 1;\n\
+    for (int64_t i = 0; i < r; i++) dest[i] = src[c * r + i];\n\
+}\n\
+";
+
+/// `convmat_ewmin`/`convmat_ewmax`: elementwise `min`/`max` of two equal-length
+/// arrays (`min(A, B)` / `max(A, B)`).
+const EWMIN_C: &str = "\
+static void convmat_ewmin(double* dest, const double* a, const double* b, double n) {\n\
+    int64_t m = (int64_t)n;\n\
+    for (int64_t i = 0; i < m; i++) dest[i] = fmin(a[i], b[i]);\n\
+}\n\
+";
+
+const EWMAX_C: &str = "\
+static void convmat_ewmax(double* dest, const double* a, const double* b, double n) {\n\
+    int64_t m = (int64_t)n;\n\
+    for (int64_t i = 0; i < m; i++) dest[i] = fmax(a[i], b[i]);\n\
+}\n\
+";
+
+/// File I/O (`fopen`/`fread`/`fclose`): a stdio-backed table of `FILE*` keyed by an
+/// integer id (0 means failure), so a MATLAB file handle is a scalar `double`. The
+/// generated C is C++, hence `std::fopen` etc. `fread` reads raw `double`s (the
+/// only element type) from the current position; `fread_count` reports how many
+/// whole `double`s remain. See `docs/unsupported.md`.
+const FILE_SUPPORT_C: &str = "\
+#ifndef CONVMAT_FILE_SUPPORT_H\n\
+#define CONVMAT_FILE_SUPPORT_H\n\
+#include <cstdio>\n\
+static FILE* convmat_files[64] = {nullptr};\n\
+static int convmat_file_count = 1;\n\
+double convmat_fopen(const double* name, double namelen, double mode) {\n\
+    char buf[1024];\n\
+    int n = (int)namelen;\n\
+    if (n < 0) n = 0;\n\
+    if (n > 1023) n = 1023;\n\
+    for (int i = 0; i < n; i++) buf[i] = (char)(int)name[i];\n\
+    buf[n] = '\\0';\n\
+    char m[2];\n\
+    m[0] = (char)(int)mode;\n\
+    m[1] = '\\0';\n\
+    FILE* f = std::fopen(buf, m);\n\
+    if (f == nullptr) return 0.0;\n\
+    if (convmat_file_count >= 64) { std::fclose(f); return 0.0; }\n\
+    int id = convmat_file_count++;\n\
+    convmat_files[id] = f;\n\
+    return (double)id;\n\
+}\n\
+double convmat_fread_count(double fid) {\n\
+    int id = (int)fid;\n\
+    if (id <= 0 || id >= convmat_file_count) return 0.0;\n\
+    FILE* f = convmat_files[id];\n\
+    long cur = std::ftell(f);\n\
+    std::fseek(f, 0, SEEK_END);\n\
+    long bytes = std::ftell(f);\n\
+    std::fseek(f, cur, SEEK_SET);\n\
+    return (double)(bytes / (long)sizeof(double));\n\
+}\n\
+void convmat_fread(double* dest, double fid, double count) {\n\
+    int id = (int)fid;\n\
+    if (id <= 0 || id >= convmat_file_count) return;\n\
+    std::fread(dest, sizeof(double), (size_t)(long)count, convmat_files[id]);\n\
+}\n\
+double convmat_fclose(double fid) {\n\
+    int id = (int)fid;\n\
+    if (id > 0 && id < convmat_file_count && convmat_files[id] != nullptr) {\n\
+        std::fclose(convmat_files[id]);\n\
+        convmat_files[id] = nullptr;\n\
+    }\n\
+    return 0.0;\n\
+}\n\
+#endif\n\
+";
+
 pub const ERROR_SUPPORT_C: &str = "\
 #ifndef CONVMAT_ERROR_SUPPORT_H\n\
 #define CONVMAT_ERROR_SUPPORT_H\n\
@@ -1209,6 +1418,15 @@ mod tests {
         MASK_COUNT,
         MASK_GATHER,
         MASK_ASSIGN,
+        FILL,
+        COLUMN,
+        EWMIN,
+        EWMAX,
+        PLOT,
+        FOPEN,
+        FREAD,
+        FREAD_COUNT,
+        FCLOSE,
         ERROR_ENTER,
         ERROR_CHECK,
         ERROR_LEAVE,

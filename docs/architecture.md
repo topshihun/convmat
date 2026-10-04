@@ -77,7 +77,9 @@ MATLAB 是动态语言，无法（也不应）要求所有代码都静态可编�
    `global`（编译为 C `static`）、标量字段的 `struct`（构造/字段读写/嵌套字段/按值传参与
    返回）、`int32` 标量、逻辑下标 `A(mask)` 读/写、标量元素 cell 字面量与 `c{i}` 读、
    复数（`i`/`3+4i` 与复数算术、`abs`、`fft`，盒式，见 §10.5）、`try`/`catch`（`setjmp`，
-   见 §10.5），以及**非逃逸的匿名函数句柄**（同作用域、标量参数/捕获，见 §13）已支持。
+   见 §10.5）、**非逃逸的匿名函数句柄**（同作用域、标量参数/捕获，见 §13）与**逃逸/
+   内建函数句柄**（闭包值，见 §13.5）、**图形 no-op**（`plot`/`plot3`）与**基础文件
+   I/O**（`fopen`/`fread`/`fclose`，stdio helper，见 `docs/unsupported.md` §7）已支持。
 
 **边界两侧的处理**：
 
@@ -345,16 +347,16 @@ region——循环体写过的 cell 在后续迭代值不同；只有 `if` regio
 | P1 形状模型 | ✅ 完成 | `Shape`/`LocalTy`、列主序、行/列/N-D 元数据 |
 | P2 逐元素/广播/转置/逻辑 | ✅ 完成 | 同形数组 + 标量广播 + 2-D 转置（封装 `convmat_transpose`） |
 | P3 矩阵乘/幂 | ✅ 完成 | `*` 封装 `convmat_matmul`；`^`/`.^` 已支持（矩阵幂封装 `convmat_mpower`） |
-| P4 内建 | 🟡 部分 | 归约(含按维)+形状内省+`zeros/ones/eye/reshape`+`sort`(向量及矩阵列排序)+`mean/std/median/var/cumsum/diff/isnan/isinf/isempty/logical`+`linspace/repmat/permute`(静态)+`Inf/NaN`+`inv/det/norm/solve/rand`(静态方阵/向量)+`strcmp`(字面量)+`int32`+复数 `abs`/`fft`/`eig`(1x1/2x2) 已做；`find`、`cat/horzcat/vertcat` 未做 |
-| P5 索引/冒号/`end` | 🟡 部分 | 静态数组：常量下标 `A(i,j)`、线性 `A(i)`、`end`、`A(:)`、切片 `A(i,:)`/`A(:,j)`、常量区间/步长 `A(a:b:c)`（含 `end` 边界）、N-D 下标 `A(i,j,k)`、逻辑下标 `A(mask)` 读（运行时长度输出，`convmat_mask_gather`）与写（`A(mask)=v`，`convmat_mask_assign`）；动态数组形参：运行时下标 `A(i)`、`end`。仍缺变量/非静态下标 |
+| P4 内建 | 🟡 部分 | 归约(含按维)+形状内省+`zeros/ones/eye/reshape`+`sort`(向量及矩阵列排序)+`mean/std/median/var/cumsum/diff/isnan/isinf/isempty/logical`+`linspace/repmat/permute`(静态)+`Inf/NaN`+`inv/det/norm/solve/rand`(静态方阵/向量)+`strcmp`(字面量)+`int32`+复数 `abs`/`fft`/`eig`(1x1/2x2)+**图形 no-op `plot`/`plot3`**+**文件 I/O `fopen`/`fread`/`fclose`**(stdio) 已做；`find`、`cat/horzcat/vertcat` 未做 |
+| P5 索引/冒号/`end` | 🟡 部分 | 静态数组：常量下标 `A(i,j)`、线性 `A(i)`、`end`、`A(:)`、切片 `A(i,:)`/`A(:,j)`、常量区间/步长 `A(a:b:c)`（含 `end` 边界）、N-D 下标 `A(i,j,k)`、逻辑下标 `A(mask)` 读（运行时长度输出，`convmat_mask_gather`）与写（`A(mask)=v`，`convmat_mask_assign`）；动态数组：运行时下标 `A(i)` 读**与写**（`A(i)=v`）、`end`、运行时**列切片** `A(:, j)`（描述符形参，`convmat_column`）。仍缺静态数组的变量下标 |
 | 控制流 | ✅ 完成 | `if`/`elseif`/`else`、`while`、`for`（升/降序，编译为方向感知的 C `for`）、`switch`、`break`/`continue`、`try`/`catch`（`matlab.try` → `emitc` 的 `setjmp` 守卫 + `if`/`else`） |
 | 存储类 | 🟡 部分 | 局部栈变量；`persistent`/`global` 编译为 C `static`（单函数封闭世界），`persistent` 变量额外带 `_not_empty` 静态标志（`isempty` 首次为真，`kalmanfilter` 依赖此语义）；多返回值调用 `[a,b]=f()` 未做 |
 | struct 类型 | 🟡 部分 | `struct('a',1,...)` 构造、`s.a` 读/写、struct 按值传参/返回（含多出参 tuple）、struct 形参/局部字段使用点推断、嵌套字段路径 `s.a.b`（静态展平为扁平 C 字段）；数组字段、struct 数组未做 |
 | cell 类型 | 🟡 部分 | 标量元素 cell 字面量 `{...}` 与 `c{i}`（常量下标）读已支持，经 `convmat_value` box（`matlab.box` 类型 + `cell_new`/`cell_set`/`cell_get` → `emitc` C 调用，块作用域 `convmat_value_release`）；非标量元素、`cell(...)` 构造、`c{i}` 写、cell 形参/返回值仍 defer（见 §12） |
-| 匿名函数句柄 | 🟡 部分 | 同函数、非逃逸、标量参数/捕获的匿名函数 `f = @(x) …` 编译期特化（捕获作为额外形参，创建时快照，见 §13）；数组参数/捕获、逃逸句柄、命名/内建句柄、立即调用、`arrayfun` 未做 |
+| 匿名函数句柄 | 🟡 部分 | 同函数、非逃逸、标量参数/捕获的匿名函数 `f = @(x) …` 编译期特化（捕获作为额外形参，创建时快照）；**逃逸/返回句柄**（`f = @(x) x + k` 作为返回值）与**内建句柄**（`f = @sin`，直接调用或返回）降级为盒式 `convmat_value`（`CONVMAT_FUNCTION`）闭包，经生成的 thunk + `convmat_handle_dispatch` 分派（见 §13）。数组参数/捕获、交叉函数传递句柄、`arrayfun` 未做 |
 | 内存调度 | ✅ 完成 | 静态数组按 `numel` 调度：小数组入栈、超过 `STACK_ELEMS_LIMIT`（默认 4096 元素）的大数组堆分配并在返回前 `delete[]`；动态形状堆分配未做（见 P7） |
 | P6 优化 | 🟡 部分 | 按方言分层的独立 pass（`src/passes/matlab.rs`：常量折叠、cell 常量传播、死分支消除、死值消除；`src/passes/emitc.rs`：死单元、死值清理），基于 pliron `Pass` 框架迭代到不动点；循环条件不误折叠。CSE/canonicalize/linalg/向量化仍延后 |
-| P7 动态形状 | 🟡 部分 | 动态形状数组形参与输出均已实现：形参默认「指针 + 长度」ABI、查询 `size` 的形参走「指针 + 行 + 列」形状描述符 ABI、输出「缓冲 + 长度回填」ABI（`matlab.ptr` 类型）。支持 `size(A)`/`size(A,d)`（描述符形参）、`sum/prod/min/max(A)`、`numel/length(A)`（描述符下 `length=max(rows,cols)`）、运行时下标 `A(i)`、`end`、运行时区间循环 `for i = 1:numel(A)`，以及动态数组输出 `y = A(:)`、`y = -A(:)`、`y = k * A`（标量广播）、`y = A(:) ± B(:)`、`y = A(:) .* B(:)`（两个等长动态数组逐元素，`convmat_*` helper）；动态数组*中间值*已实现为块作用域（赋值处 `matlab.heap_alloc`，所在块末尾 `delete[]`；含控制流内，如循环体每轮分配/释放）；参数展开 `{:}`、cell/string 等待做 |
+| P7 动态形状 | 🟡 部分 | 动态形状数组形参与输出均已实现：形参默认「指针 + 长度」ABI、查询 `size` 的形参走「指针 + 行 + 列」形状描述符 ABI、输出「缓冲 + 长度回填」ABI（`matlab.ptr` 类型）。支持 `size(A)`/`size(A,d)`（描述符形参）、`sum/prod/min/max(A)`、`numel/length(A)`（描述符下 `length=max(rows,cols)`）、运行时下标 `A(i)` 读/写、运行时列切片 `A(:, j)`、`end`、运行时区间循环 `for i = 1:numel(A)`，以及动态数组输出 `y = A(:)`、`y = -A(:)`、`y = k * A`（标量广播）、`y = A(:) ± B(:)`、`y = A(:) .* B(:)`（两个等长动态数组逐元素，`convmat_*` helper）；运行时维度常量填充 `Inf/zeros/ones(1, n)`（`convmat_fill`）；两数组逐元素 `min`/`max`（`convmat_ewmin`/`ewmax`）；动态数组*中间值*已实现为块作用域（赋值处 `matlab.heap_alloc`，所在块末尾 `delete[]`；含控制流内，如循环体每轮分配/释放）；参数展开 `{:}`、cell/string 等待做 |
 | P8 函数调用 | 🟡 部分 | 封闭世界同文件函数调用已支持（标量 ABI：全标量入参 + 单标量输出，含递归；C 发射器为所有函数发前向声明）；多返回值调用 `[a,b]=f()`、数组/结构体实参、跨文件调用未做 |
 
 > 数组形参不再被当作标量：`sum(A)`、`A(i)`、`reshape(A,…)` 等会把它推断为动态形状
@@ -492,9 +494,14 @@ region——循环体写过的 cell 在后续迭代值不同；只有 `if` regio
 运行时闭包模型拉进 `matlab` 方言（违反 §6 分层）。因此按 §4 的封闭世界规则切分：
 
 - **静态路径（已支持）**：句柄在**同一函数内创建、只被直接调用、不逃逸**，且参数/捕获
-  均为标量。编译期解析目标函数并由 `hir_to_mlir` 特化到固定签名。
-- **动态路径（defer）**：句柄作为返回值/实参、存入 struct/cell/数组、赋值给其他变量、
-  参与非调用表达式，或调用需要多返回值分派——需要闭包值（函数指针 + 环境，§11.2）。
+  均为标量。编译期解析目标函数并由 `hir_to_mlir` 特化到固定签名；`@name`（内建）
+  的直接调用同理降为对 `name` 的普通调用。
+- **闭包值路径（已支持，一元、标量捕获）**：句柄**作为返回值逃逸**时，降为盒式
+  `convmat_value`（`CONVMAT_FUNCTION`）：创建时把捕获标量快照进环境，`hir_to_mlir`
+  为每个逃逸点生成 thunk + 模块级 `convmat_handle_dispatch`，调用方经运行时
+  `convmat_handle_call` 分派（§13.3、`docs/runtime.md` §9.5）。
+- **仍 defer**：句柄作为实参、存入 struct/cell/数组、赋值给其他变量、参与非调用
+  表达式，多参数/数组捕获/数组返回的句柄，以及在控制流内定义的句柄。
 
 ### 13.2 HIR 形态（一个陷阱）
 
@@ -508,19 +515,28 @@ runmat 已把 `@(x) …` 降为真实 `HirFunction`（`kind = FunctionKind::Anon
 
 | 层 | 职责 |
 |----|------|
-| `triage` | `analyze_handles` 单一裁决点：识别顶层单次 `f = @(…)`；扫描所有使用确认非逃逸（只允许 `f(args)`）；`expr_ty` 把句柄调用归为标量；`classify` 与 `infer_locals` 跳过句柄绑定 |
-| `hir_to_mlir` | 匿名函数名 sanitize（`anonymous#1` → `convmat_anon_1`）；`function.captures` 接为**尾部额外形参**；`f = @(…)` 落成捕获快照；`f(args)` 落成 `matlab.call @convmat_anon_N(args…, captures…)` |
-| `lowering`/`emit_c` | 无需新 op；匿名 helper 是模块内普通 `builtin.func`，helper 收集时按「已定义函数名」排除 |
+| `triage` | `analyze_handles` 单一裁决点：识别顶层单次 `f = @(…)` / `f = @name`；分为**非逃逸**（只允许 `f(args)`，进 `local`）与**作为返回值的逃逸**（进 `returned`）；校验使用、拒绝其余逃逸；`expr_ty` 把句柄（及其调用）归为标量/`Handle`；`classify` 与 `infer_locals` 把句柄绑定归为 `LocalTy::Handle` |
+| `hir_to_mlir` | 匿名函数名 sanitize（`anonymous#1` → `convmat_anon_1`）；非逃逸：`function.captures` 接为**尾部额外形参**，创建时快照，`f(args)` 落成 `matlab.call @convmat_anon_N(args…, captures…)`；逃逸：`collect_handle_sites` 预扫描分配 id，创建处落成 `convmat_function_handle(id)` + `convmat_handle_set_env`，并生成 thunk（`convmat_handle_thunk_<id>`）与模块级 `convmat_handle_dispatch`（select 链）；内建 `@name` 直接调用落成对 `name` 的调用 |
+| `lowering`/`emit_c` | 无需新 op；匿名 helper、thunk、`convmat_handle_dispatch` 都是模块内普通 `builtin.func`，helper 收集时按「已定义函数名」排除；句柄 helper 经 `handle_support_source()` 按需发射 |
 
 ### 13.4 捕获语义（正确性红线）
 
 MATLAB 在**创建时按值快照**捕获变量。生成的 C 在 `f = @(…)` 处把每个捕获存入
 调用方帧内的快照单元，调用时读出作为 helper 的尾部实参；helper 内捕获是可读局部。
+逃逸句柄同理，只是快照落在盒内（`convmat_handle_set_env` → `u.func.env`），调用时经
+`convmat_handle_env` 读回。
 
 ### 13.5 现状与后续
 
 - **已支持**：标量参数/捕获、任意参数个数（含 0）、同函数多句柄、创建后变量再赋值仍
   按创建值（快照）——均有 `tests/fixtures/anon_*.m` + `tests/run.rs::run_anon_*` 覆盖，
   逃逸用例见 `tests/errors.rs`。
-- **仍 defer**：数组参数/捕获/返回值、逃逸句柄、在控制流内定义句柄、命名函数句柄 `@f`、内建句柄 `@sin`、
-  立即调用 `(@(x) …)(3)`、跨函数句柄传递（需闭包值或跨函数调用，后者与「用户函数直接调用」一并补齐）。
+- **已支持（闭包值，`CONVMAT_FUNCTION` 盒）**：**返回**句柄——匿名（`f = @(x) x + k` 作为
+  返回值）与内建（`f = @sin` 作为返回值）——以及**内建句柄的直接调用**（`g = @sin; y = g(2)`）。
+  实现：`hir_to_mlir` 为每个逃逸句柄点生成一个 thunk + 模块级 `convmat_handle_dispatch`
+  （select 链），把捕获标量快照进 `u.func.env`；运行时 `convmat_handle_call` 经它分派
+  （`docs/runtime.md` §9.5）。覆盖：`tests/fixtures/handle_*.m` + `run_handle_*`，coder 例
+  `func_handle_return`/`func_handle_builtin`。
+- **仍 defer**：数组参数/捕获/返回值的句柄、多参数句柄（driver 侧只提供一元
+  `convmat_handle_call`）、逃逸到 struct/cell/数组、跨函数句柄传递、在控制流内定义句柄、
+  命名用户函数句柄 `@f`、立即调用 `(@(x) …)(3)`、`arrayfun`。

@@ -724,3 +724,55 @@ fn codegen_emitc_dead_value_after_folds() {
     assert!(c.contains("double v1 = 20.0"), "got:\n{c}");
     assert!(!c.contains("double a0"), "got:\n{c}");
 }
+
+// --- function handles as closure values --------------------------------------
+
+#[test]
+fn codegen_returned_handle_closure() {
+    // A returned anonymous handle lowers to a boxed `CONVMAT_FUNCTION` closure:
+    // the captured scalar is snapshotted into `u.func.env`, a per-site thunk
+    // forwards to `convmat_anon_N`, and the generated dispatcher routes by id.
+    let c = compile_fixture("handle_return");
+    assert!(c.contains("convmat_value* handle_return("), "got:\n{c}");
+    assert!(c.contains("convmat_function_handle("), "got:\n{c}");
+    assert!(c.contains("convmat_handle_set_env("), "got:\n{c}");
+    assert!(c.contains("double convmat_handle_thunk_0("), "got:\n{c}");
+    assert!(c.contains("double convmat_handle_dispatch("), "got:\n{c}");
+}
+
+#[test]
+fn codegen_builtin_handle_direct_call() {
+    // `g = @sin; y = g(2)` lowers to a direct `sin` call (no closure value).
+    let c = compile_fixture("handle_builtin");
+    assert!(c.contains("double handle_builtin("), "got:\n{c}");
+    assert!(c.contains("sin("), "got:\n{c}");
+    assert!(!c.contains("convmat_function_handle("), "got:\n{c}");
+}
+
+#[test]
+fn codegen_graphics_noop() {
+    // `plot(x)` has no C representation; the args are evaluated and the call
+    // becomes the documented no-op `convmat_plot`.
+    let c = compile_fixture("plot");
+    assert!(c.contains("void plot_demo("), "got:\n{c}");
+    assert!(c.contains("convmat_plot("), "got:\n{c}");
+}
+
+#[test]
+fn codegen_file_io_stdio_helpers() {
+    // `fopen`/`fread`/`fclose` lower to the stdio-backed runtime helpers.
+    let c = compile_fixture("file_io");
+    assert!(c.contains("convmat_fopen("), "got:\n{c}");
+    assert!(c.contains("convmat_fread("), "got:\n{c}");
+    assert!(c.contains("convmat_fclose("), "got:\n{c}");
+}
+
+#[test]
+fn codegen_dynamic_array_primitives() {
+    // Runtime `Inf(1, n)` fill, a runtime subscript write `y(j) = 0`, a runtime
+    // column slice `A(:, j)`, and elementwise `min(y, ...)`.
+    let c = compile_fixture("dynamic_ops");
+    assert!(c.contains("convmat_fill("), "got:\n{c}");
+    assert!(c.contains("convmat_column("), "got:\n{c}");
+    assert!(c.contains("convmat_ewmin("), "got:\n{c}");
+}

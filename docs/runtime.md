@@ -85,7 +85,9 @@ typedef struct convmat_value {
             convmat_value **fields;     // 字段主序：fields[f * numel + i]
         } strct;
         struct {
-            int64_t handle_id;          // 函数注册表索引
+            int64_t handle_id;          // 分派 id（→ `convmat_handle_dispatch`）
+            int64_t nenv;               // 捕获标量个数
+            double *env;                // 创建时快照的捕获值（堆，归属所属 value）
         } func;
     } u;
 } convmat_value;
@@ -263,6 +265,11 @@ void convmat_error_throw(const char *msg);   // longjmp 到最近 armed 的 catc
 | `convmat_mask_count` | 非零掩码元素个数 | `A(mask)` 的结果长度回填 |
 | `convmat_mask_gather` | `dst = src(where mask)`，返回个数 | `A(mask)` 读 |
 | `convmat_mask_assign` | `a(where mask) = v`（原地） | `A(mask) = v` 写 |
+| `convmat_fill` | 运行时长度常量填充 | `Inf(1,n)`/`zeros(1,n)`（运行时维度） |
+| `convmat_column` | 列主序 2-D 数组的运行时列切片 | `W(:, j)`（描述符形参，运行时 `j`） |
+| `convmat_ewmin` / `convmat_ewmax` | 两等长数组逐元素 `min`/`max` | `min(A, B)` / `max(A, B)`（两数组） |
+| `convmat_plot` | 图形 no-op（无输出） | `plot`/`plot3`（见 `docs/unsupported.md` §7.1） |
+| `convmat_fopen` / `convmat_fread` / `convmat_fread_count` / `convmat_fclose` | stdio 文件 I/O（`FILE*` 表 + 标量 id；读二进制 `double`） | `fopen`/`fread`/`fclose`（见 `docs/unsupported.md` §7.2） |
 
 **不在本类**（编译期直接内联展开，无需 helper）：标量算术/比较/逻辑、静态数组逐元素
 与标量广播、`libm` 一元/二元内建（`sin`/`pow`/…）、常量下标读写、`zeros/ones/eye/reshape`。
@@ -270,10 +277,10 @@ void convmat_error_throw(const char *msg);   // longjmp 到最近 armed 的 catc
 ### 9.2 动态 tier 值模型内核（已实现 C，**尚未接入 `.m` 降级**）
 
 `DYNAMIC_RUNTIME_H`（类型 + 原型）+ `DYNAMIC_RUNTIME_C`（实现），由 `tests/runtime.rs`
-直接编译运行验证。**已接线到 cell 与复数**：`lowering` 按需发射 `cell_support_source()` /
-`complex_support_source()`（`DYNAMIC_RUNTIME_H`+`C` + 各自包装），支撑 cell 字面量/`c{i}` 读
-与复数算术/`cabs`/`fft`（`CONVMAT_COMPLEX`，交错 `[re,im]` 数据）。其余动态特性（字符串/
-嵌套 struct 等）仍待接。
+直接编译运行验证。**已接线到 cell、复数与函数句柄**：`lowering` 按需发射 `cell_support_source()` /
+`complex_support_source()` / `handle_support_source()`（`DYNAMIC_RUNTIME_H`+`C` + 各自包装），
+支撑 cell 字面量/`c{i}` 读、复数算术/`cabs`/`fft`（`CONVMAT_COMPLEX`，交错 `[re,im]` 数据）、
+以及逃逸/内建函数句柄（`CONVMAT_FUNCTION`，§9.5）。其余动态特性（字符串/嵌套 struct 等）仍待接。
 
 | 组 | 符号 | 状态 |
 |----|------|------|
@@ -282,12 +289,21 @@ void convmat_error_throw(const char *msg);   // longjmp 到最近 armed 的 catc
 | cell | `convmat_cell_create` / `get` / `set` | ✅ 实现；已接线（`{...}`/`c{i}`，标量元素） |
 | complex | `convmat_complex` / `complex_real` / `cabs` / `cadd` / `csub` / `cmul` / `cdiv` / `fft` / `complex_component` | ✅ 实现；已接线（`3+4i`/`abs`/`fft`） |
 | struct | `convmat_struct_create` / `field_index` / `get` / `set` | ✅ 实现 |
+| 函数句柄 | `convmat_function_handle` / `handle_set_env` / `handle_env` / `handle_call` | ✅ 实现；已接线（逃逸/内建句柄，见 §9.5） |
 | 形状/索引 | `convmat_numel` / `linear_index` | ✅ 实现 |
 | 动态 ABI | `convmat_runtime_fn`（typedef） | ⛔ 仅声明 |
 | 错误传播 | `convmat_error_enter` / `convmat_error_check`（宏，内联 `setjmp`）/ `convmat_error_leave` / `convmat_error_throw`（`longjmp`） | ✅ 实现（`ERROR_SUPPORT_C`，供 `try`/`catch` 使用，见 §7） |
 
 支持的 `convmat_dtype`：`CONVMAT_DOUBLE` / `CONVMAT_LOGICAL`（存储均为 `double`）；
 `CONVMAT_INT32` / `CONVMAT_CHAR` 预留（无实现）。
+
+### 9.5 函数句柄（`CONVMAT_FUNCTION`）
+
+一个函数句柄是一个 `CONVMAT_FUNCTION` 盒：`u.func.handle_id` 选择 `handle_support_source()`
+之外的**生成分派器**，`u.func.env` 按创建时快照保存捕获标量。降级侧（`hir_to_mlir`）在每个
+逃逸句柄点生成一个 thunk（`convmat_handle_thunk_<id>`）与一个模块级分派器
+`convmat_handle_dispatch(id, h, x)`（select 链，无需新控制流 op）；运行时 `convmat_handle_call`
+经它分派。当前边界：句柄一元（单参数，标量），匿名目标须返回标量，`@name` 须是有效一元内建。
 
 ### 9.3 明确不属于运行时库（由静态分析解决）
 

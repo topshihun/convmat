@@ -48,7 +48,10 @@ const SUPPORTED: &[&str] = &[
     "builtin_predicates",
     "builtin_std",
     "cell_basic",
+    "dijkstra",
     "fib",
+    "func_handle_builtin",
+    "func_handle_return",
     "func_helper",
     "func_recursion",
     "kalmanfilter",
@@ -58,8 +61,11 @@ const SUPPORTED: &[&str] = &[
     "linalg_norm",
     "linalg_solve",
     "mandelbrot_count",
+    "sierpinski",
     "struct_nested",
     "sys_fft",
+    "sys_file_io",
+    "sys_plot",
     "sys_random",
     "sys_trycatch",
     "text_compare",
@@ -137,6 +143,13 @@ fn scratch_dir(name: &str) -> PathBuf {
 
 /// Compile a supported example with a `main` driver and return trimmed stdout.
 fn run_program(name: &str, decls: &str, body: &str) -> String {
+    run_program_with_files(name, decls, body, &[])
+}
+
+/// Like [`run_program`], but writes `files` into the scratch directory first and
+/// runs the program with that directory as its working directory (so examples can
+/// read auxiliary data, e.g. `fopen('data.bin')`).
+fn run_program_with_files(name: &str, decls: &str, body: &str, files: &[(&str, &[u8])]) -> String {
     let cpp = compile_example(name).expect("supported example should compile");
     let compiler = find_compiler()
         .unwrap_or_else(|| panic!("no C++ compiler found (set `CXX`); run tests need one"));
@@ -147,6 +160,9 @@ fn run_program(name: &str, decls: &str, body: &str) -> String {
     let bin_path = dir.join("prog");
 
     fs::write(&gen_path, &cpp).expect("write generated code");
+    for (file, bytes) in files {
+        fs::write(dir.join(file), bytes).expect("write auxiliary data file");
+    }
     fs::write(
         &main_path,
         format!(
@@ -174,7 +190,10 @@ fn run_program(name: &str, decls: &str, body: &str) -> String {
         );
     }
 
-    let run = Command::new(&bin_path).output().expect("run program");
+    let run = Command::new(&bin_path)
+        .current_dir(&dir)
+        .output()
+        .expect("run program");
     let _ = fs::remove_dir_all(&dir);
 
     assert!(
@@ -190,6 +209,18 @@ fn run_program(name: &str, decls: &str, body: &str) -> String {
 /// Assert that a driver prints exactly `expected`.
 fn run_exact(name: &str, decls: &str, body: &str, expected: &str) {
     let got = run_program(name, decls, body);
+    assert_eq!(got, expected, "`{name}` produced wrong output");
+}
+
+/// Like [`run_exact`], but writes `files` into the program's working directory.
+fn run_exact_with_files(
+    name: &str,
+    decls: &str,
+    body: &str,
+    files: &[(&str, &[u8])],
+    expected: &str,
+) {
+    let got = run_program_with_files(name, decls, body, files);
     assert_eq!(got, expected, "`{name}` produced wrong output");
 }
 
@@ -653,6 +684,81 @@ fn coder_examples_supported_run() {
          convmat_complex_component(z, 1.0, 0.0));\n    \
          convmat_value_release(z);",
         "2 3",
+    );
+
+    // A returned anonymous handle snapshots its capture: `f(1)` is `1 + 3`.
+    run_exact(
+        "func_handle_return",
+        "struct convmat_value;\n\
+         convmat_value* func_handle_return(double);\n\
+         double convmat_handle_call(convmat_value*, double);\n\
+         void convmat_value_release(convmat_value*);",
+        "convmat_value* f = func_handle_return(3.0);\n    \
+         printf(\"%g\\n\", convmat_handle_call(f, 1.0));\n    \
+         convmat_value_release(f);",
+        "4",
+    );
+
+    // A returned builtin handle: `f(0)` is `sin(0) == 0`.
+    run_exact(
+        "func_handle_builtin",
+        "struct convmat_value;\n\
+         convmat_value* func_handle_builtin(void);\n\
+         double convmat_handle_call(convmat_value*, double);\n\
+         void convmat_value_release(convmat_value*);",
+        "convmat_value* f = func_handle_builtin();\n    \
+         printf(\"%g\\n\", convmat_handle_call(f, 0.0));\n    \
+         convmat_value_release(f);",
+        "0",
+    );
+
+    // `plot` is a documented no-op for the C backend: `sys_plot` compiles and
+    // runs (the plot produces no output).
+    run_exact(
+        "sys_plot",
+        "void sys_plot(void);",
+        "sys_plot();\n    printf(\"ok\\n\");",
+        "ok",
+    );
+
+    // `sierpinski` computes its points and calls the no-op `plot` each iteration;
+    // it must compile and run to completion.
+    run_exact(
+        "sierpinski",
+        "void sierpinski(double);",
+        "sierpinski(10.0);\n    printf(\"ok\\n\");",
+        "ok",
+    );
+
+    // File I/O: `fopen`/`fread`/`fclose` read a binary file of doubles.
+    {
+        let mut bytes = Vec::new();
+        for value in [1.5f64, 2.5, 3.5, 4.5] {
+            bytes.extend_from_slice(&value.to_ne_bytes());
+        }
+        run_exact_with_files(
+            "sys_file_io",
+            "void sys_file_io(double*, double*);",
+            "double y[16];\n    double n = 0.0;\n    sys_file_io(y, &n);\n    \
+             printf(\"%g %g %g %g %g\\n\", n, y[0], y[1], y[2], y[3]);",
+            &[("data.bin", &bytes)],
+            "4 1.5 2.5 3.5 4.5",
+        );
+    }
+
+    // Dijkstra: a composite of dynamic-array primitives (`Inf(1,n)` fill, a
+    // runtime subscript write `dist(source)=0`, a runtime column slice
+    // `W(:,source)`, scalar broadcast, and elementwise `min`). For a 3x3 `W`
+    // with source=1 the result is the source column `[0 3 5]`.
+    run_exact(
+        "dijkstra",
+        "void dijkstra(double*, double, double, double, double, double*, double*, double*, double*);",
+        "double W[9] = {0, 3, 5, 1, 0, 6, 2, 4, 0};\n    \
+         double dist[8], path[8];\n    double dn = 0.0, pn = 0.0;\n    \
+         dijkstra(W, 3.0, 3.0, 1.0, 3.0, dist, &dn, path, &pn);\n    \
+         printf(\"%g %g %g %g %g %g %g %g\\n\", dn, dist[0], dist[1], dist[2],\n    \
+         pn, path[0], path[1], path[2]);",
+        "3 0 3 5 3 0 3 5",
     );
 }
 

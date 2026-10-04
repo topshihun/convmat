@@ -51,6 +51,8 @@ pub fn lower_module(context: &mut Context, module: &ModuleOp) -> Result<ModuleOp
             crate::runtime::cell_support_source()
         } else if name == crate::runtime::COMPLEX_SUPPORT {
             crate::runtime::complex_support_source()
+        } else if name == crate::runtime::HANDLE_SUPPORT {
+            crate::runtime::handle_support_source()
         } else {
             crate::runtime::helper_source(&name)
                 .ok_or_else(|| Error::Backend(format!("unknown runtime helper `{name}`")))?
@@ -417,8 +419,11 @@ fn collect_helpers_from_op(
         used.insert(crate::runtime::ERROR_CHECK.to_string());
     }
     if let Some(call) = Operation::get_op::<matlab::BoxCallOp>(op, context) {
-        if crate::runtime::is_complex_helper(&call.callee(context)) {
+        let callee = call.callee(context);
+        if crate::runtime::is_complex_helper(&callee) {
             used.insert(crate::runtime::COMPLEX_SUPPORT.to_string());
+        } else if crate::runtime::is_handle_helper(&callee) {
+            used.insert(crate::runtime::HANDLE_SUPPORT.to_string());
         }
     }
     if Operation::get_op::<matlab::CellNewOp>(op, context).is_some()
@@ -434,6 +439,8 @@ fn collect_helpers_from_op(
             if callee == crate::runtime::VALUE_RELEASE {
                 // `convmat_value_release` comes from the cell support blob.
                 used.insert(crate::runtime::CELL_SUPPORT.to_string());
+            } else if crate::runtime::is_handle_helper(&callee) {
+                used.insert(crate::runtime::HANDLE_SUPPORT.to_string());
             } else {
                 used.insert(callee);
             }
@@ -442,6 +449,8 @@ fn collect_helpers_from_op(
         let callee = call.callee(context);
         if crate::runtime::is_complex_helper(&callee) {
             used.insert(crate::runtime::COMPLEX_SUPPORT.to_string());
+        } else if crate::runtime::is_handle_helper(&callee) {
+            used.insert(crate::runtime::HANDLE_SUPPORT.to_string());
         } else if callee.starts_with("convmat_") && !defined.contains(&callee) {
             used.insert(callee);
         }

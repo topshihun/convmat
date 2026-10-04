@@ -50,9 +50,10 @@ use crate::dialects::matlab::{
 use crate::error::{Error, Result};
 use crate::triage::{
     analyze_handles, brace_index, broadcast_shape, call_name, char_codes, component_end_offset,
-    component_is_colon, concat_operand_shape, constant_int_list, dispatch, expr_ty,
-    flat_field_name, infer_locals, member_path, place_member_path, shape_descriptor_params,
-    static_index_selection, unquote_str, varargout_index, FunctionPlan, LocalTy, Shape, Variadics,
+    component_is_colon, component_is_slice, concat_operand_shape, constant_int_list, dispatch,
+    expr_ty, flat_field_name, infer_locals, member_path, place_member_path,
+    shape_descriptor_params, static_index_selection, unquote_str, varargout_index, FunctionPlan,
+    HandleKind, LocalTy, Shape, Variadics,
 };
 
 use runmat_hir::{
@@ -100,6 +101,10 @@ pub fn lower_to_module_with_plans(
     let f64_ty: TypeHandle = FP64Type::get(context).into();
     let module = ModuleOp::new(context, Identifier::try_from("convmat").unwrap());
 
+    // Resolve the escaping function-handle sites first, so each gets a stable id
+    // the per-function lowering and the generated dispatch agree on.
+    let (handle_sites, handle_ids) = collect_handle_sites(hir)?;
+
     // Map each binding to its storage class, so `persistent`/`global` bindings
     // can be allocated as `static` cells.
     let storage: HashMap<BindingId, BindingStorage> = hir
@@ -137,11 +142,202 @@ pub fn lower_to_module_with_plans(
 
     for (function, plan) in hir.functions.iter().zip(plans) {
         lower_function(
-            context, function, hir, &storage, &module, f64_ty, plan, &callees,
+            context,
+            function,
+            hir,
+            &storage,
+            &module,
+            f64_ty,
+            plan,
+            &callees,
+            &handle_sites,
+            &handle_ids,
         )?;
     }
 
+    // Generate the closure machinery: a thunk per escaping handle site plus the
+    // dispatcher `convmat_handle_dispatch` that `convmat_handle_call` routes
+    // through (see `docs/architecture.md` §13).
+    build_handle_helpers(context, &module, &handle_sites, f64_ty)?;
+
     Ok(module)
+}
+
+/// Pre-scan every function for handles that escape as an output, assigning each a
+/// stable site id and recording the captures its thunk must thread through.
+fn collect_handle_sites(hir: &HirAssembly) -> Result<(Vec<HandleSite>, HandleSiteIds)> {
+    let mut sites: Vec<HandleSite> = Vec::new();
+    let mut ids: HandleSiteIds = HashMap::new();
+    for function in &hir.functions {
+        let analysis = analyze_handles(function).map_err(Error::NotLowerable)?;
+        for (binding, kind) in &analysis.returned {
+            let captures = match kind {
+                HandleKind::Anonymous(id) => {
+                    let anon = hir
+                        .functions
+                        .iter()
+                        .find(|function| function.id == *id)
+                        .ok_or_else(|| {
+                            Error::Backend(format!("anonymous function #{} not found", id.0))
+                        })?;
+                    // The boxed handle is invoked through the unary runtime call
+                    // `convmat_handle_call(h, x)`.
+                    if anon.abi.fixed_inputs.len() != 1 {
+                        return Err(Error::NotLowerable(
+                            "a returned function handle must take exactly one argument".to_string(),
+                        ));
+                    }
+                    if !anon_returns_scalar(hir, *id) {
+                        return Err(Error::NotLowerable(
+                            "a returned function handle must return a scalar".to_string(),
+                        ));
+                    }
+                    anon_capture_bindings(hir, *id)?
+                }
+                HandleKind::Builtin(name) => {
+                    if !builtins::lookup(name).is_some_and(|b| b.valid_arity(1)) {
+                        return Err(Error::NotLowerable(format!(
+                            "a returned builtin handle `@{name}` must be a unary builtin"
+                        )));
+                    }
+                    Vec::new()
+                }
+            };
+            let id = sites.len();
+            sites.push(HandleSite {
+                kind: kind.clone(),
+                captures,
+            });
+            ids.insert((function.id, *binding), id);
+        }
+    }
+    Ok((sites, ids))
+}
+
+/// Build one thunk per escaping handle site and the dispatcher that routes an
+/// integer site id to its thunk. The thunks ignore the box (captures are read
+/// through `convmat_handle_env`); the dispatcher is a select-chain over the id,
+/// so no new control-flow ops are needed.
+fn build_handle_helpers(
+    context: &mut Context,
+    module: &ModuleOp,
+    sites: &[HandleSite],
+    f64_ty: TypeHandle,
+) -> Result<()> {
+    if sites.is_empty() {
+        return Ok(());
+    }
+    let box_ty: TypeHandle = BoxType::get(context).into();
+    for (id, site) in sites.iter().enumerate() {
+        let thunk_ty = FunctionType::get(context, vec![box_ty, f64_ty], vec![f64_ty]);
+        let thunk_name = format!("convmat_handle_thunk_{id}");
+        let thunk = FuncOp::new(
+            context,
+            Identifier::try_from(thunk_name.as_str())
+                .map_err(|e| Error::Backend(format!("bad thunk name `{thunk_name}`: {e}")))?,
+            thunk_ty,
+        );
+        let entry = thunk.get_entry_block(context);
+        let handle = entry.deref(context).get_argument(0);
+        let arg = entry.deref(context).get_argument(1);
+        let result = match &site.kind {
+            HandleKind::Anonymous(function) => {
+                let mut args = Vec::with_capacity(site.captures.len() + 1);
+                args.push(arg);
+                for index in 0..site.captures.len() {
+                    let offset = emit_constant(context, entry, index as f64)?;
+                    let get =
+                        CallOp::new(context, crate::runtime::HANDLE_ENV, vec![handle, offset]);
+                    let value = get.get_result(context);
+                    append(context, entry, &get);
+                    args.push(value);
+                }
+                let call = CallOp::new(context, &format!("convmat_anon_{}", function.0), args);
+                let value = call.get_result(context);
+                append(context, entry, &call);
+                value
+            }
+            HandleKind::Builtin(name) => {
+                let call = CallOp::new(context, name, vec![arg]);
+                let value = call.get_result(context);
+                append(context, entry, &call);
+                value
+            }
+        };
+        emit_return(context, entry, vec![result]);
+        module.append_operation(context, thunk.get_operation(), 0);
+    }
+
+    // Dispatcher: an `if (id == k) { result = thunk_k(h, x); }` chain. A
+    // select-chain would evaluate every thunk eagerly, which is unsafe when a
+    // thunk has side effects; the `if` chain calls only the matching thunk.
+    let dispatch_ty = FunctionType::get(context, vec![f64_ty, box_ty, f64_ty], vec![f64_ty]);
+    let dispatch = FuncOp::new(
+        context,
+        Identifier::try_from("convmat_handle_dispatch").unwrap(),
+        dispatch_ty,
+    );
+    let entry = dispatch.get_entry_block(context);
+    let id = entry.deref(context).get_argument(0);
+    let handle = entry.deref(context).get_argument(1);
+    let arg = entry.deref(context).get_argument(2);
+    // A one-element cell holds the dispatched result; each branch stores into it.
+    let cell_ty: TypeHandle = ArrayType::get(context, vec![1]).into();
+    let alloca = AllocaOp::new(context, cell_ty);
+    let cell = alloca.get_result(context);
+    append(context, entry, &alloca);
+    let zero = emit_constant(context, entry, 0.0)?;
+    let slot = emit_constant(context, entry, 0.0)?;
+    emit_store(context, entry, cell, slot, zero);
+    build_dispatch_chain(context, entry, sites.len(), 0, id, handle, arg, cell)?;
+    let index = emit_constant(context, entry, 0.0)?;
+    let load = LoadOp::new(context, cell, index);
+    let result = load.get_result(context);
+    append(context, entry, &load);
+    emit_return(context, entry, vec![result]);
+    module.append_operation(context, dispatch.get_operation(), 0);
+    Ok(())
+}
+
+/// Emit the nested `if` chain for the handle dispatcher: when `index` reaches
+/// `sites`, the final `else` branch is just a `yield`.
+fn build_dispatch_chain(
+    context: &mut Context,
+    block: Ptr<BasicBlock>,
+    sites: usize,
+    index: usize,
+    id: Value,
+    handle: Value,
+    arg: Value,
+    cell: Value,
+) -> Result<()> {
+    if index >= sites {
+        emit_yield(context, block);
+        return Ok(());
+    }
+    let want = emit_constant(context, block, index as f64)?;
+    let cmp = CmpOp::new(context, CmpKind::Eq, id, want);
+    let cond = cmp.get_result(context);
+    append(context, block, &cmp);
+    let if_op = IfOp::new(context, cond);
+    append(context, block, &if_op);
+
+    let then_block = BasicBlock::new(context, None, vec![]);
+    then_block.insert_at_front(if_op.then_region(context), context);
+    let call = CallOp::new(
+        context,
+        &format!("convmat_handle_thunk_{index}"),
+        vec![handle, arg],
+    );
+    let value = call.get_result(context);
+    append(context, then_block, &call);
+    let slot = emit_constant(context, then_block, 0.0)?;
+    emit_store(context, then_block, cell, slot, value);
+    emit_yield(context, then_block);
+
+    let else_block = BasicBlock::new(context, None, vec![]);
+    else_block.insert_at_front(if_op.else_region(context), context);
+    build_dispatch_chain(context, else_block, sites, index + 1, id, handle, arg, cell)
 }
 
 /// The C-level name of a HIR function. Anonymous functions carry a
@@ -193,16 +389,36 @@ struct CalleeInfo {
     scalar_abi: bool,
 }
 
-/// A statically-resolved anonymous-function handle in a caller: the target
-/// function, its ordered captured bindings, and one caller-frame snapshot cell
-/// per capture (written at handle creation, read at every call).
+/// A statically-resolved anonymous/builtin function handle in a caller: the
+/// target, its ordered captured bindings, and one caller-frame snapshot cell per
+/// capture (written at handle creation, read at every call).
 struct HandleRuntime {
-    function: FunctionId,
+    kind: HandleKind,
     captures: Vec<BindingId>,
     snapshot_cells: Vec<Value>,
     /// Whether the target returns a single scalar (the only supported ABI).
     scalar_result: bool,
 }
+
+/// A module-scoped function-handle *site*: a handle returned from a function.
+/// `id` is the site's index (used in the generated thunk/dispatch and stored in
+/// the boxed `CONVMAT_FUNCTION` value).
+struct HandleSite {
+    kind: HandleKind,
+    /// Captured bindings (anonymous functions only).
+    captures: Vec<BindingId>,
+}
+
+/// The per-function runtime for a handle that escapes as an output: its site id
+/// and the capture bindings whose values are snapshotted into the box.
+#[derive(Clone)]
+struct ReturnedHandleRuntime {
+    id: usize,
+    captures: Vec<BindingId>,
+}
+
+/// Maps a `(function, output binding)` handle to its module-scoped site id.
+type HandleSiteIds = HashMap<(FunctionId, BindingId), usize>;
 
 /// Lower a single HIR function into a `builtin.func` appended to `module`.
 fn lower_function(
@@ -214,6 +430,8 @@ fn lower_function(
     f64_ty: TypeHandle,
     plan: &FunctionPlan,
     callees: &HashMap<FunctionId, CalleeInfo>,
+    handle_sites: &[HandleSite],
+    handle_ids: &HandleSiteIds,
 ) -> Result<()> {
     let name = c_function_name(function);
 
@@ -267,8 +485,10 @@ fn lower_function(
             LocalTy::Array { shape } if shape.is_dynamic() => dynamic_outputs.push(*output),
             LocalTy::Array { .. } => array_outputs.push(*output),
             LocalTy::Cell => return Err(Error::NotLowerable("cell output".to_string())),
-            // A complex output is returned as a boxed `convmat_value*`.
-            LocalTy::Complex => return_outputs.push((*output, BoxType::get(context).into())),
+            // A complex or handle output is returned as a boxed `convmat_value*`.
+            LocalTy::Complex | LocalTy::Handle => {
+                return_outputs.push((*output, BoxType::get(context).into()))
+            }
             LocalTy::Dynamic => {
                 return Err(Error::NotLowerable("dynamic output shape".to_string()))
             }
@@ -308,7 +528,9 @@ fn lower_function(
                 ))
             }
             LocalTy::Cell => return Err(Error::NotLowerable("cell parameter".to_string())),
-            LocalTy::Complex => return Err(Error::NotLowerable("complex parameter".to_string())),
+            LocalTy::Complex | LocalTy::Handle => {
+                return Err(Error::NotLowerable("boxed parameter".to_string()))
+            }
             LocalTy::Dynamic => return Err(Error::NotLowerable("dynamic parameter".to_string())),
         }
     }
@@ -373,9 +595,9 @@ fn lower_function(
                 Some(shape),
             ),
             LocalTy::Struct { fields } => (struct_type(context, &fields)?, None),
-            // A cell or complex value is a boxed `convmat_value*` SSA value, not
-            // an alloca cell; it is materialized at its assignment.
-            LocalTy::Cell | LocalTy::Complex => continue,
+            // A cell, complex, or handle value is a boxed `convmat_value*` SSA
+            // value, not an alloca cell; it is materialized at its assignment.
+            LocalTy::Cell | LocalTy::Complex | LocalTy::Handle => continue,
             LocalTy::Dynamic => return Err(Error::NotLowerable("dynamic local shape".to_string())),
         };
 
@@ -521,14 +743,18 @@ fn lower_function(
         array_out_lens.insert(*output, len);
     }
 
-    // Resolve anonymous-function handles defined in this function and allocate
-    // one snapshot cell per capture. The cells are written at the handle's
-    // definition and read at every call, giving MATLAB's capture-at-creation
-    // semantics.
+    // Resolve function handles defined in this function. Non-escaping handles
+    // get one snapshot cell per capture (written at the handle's definition and
+    // read at every call); escaping (returned) handles get a boxed closure value
+    // whose site id and captures are resolved here.
+    let analysis = analyze_handles(function).map_err(Error::NotLowerable)?;
     let mut handles: HashMap<BindingId, HandleRuntime> = HashMap::new();
-    let mut handle_targets: HashMap<BindingId, FunctionId> = HashMap::new();
-    for (binding, function_id) in analyze_handles(function).map_err(Error::NotLowerable)? {
-        let captures = anon_capture_bindings(hir, function_id)?;
+    let mut handle_targets: crate::triage::HandleTargets = HashMap::new();
+    for (binding, kind) in &analysis.local {
+        let captures = match kind {
+            HandleKind::Anonymous(function_id) => anon_capture_bindings(hir, *function_id)?,
+            HandleKind::Builtin(_) => Vec::new(),
+        };
         let mut snapshot_cells = Vec::with_capacity(captures.len());
         for _ in &captures {
             let alloca = AllocaOp::new(context, scalar_cell_ty);
@@ -536,16 +762,34 @@ fn lower_function(
             append(context, entry, &alloca);
             snapshot_cells.push(value);
         }
+        let scalar_result = match kind {
+            HandleKind::Anonymous(function_id) => anon_returns_scalar(hir, *function_id),
+            HandleKind::Builtin(_) => true,
+        };
         handles.insert(
-            binding,
+            *binding,
             HandleRuntime {
-                function: function_id,
+                kind: kind.clone(),
                 captures,
                 snapshot_cells,
-                scalar_result: anon_returns_scalar(hir, function_id),
+                scalar_result,
             },
         );
-        handle_targets.insert(binding, function_id);
+        handle_targets.insert(*binding, kind.clone());
+    }
+    let mut returned_handles: HashMap<BindingId, ReturnedHandleRuntime> = HashMap::new();
+    for binding in analysis.returned.keys() {
+        let id = handle_ids
+            .get(&(function.id, *binding))
+            .copied()
+            .ok_or_else(|| Error::Backend(format!("no handle site for {binding:?}")))?;
+        returned_handles.insert(
+            *binding,
+            ReturnedHandleRuntime {
+                id,
+                captures: handle_sites[id].captures.clone(),
+            },
+        );
     }
 
     // Boxed (complex) outputs are returned by value; their boxes must survive
@@ -577,6 +821,7 @@ fn lower_function(
         return_outputs,
         handles,
         handle_targets,
+        returned_handles,
         persistent_flags,
     };
     lowerer.lower_block(context, entry, &function.body)?;
@@ -691,10 +936,12 @@ struct FuncLowerer {
     array_out_lens: HashMap<BindingId, Value>,
     /// Value outputs (scalar or struct), in ABI order, with their return type.
     return_outputs: Vec<(BindingId, TypeHandle)>,
-    /// Statically-resolved anonymous-function handles: target + capture cells.
+    /// Non-escaping function handles: target kind + capture cells.
     handles: HashMap<BindingId, HandleRuntime>,
-    /// Just the handle targets, for `expr_ty`'s call typing.
-    handle_targets: HashMap<BindingId, FunctionId>,
+    /// Just the non-escaping handle kinds, for `expr_ty`'s call typing.
+    handle_targets: crate::triage::HandleTargets,
+    /// Escaping (returned) handles: binding -> site id + captures.
+    returned_handles: HashMap<BindingId, ReturnedHandleRuntime>,
     /// Persistent-array/scalar `_not_empty` flag cells. A `persistent` binding
     /// starts empty in MATLAB, so `isempty(p)` is true until `p` is first
     /// assigned; the flag records that, independent of the zero-initialized
@@ -842,6 +1089,17 @@ impl FuncLowerer {
                         );
                         return Ok(());
                     }
+                    // `dist(i) = v`: a runtime scalar index write into a dynamic
+                    // array (the buffer is written in place).
+                    if matches!(self.operand_type(base), LocalTy::Array { shape } if shape.is_dynamic())
+                        && indexing.components.len() == 1
+                    {
+                        let src = self.array_source(context, block, base)?;
+                        let offset = self.dynamic_linear_offset(context, block, indexing, base)?;
+                        let v = self.lower_expr(context, block, value)?;
+                        emit_store(context, block, src, offset, v);
+                        return Ok(());
+                    }
                     return Err(Error::NotLowerable(
                         "only logical-mask assignment targets are supported".to_string(),
                     ));
@@ -851,12 +1109,21 @@ impl FuncLowerer {
                         "non-local assignment target {place:?}"
                     )));
                 };
-                // `f = @(...)`: snapshot the captured bindings at creation time.
-                // The handle binding itself has no runtime cell.
-                if matches!(value.kind, HirExprKind::AnonymousFunction(_)) {
+                // `f = @(...)` / `f = @name`: a handle definition. A
+                // non-escaping handle snapshots its captures into cells and has
+                // no runtime cell of its own; a returned handle is boxed into a
+                // closure value here.
+                if matches!(
+                    value.kind,
+                    HirExprKind::AnonymousFunction(_) | HirExprKind::FunctionHandle(_)
+                ) {
                     if let Some(handle) = self.handles.get(target) {
                         return self.lower_handle_creation(context, block, handle);
                     }
+                    if let Some(returned) = self.returned_handles.get(target) {
+                        return self.lower_returned_handle(context, block, *target, returned);
+                    }
+                    return Ok(());
                 }
                 let ty = self.tys.get(target).cloned().unwrap_or(LocalTy::Scalar);
                 match ty {
@@ -925,6 +1192,11 @@ impl FuncLowerer {
                     }
                     LocalTy::Dynamic => {
                         return Err(Error::NotLowerable("dynamic assignment target".to_string()));
+                    }
+                    // A handle value is only ever produced by its defining `f = @...`
+                    // assignment, handled above.
+                    LocalTy::Handle => {
+                        return Err(Error::NotLowerable("handle assignment".to_string()));
                     }
                 }
                 // A `persistent` binding stops being empty once assigned.
@@ -1251,9 +1523,50 @@ impl FuncLowerer {
         Ok(())
     }
 
-    /// Lower a call through an anonymous-function handle to a `matlab.call` on
-    /// the specialized helper, passing the call arguments followed by the
-    /// captured snapshots (the helper's trailing parameters).
+    /// Lower a returned (escaping) handle `f = @(...)` / `f = @name` into a
+    /// boxed `CONVMAT_FUNCTION` closure: allocate the box, snapshot each captured
+    /// scalar into it, and hand ownership to the caller as the function output.
+    fn lower_returned_handle(
+        &self,
+        context: &mut Context,
+        block: Ptr<BasicBlock>,
+        target: BindingId,
+        returned: &ReturnedHandleRuntime,
+    ) -> Result<()> {
+        let id = emit_constant(context, block, returned.id as f64)?;
+        let op = BoxCallOp::new(context, crate::runtime::FUNCTION_HANDLE, vec![id]);
+        let handle = op.get_result(context);
+        append(context, block, &op);
+        for (index, capture) in returned.captures.iter().enumerate() {
+            let ty = self.tys.get(capture).cloned().unwrap_or(LocalTy::Scalar);
+            if !matches!(ty, LocalTy::Scalar) {
+                return Err(Error::NotLowerable(
+                    "anonymous function captures must be scalar \
+                     (only scalar captures are supported)"
+                        .to_string(),
+                ));
+            }
+            let source = self.locals.get(capture).copied().ok_or_else(|| {
+                Error::Backend(format!("captured binding {capture:?} has no cell"))
+            })?;
+            let value = self.load_local(context, block, source)?;
+            let index = emit_constant(context, block, index as f64)?;
+            let set = CallVoidOp::new(
+                context,
+                crate::runtime::HANDLE_SET_ENV,
+                vec![handle, index, value],
+            );
+            append(context, block, &set);
+        }
+        self.box_values.borrow_mut().insert(target, handle);
+        self.box_heap.borrow_mut().push((target, handle));
+        Ok(())
+    }
+
+    /// Lower a call through a function handle: an anonymous handle becomes a
+    /// `matlab.call` on the specialized helper (call arguments followed by the
+    /// captured snapshots, the helper's trailing parameters); a builtin handle
+    /// becomes a direct `matlab.call` on the builtin.
     fn lower_handle_call(
         &self,
         context: &mut Context,
@@ -1266,15 +1579,7 @@ impl FuncLowerer {
                 "function handle must be called with `()`".to_string(),
             ));
         }
-        if !handle.scalar_result {
-            return Err(Error::NotLowerable(
-                "anonymous function must return a scalar \
-                 (array results are not supported)"
-                    .to_string(),
-            ));
-        }
-        let mut args: Vec<Value> =
-            Vec::with_capacity(indexing.components.len() + handle.snapshot_cells.len());
+        let mut args: Vec<Value> = Vec::with_capacity(indexing.components.len());
         for component in &indexing.components {
             let IndexComponent::Expr(expr) = component else {
                 return Err(Error::NotLowerable(
@@ -1285,24 +1590,43 @@ impl FuncLowerer {
             // silently truncated to its first element by `lower_expr`.
             if !matches!(self.operand_type(expr), LocalTy::Scalar) {
                 return Err(Error::NotLowerable(
-                    "anonymous function arguments must be scalar \
+                    "function handle arguments must be scalar \
                      (only scalar parameters are supported)"
                         .to_string(),
                 ));
             }
             args.push(self.lower_expr(context, block, expr)?);
         }
-        for cell in &handle.snapshot_cells {
-            args.push(self.load_local(context, block, *cell)?);
+        match &handle.kind {
+            HandleKind::Anonymous(function) => {
+                if !handle.scalar_result {
+                    return Err(Error::NotLowerable(
+                        "anonymous function must return a scalar \
+                         (array results are not supported)"
+                            .to_string(),
+                    ));
+                }
+                for cell in &handle.snapshot_cells {
+                    args.push(self.load_local(context, block, *cell)?);
+                }
+                let op = CallOp::new(context, &format!("convmat_anon_{}", function.0), args);
+                let result = op.get_result(context);
+                append(context, block, &op);
+                Ok(result)
+            }
+            HandleKind::Builtin(name) => {
+                if !builtins::lookup(name).is_some_and(|builtin| builtin.valid_arity(args.len())) {
+                    return Err(Error::NotLowerable(format!(
+                        "builtin handle `@{name}` called with {} argument(s)",
+                        args.len()
+                    )));
+                }
+                let op = CallOp::new(context, name, args);
+                let result = op.get_result(context);
+                append(context, block, &op);
+                Ok(result)
+            }
         }
-        let op = CallOp::new(
-            context,
-            &format!("convmat_anon_{}", handle.function.0),
-            args,
-        );
-        let result = op.get_result(context);
-        append(context, block, &op);
-        Ok(result)
     }
 
     /// Lower a struct-producing expression into `dest` (a struct cell). Only
@@ -1650,6 +1974,7 @@ impl FuncLowerer {
                     LocalTy::Struct { .. }
                     | LocalTy::Cell
                     | LocalTy::Complex
+                    | LocalTy::Handle
                     | LocalTy::Dynamic => Err(Error::NotLowerable("dynamic isempty".to_string())),
                 }
             }
@@ -1687,9 +2012,11 @@ impl FuncLowerer {
                     let n = emit_constant(context, block, shape.dims()[0] as f64)?;
                     self.emit_libm_call(context, block, crate::runtime::DET, &[src, n])
                 }
-                LocalTy::Struct { .. } | LocalTy::Cell | LocalTy::Complex | LocalTy::Dynamic => {
-                    Err(Error::NotLowerable("dynamic det".to_string()))
-                }
+                LocalTy::Struct { .. }
+                | LocalTy::Cell
+                | LocalTy::Complex
+                | LocalTy::Handle
+                | LocalTy::Dynamic => Err(Error::NotLowerable("dynamic det".to_string())),
             },
             // `norm` of a scalar is `abs`; of a vector it is the 2-norm.
             Builtin::Norm => match self.operand_type(args[0]) {
@@ -1703,9 +2030,11 @@ impl FuncLowerer {
                     let n = emit_constant(context, block, n as f64)?;
                     self.emit_libm_call(context, block, crate::runtime::NORM, &[src, n])
                 }
-                LocalTy::Struct { .. } | LocalTy::Cell | LocalTy::Complex | LocalTy::Dynamic => {
-                    Err(Error::NotLowerable("dynamic norm".to_string()))
-                }
+                LocalTy::Struct { .. }
+                | LocalTy::Cell
+                | LocalTy::Complex
+                | LocalTy::Handle
+                | LocalTy::Dynamic => Err(Error::NotLowerable("dynamic norm".to_string())),
             },
             // `rand()`: a pseudo-random scalar in `[0, 1)`.
             Builtin::Rand => self.emit_libm_call(context, block, crate::runtime::RAND, &[]),
@@ -1715,9 +2044,11 @@ impl FuncLowerer {
                 }
                 LocalTy::Array { shape } => emit_constant(context, block, shape.numel() as f64),
                 LocalTy::Scalar | LocalTy::Int32 => emit_constant(context, block, 1.0),
-                LocalTy::Struct { .. } | LocalTy::Cell | LocalTy::Complex | LocalTy::Dynamic => {
-                    Err(Error::NotLowerable("dynamic numel".to_string()))
-                }
+                LocalTy::Struct { .. }
+                | LocalTy::Cell
+                | LocalTy::Complex
+                | LocalTy::Handle
+                | LocalTy::Dynamic => Err(Error::NotLowerable("dynamic numel".to_string())),
             },
             Builtin::Length => {
                 let max = match self.operand_type(args[0]) {
@@ -1737,6 +2068,7 @@ impl FuncLowerer {
                     LocalTy::Struct { .. }
                     | LocalTy::Cell
                     | LocalTy::Complex
+                    | LocalTy::Handle
                     | LocalTy::Dynamic => {
                         return Err(Error::NotLowerable("dynamic length".to_string()))
                     }
@@ -1769,6 +2101,37 @@ impl FuncLowerer {
                 };
                 emit_constant(context, block, size as f64)
             }
+            // Graphics no-op: evaluate the arguments (for side effects) and emit
+            // the no-op runtime helper. `plot`/`plot3` have no C representation;
+            // see `docs/unsupported.md`.
+            Builtin::Noop => {
+                for arg in &args {
+                    self.lower_expr(context, block, arg)?;
+                }
+                self.emit_libm_call(context, block, crate::runtime::PLOT, &[])
+            }
+            // `fopen(name, mode)`: `name` is a char array, `mode` a single-char
+            // code point; returns a scalar file id (see `docs/unsupported.md`).
+            Builtin::Fopen => {
+                let [name, mode] = call.args.as_slice() else {
+                    return Err(Error::NotLowerable(
+                        "fopen expects (name, mode)".to_string(),
+                    ));
+                };
+                let src = self.array_source(context, block, name)?;
+                let len = self.array_len_value(context, block, name)?;
+                let m = self.lower_expr(context, block, mode)?;
+                self.emit_libm_call(context, block, crate::runtime::FOPEN, &[src, len, m])
+            }
+            Builtin::Fclose => {
+                let fid = self.lower_expr(context, block, args[0])?;
+                self.emit_libm_call(context, block, crate::runtime::FCLOSE, &[fid])
+            }
+            // `fread` yields a dynamic-shape array; it is handled by the array
+            // path and must not reach the scalar path.
+            Builtin::Fread => Err(Error::NotLowerable(
+                "fread must be used as an array value".to_string(),
+            )),
             // Constructors and reshape/sort always produce arrays; they are handled
             // by the array path and never reach the scalar path.
             Builtin::Fill(_)
@@ -1830,9 +2193,11 @@ impl FuncLowerer {
                 let src = self.array_source(context, block, operand)?;
                 self.reduce(context, block, reducer, src, shape.numel())
             }
-            LocalTy::Struct { .. } | LocalTy::Cell | LocalTy::Complex | LocalTy::Dynamic => {
-                Err(Error::NotLowerable("dynamic reduction".to_string()))
-            }
+            LocalTy::Struct { .. }
+            | LocalTy::Cell
+            | LocalTy::Complex
+            | LocalTy::Handle
+            | LocalTy::Dynamic => Err(Error::NotLowerable("dynamic reduction".to_string())),
         }
     }
 
@@ -1958,6 +2323,22 @@ impl FuncLowerer {
                         )
                     }
                     Builtin::MinMax(minmax) => {
+                        // Elementwise `min(A, B)`/`max(A, B)` between two arrays
+                        // (same size), via `convmat_ewmin`/`convmat_ewmax`.
+                        if call.args.len() == 2
+                            && matches!(self.operand_type(&call.args[0]), LocalTy::Array { .. })
+                            && matches!(self.operand_type(&call.args[1]), LocalTy::Array { .. })
+                        {
+                            let a = self.array_source(context, block, &call.args[0])?;
+                            let b = self.array_source(context, block, &call.args[1])?;
+                            let n = self.array_len_value(context, block, &call.args[0])?;
+                            let callee = match minmax {
+                                MinMax::Min => crate::runtime::EWMIN,
+                                MinMax::Max => crate::runtime::EWMAX,
+                            };
+                            self.emit_extern_call(context, block, callee, &[dest, a, b, n]);
+                            return Ok(());
+                        }
                         let [arg, _] = call.args.as_slice() else {
                             return Err(Error::NotLowerable(
                                 "expected array + dimension".to_string(),
@@ -2002,6 +2383,7 @@ impl FuncLowerer {
                             LocalTy::Struct { .. }
                             | LocalTy::Cell
                             | LocalTy::Complex
+                            | LocalTy::Handle
                             | LocalTy::Dynamic => {
                                 return Err(Error::NotLowerable("dynamic size".to_string()))
                             }
@@ -2015,8 +2397,23 @@ impl FuncLowerer {
                         Ok(())
                     }
                     Builtin::Fill(value) => {
-                        let shape = self.constructor_shape(call)?;
                         let fill = emit_constant(context, block, value)?;
+                        // A runtime dimension (`Inf(1, n)`, `zeros(1, n)`) fills a
+                        // runtime-length buffer via the `convmat_fill` helper.
+                        if matches!(
+                            self.operand_type(expr),
+                            LocalTy::Array { shape } if shape.is_dynamic()
+                        ) {
+                            let n = self.dynamic_fill_len(context, block, call)?;
+                            self.emit_extern_call(
+                                context,
+                                block,
+                                crate::runtime::FILL,
+                                &[dest, n, fill],
+                            );
+                            return Ok(());
+                        }
+                        let shape = self.constructor_shape(call)?;
                         for offset in 0..shape.numel() {
                             let index = emit_constant(context, block, offset as f64)?;
                             emit_store(context, block, dest, index, fill);
@@ -2163,6 +2560,23 @@ impl FuncLowerer {
                         self.emit_extern_call(context, block, crate::runtime::INV, &[dest, src, n]);
                         Ok(())
                     }
+                    Builtin::Fread => {
+                        let [arg] = call.args.as_slice() else {
+                            return Err(Error::NotLowerable("fread expects a file id".to_string()));
+                        };
+                        // `fread` returns a dynamic-shape array: read the remaining
+                        // whole `double`s into `dest`, reporting the count to the
+                        // out-length cell (see `dynamic_array_len`).
+                        let fid = self.lower_expr(context, block, arg)?;
+                        let count = self.dynamic_array_len(context, block, expr)?;
+                        self.emit_extern_call(
+                            context,
+                            block,
+                            crate::runtime::FREAD,
+                            &[dest, fid, count],
+                        );
+                        Ok(())
+                    }
                     _ => Err(Error::NotLowerable(format!(
                         "array result from `{name}` is not supported"
                     ))),
@@ -2193,6 +2607,22 @@ impl FuncLowerer {
                     );
                     return Ok(());
                 }
+                // `W(:, j)`: a runtime column slice of a descriptor array.
+                if let Some((rows, _)) = self.column_slice_dims(base, indexing) {
+                    let IndexComponent::Expr(expr) = &indexing.components[1] else {
+                        return Err(Error::NotLowerable(
+                            "dynamic column index must be a value".to_string(),
+                        ));
+                    };
+                    let j = self.lower_expr(context, block, expr)?;
+                    self.emit_extern_call(
+                        context,
+                        block,
+                        crate::runtime::COLUMN,
+                        &[dest, src, rows, j],
+                    );
+                    return Ok(());
+                }
                 if self.array_shape(base)?.is_dynamic() {
                     // Dynamic source: copy elementwise via a runtime helper.
                     let n = self.array_len_value(context, block, base)?;
@@ -2219,6 +2649,16 @@ impl FuncLowerer {
                 let src = self.array_source(context, block, expr)?;
                 let n = self.array_len_value(context, block, expr)?;
                 self.emit_extern_call(context, block, crate::runtime::COPY, &[dest, src, n]);
+                Ok(())
+            }
+            HirExprKind::String(lit) => {
+                // A multi-char literal is a 1xN code-unit array (e.g. an `fopen`
+                // filename); write its code points into `dest`.
+                for (i, code) in char_codes(&lit.0).iter().enumerate() {
+                    let index = emit_constant(context, block, i as f64)?;
+                    let value = emit_constant(context, block, *code)?;
+                    emit_store(context, block, dest, index, value);
+                }
                 Ok(())
             }
             other => Err(Error::NotLowerable(format!("array rvalue {other:?}"))),
@@ -2289,8 +2729,13 @@ impl FuncLowerer {
                     .ok_or_else(|| Error::Backend(format!("binding {id:?} has no cell")))
             }
             // `A(:)` on a dynamic (vector) array is the identity: the same data
-            // pointer (linear order is unchanged), so it needs no temporary.
-            HirExprKind::Index(base, _) if matches!(self.operand_type(base), LocalTy::Array { shape } if shape.is_dynamic()) => {
+            // pointer (linear order is unchanged), so it needs no temporary. Only
+            // the single-colon form is the identity; `A(:, j)` is a real slice.
+            HirExprKind::Index(base, indexing)
+                if indexing.components.len() == 1
+                    && component_is_colon(&indexing.components[0])
+                    && matches!(self.operand_type(base), LocalTy::Array { shape } if shape.is_dynamic()) =>
+            {
                 self.array_source(context, block, base)
             }
             _ => {
@@ -2363,6 +2808,11 @@ impl FuncLowerer {
                 if let Some((_, len)) = self.dyn_values.borrow().get(id).copied() {
                     return Ok(len);
                 }
+                // A dynamic-shape output reports its length through the out-length
+                // cell written by the callee.
+                if let Some(out_len) = self.array_out_lens.get(id).copied() {
+                    return self.load_local(context, block, out_len);
+                }
                 self.array_lens
                     .get(id)
                     .copied()
@@ -2379,9 +2829,43 @@ impl FuncLowerer {
                         &[mask_src, n],
                     );
                 }
+                // `W(:, j)`: the column length is the source's row count.
+                if let Some((rows, _)) = self.column_slice_dims(base, indexing) {
+                    return Ok(rows);
+                }
                 self.dynamic_array_len(context, block, base)
             }
             HirExprKind::Unary(_, base) => self.dynamic_array_len(context, block, base),
+            HirExprKind::Call(call) => {
+                let name = call_name(&call.callee)
+                    .ok_or_else(|| Error::NotLowerable("dynamic function call".to_string()))?;
+                match builtins::lookup(&name) {
+                    // `fread(fid)`'s runtime length is how many whole `double`s
+                    // remain in the file.
+                    Some(Builtin::Fread) => {
+                        let [arg] = call.args.as_slice() else {
+                            return Err(Error::NotLowerable("fread expects a file id".to_string()));
+                        };
+                        let fid = self.lower_expr(context, block, arg)?;
+                        self.emit_libm_call(context, block, crate::runtime::FREAD_COUNT, &[fid])
+                    }
+                    // `Inf(1, n)` etc.: the product of the runtime dimensions.
+                    Some(Builtin::Fill(_)) => self.dynamic_fill_len(context, block, call),
+                    // Elementwise `min(A, B)`: same length as the operands.
+                    Some(Builtin::MinMax(_))
+                        if call.args.len() == 2
+                            && matches!(
+                                self.operand_type(&call.args[0]),
+                                LocalTy::Array { .. }
+                            ) =>
+                    {
+                        self.dynamic_array_len(context, block, &call.args[0])
+                    }
+                    _ => Err(Error::NotLowerable(
+                        "dynamic array length of this call is not supported".to_string(),
+                    )),
+                }
+            }
             HirExprKind::Binary(lhs, _, rhs) => {
                 if matches!(self.operand_type(lhs), LocalTy::Array { .. }) {
                     self.dynamic_array_len(context, block, lhs)
@@ -2393,6 +2877,42 @@ impl FuncLowerer {
                 "dynamic array length of this expression is not supported".to_string(),
             )),
         }
+    }
+
+    /// The runtime element count of a constant fill with runtime dimensions: the
+    /// product of its dimension arguments (`Inf(1, n)` -> `1 * n`).
+    fn dynamic_fill_len(
+        &self,
+        context: &mut Context,
+        block: Ptr<BasicBlock>,
+        call: &HirCall,
+    ) -> Result<Value> {
+        let mut acc: Option<Value> = None;
+        for arg in &call.args {
+            let v = self.lower_expr(context, block, arg)?;
+            acc = Some(match acc {
+                None => v,
+                Some(a) => self.append_binop(context, block, BinOpKind::Mul, a, v)?,
+            });
+        }
+        acc.ok_or_else(|| Error::NotLowerable("fill requires a dimension".to_string()))
+    }
+
+    /// The `(rows, cols)` descriptor of a runtime column slice `A(:, j)` on a
+    /// descriptor array parameter, if `base`/`indexing` denote such a slice.
+    fn column_slice_dims(
+        &self,
+        base: &HirExpr,
+        indexing: &IndexingSemantics,
+    ) -> Option<(Value, Value)> {
+        let HirExprKind::Binding(id) = &base.kind else {
+            return None;
+        };
+        let comps = indexing.components.as_slice();
+        if comps.len() != 2 || !component_is_colon(&comps[0]) || component_is_slice(&comps[1]) {
+            return None;
+        }
+        self.array_dims.get(id).copied()
     }
 
     /// The static shape of an array-typed expression.
@@ -2484,9 +3004,11 @@ impl FuncLowerer {
                 let count = emit_constant(context, block, n as f64)?;
                 self.append_binop(context, block, BinOpKind::Div, sum, count)
             }
-            LocalTy::Struct { .. } | LocalTy::Cell | LocalTy::Complex | LocalTy::Dynamic => {
-                Err(Error::NotLowerable("dynamic mean".to_string()))
-            }
+            LocalTy::Struct { .. }
+            | LocalTy::Cell
+            | LocalTy::Complex
+            | LocalTy::Handle
+            | LocalTy::Dynamic => Err(Error::NotLowerable("dynamic mean".to_string())),
         }
     }
 
@@ -2554,6 +3076,7 @@ impl FuncLowerer {
             | LocalTy::Struct { .. }
             | LocalTy::Cell
             | LocalTy::Complex
+            | LocalTy::Handle
             | LocalTy::Dynamic => Err(Error::NotLowerable("dynamic variance".to_string())),
         }
     }
@@ -2606,6 +3129,7 @@ impl FuncLowerer {
             | LocalTy::Struct { .. }
             | LocalTy::Cell
             | LocalTy::Complex
+            | LocalTy::Handle
             | LocalTy::Dynamic => Err(Error::NotLowerable("dynamic median".to_string())),
         }
     }
@@ -3889,6 +4413,7 @@ fn struct_type(context: &mut Context, fields: &[(String, LocalTy)]) -> Result<Ty
                 | LocalTy::Struct { .. }
                 | LocalTy::Cell
                 | LocalTy::Complex
+                | LocalTy::Handle
                 | LocalTy::Dynamic => {
                     return Err(Error::NotLowerable(
                         "only scalar struct fields are supported yet".to_string(),

@@ -67,9 +67,9 @@ fn arg_expansion_rejected() {
 }
 
 #[test]
-fn anonymous_function_escape_rejected() {
-    // Returning an anonymous-function handle needs the dynamic closure tier.
-    assert_not_lowerable("anon_escape", "escapes as a return value");
+fn graphics_as_value_rejected() {
+    // `plot` has no numeric result; using it as a value defers (no shape).
+    assert_not_lowerable("plot_value", "unresolved shape");
 }
 
 #[test]
@@ -129,9 +129,9 @@ fn anonymous_function_struct_field_rejected() {
 }
 
 #[test]
-fn anonymous_function_builtin_handle_rejected() {
-    // A handle to a built-in (`@sin`) is not in the subset yet.
-    assert_not_lowerable("anon_builtin_handle", "FunctionHandle");
+fn anonymous_function_returned_and_called_rejected() {
+    // A handle cannot be both returned and called in the closure-value subset.
+    assert_not_lowerable("anon_return_call", "returned and also called");
 }
 
 #[test]
